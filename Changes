@@ -1,0 +1,6 @@
+Revision history for Structure-Info
+
+0.01
+    - initial version: reads PDB into a hash of hashes, single-letter
+      sequences, residue types.  Release notes from here on are the
+      maintainer's to write.

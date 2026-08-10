@@ -1,0 +1,33 @@
+---
+abstract: 'read a molecular structure file into a hash of hashes'
+author:
+  - 'David E. Condon <dec986@gmail.com>'
+build_requires:
+  ExtUtils::MakeMaker: '0'
+  Test::Exception: '0'
+  Test::More: '0'
+configure_requires:
+  ExtUtils::MakeMaker: '6.52'
+dynamic_config: 0
+generated_by: 'ExtUtils::MakeMaker version 7.78, CPAN::Meta::Converter version 2.150013'
+license: perl
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: '1.4'
+name: Structure-Info
+no_index:
+  directory:
+    - t
+    - inc
+requires:
+  Carp: '0'
+  Exporter: '0'
+  Scalar::Util: '0'
+  XSLoader: '0'
+  autodie: '0'
+  perl: '5.010'
+resources:
+  bugtracker: https://github.com/hhg7/pdb.info/issues
+  repository: https://github.com/hhg7/pdb.info.git
+version: '0.01'
+x_serialization_backend: 'CPAN::Meta::YAML version 0.020'
