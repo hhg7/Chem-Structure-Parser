@@ -1,0 +1,66 @@
+
+# What the C is worth
+
+`benchmark.pl` measures it rather than asserting it. Against a pure-Perl
+reader that slices the same columns in the same order and builds the same
+nested hash — not a straw man, just the same job done per line in Perl —
+reading 200 structures from PDBbind v2020, best of three:
+
+    structure_info                           6.30 s     168,000 atoms/s
+    structure_info, atoms => 0               4.05 s     262,000 atoms/s
+    the XS parse alone                       1.97 s     538,000 atoms/s
+    the same reader, in pure Perl            5.48 s     193,000 atoms/s
+    pure Perl, and the same statistics       7.14 s     148,000 atoms/s
+
+**The parse is 2.8x the same parse written in Perl.** That is what the C buys.
+
+`structure_info()` as a whole lands at 0.9x the plain Perl reader and 1.1x the
+one that also gathers the statistics — while doing a good deal more than
+either: the header records, SEQRES, the gaps between the declared sequence and
+the modelled one, chain typing, ligand and ion classification. Building a hash
+of hashes out of what was read costs what it costs in any language, because
+the hashes are the answer. Reading is the part worth writing in C, and reading
+is the part that got faster.
+
+Two rounds of that measurement changed the code. The first showed the whole
+read coming out *slower* than the naive Perl reader, because every per-atom
+statistic was being gathered in Perl over data C had just finished reading;
+those moved into the parse. The second showed each atom being built twice —
+once as columns in C, once as a hash in Perl — and the parse now builds the
+hash itself, which took another 25% off both the time and the memory.
+
+# What is written in C, and what is not
+
+The C side makes one pass over the bytes and does three things: it splits
+ATOM/HETATM records into parallel per-field arrays, it marks where each
+residue begins and ends, and it groups every other record by record name for
+Perl to take apart. Residue name lookup — three letters to one letter, and the
+amino acid/nucleotide/water question — is a switch on three packed bytes, and
+one table serves `aa3to1()`, `res1()` and `res_type()` so the three can never
+disagree.
+
+The per-atom result is columnar — one array per field rather than one hash per
+atom — which is both faster to build and about an order of magnitude smaller
+while it is being built. Perl turns it into the nested hash afterwards, and
+only for the atoms that were kept.
+
+Everything else is Perl. The header records are irregular, they are a few
+dozen lines per file rather than hundreds of thousands, and they are where the
+next surprise will turn up; none of that is worth writing in C.
+
+Two details in there are worth knowing about, because they are where a PDB
+reader is usually wrong:
+
+**Coordinates.** `x`, `y` and `z` are adjacent eight-column fields with no
+separator between them, so a reader that scans for a number instead of slicing
+the columns runs `-12.500 111.000` together. They are sliced, and converted
+with `strtod` on the slice.
+
+**Elements.** Columns 77-78 hold the element symbol, and when they are missing
+— older files, and files written by programs that should know better — it has
+to come from the atom name. A one-letter element is right-justified from
+column 14, so ` CA ` is a carbon alpha, and a two-letter element starts in
+column 13, so `CA  ` is a calcium. A hydrogen with a long name like `HG11`
+also starts in column 13, and taking its first two letters makes it mercury;
+what separates them is that it fills all four columns, which no two-letter
+element's name does.
