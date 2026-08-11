@@ -209,9 +209,24 @@ sub structure_ligands {
 	return \%lig;
 }
 
-# structure_sequences($info) -- chain id => single-letter sequence, observed.
+# structure_sequences($info_or_file, %opt) -- chain id => single-letter
+# sequence, observed.  A file name in place of the parsed structure is read
+# first, because the sequences are the one view a caller often wants on their
+# own, and parsing a file to throw the rest of it away is two lines that read
+# as one thought.  %opt is then what structure_info() takes; with a structure
+# already in hand there is nothing left for options to affect, so passing them
+# there is a mistake and is said to be one rather than quietly ignored.
 sub structure_sequences {
-	my ($info) = @_;
+	my ($info, %opt) = @_;
+	if (ref $info) {
+		croak 'structure_sequences: options apply to reading a file, not to a structure already parsed: '
+		    . join(', ', sort keys %opt) if %opt;
+	}
+	else {
+		croak 'structure_sequences: expected a file name or the hash reference from structure_info()'
+			unless defined $info && length $info;
+		$info = structure_info($info, %opt);
+	}
 	_check_info($info, 'structure_sequences');
 	return { map { $_ => $info->{chains}{$_}{sequence} }
 	         grep { length $info->{chains}{$_}{sequence} } @{ $info->{chain_order} } };
@@ -1342,9 +1357,18 @@ residue name, chain and number.
 
 =head2 structure_sequences
 
-    my $seq = structure_sequences($info);   # { A => 'FPTIPLSRL...' }
+    my $seq  = structure_sequences($info);          # { A => 'FPTIPLSRL...' }
+    my $same = structure_sequences('1ubq.pdb');     # read on the spot
+    my $fast = structure_sequences('1ubq.pdb', atoms => 0, meta => 0);
 
 The observed single-letter sequence of every chain that has one.
+
+The first argument is either the hash reference from L</structure_info> or the
+name of a file, which is read with the options given.  C<< atoms => 0 >> is
+worth knowing about here, since a sequence needs the residues and not their
+coordinates.  Options belong with a file name; passing them alongside a
+structure that is already parsed is an error, because there is nothing left
+for them to change.
 
 =head2 chain_sequence
 

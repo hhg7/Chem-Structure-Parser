@@ -96,10 +96,17 @@ my $i = structure_info("$data/mini.pdb");
 #--------
 for my $f (qw(structure_atoms structure_residues structure_ligands structure_sequences structure_summary)) {
 	no strict 'refs';
+	# structure_sequences also takes a file name, so its complaint about being
+	# handed nothing says so; every one of them still refuses a hash that is
+	# not a structure.
+	my $nothing = $f eq 'structure_sequences'
+		? qr/expected a file name or the hash reference/
+		: qr/expected the hash reference/;
 	throws_ok { $f->({ not => 'a structure' }) } qr/expected the hash reference/,
 		"$f: a hash that is not a structure dies";
-	throws_ok { $f->(undef) } qr/expected the hash reference/, "$f: undef dies";
+	throws_ok { $f->(undef) } $nothing, "$f: undef dies";
 	throws_ok { $f->([]) } qr/expected the hash reference/, "$f: an arrayref dies";
+	throws_ok { $f->('') } $nothing, "$f: the empty string dies";
 }
 
 #--------

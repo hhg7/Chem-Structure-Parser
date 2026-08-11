@@ -260,9 +260,18 @@ its row label.
 
 ## structure_sequences
 
-    my $seq = structure_sequences($info);   # { A => 'FPTIPLSRL...' }
+    my $seq  = structure_sequences($info);          # { A => 'FPTIPLSRL...' }
+    my $same = structure_sequences('1ubq.pdb');     # read on the spot
+    my $fast = structure_sequences('1ubq.pdb', atoms => 0, meta => 0);
 
 The observed single-letter sequence of every chain that has one.
+
+The first argument is either the hash reference from `structure_info()` or the
+name of a file, which is read with the options given. `atoms => 0` is worth
+knowing about here, since a sequence needs the residues and not their
+coordinates. Options belong with a file name; passing them alongside a
+structure that is already parsed is an error, because there is nothing left
+for them to change.
 
 ## chain_sequence
 

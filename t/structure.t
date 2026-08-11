@@ -47,6 +47,17 @@ is($info->{chains}{B}{seqres}, 'ACGT', 'SEQRES for a DNA chain');
 
 is_deeply(structure_sequences($info), { A => 'MAGCMHHSC', B => 'ACGT' },
 	'structure_sequences: every chain that has a sequence');
+is_deeply(structure_sequences("$data/mini.pdb"), { A => 'MAGCMHHSC', B => 'ACGT' },
+	'structure_sequences: a file name is read on the spot');
+is_deeply(structure_sequences("$data/mini.pdb", atoms => 0, meta => 0),
+	{ A => 'MAGCMHHSC', B => 'ACGT' },
+	'structure_sequences: and reads it with the options it was given');
+throws_ok { structure_sequences("$data/no-such-file.pdb") } qr/does not exist/,
+	'structure_sequences: a file name that is not a file says so';
+throws_ok { structure_sequences($info, atoms => 0) } qr/options apply to reading a file/,
+	'structure_sequences: options with an already-parsed structure would do nothing, so they are refused';
+throws_ok { structure_sequences(undef) } qr/expected a file name/,
+	'structure_sequences: and nothing at all is still an error';
 is(chain_sequence($info, 'A'), 'MAGCMHHSC', 'chain_sequence: observed by default');
 is(chain_sequence($info, 'A', 'seqres'), 'MAGLKCMHHSC', 'chain_sequence: seqres on request');
 

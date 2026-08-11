@@ -37,10 +37,10 @@ WriteMakefile(
 		resources   => {
 			repository => {
 				type => 'git',
-				url  => 'https://github.com/hhg7/pdb.info.git',
-				web  => 'https://github.com/hhg7/pdb.info',
+				url  => 'https://github.com/hhg7/Structure-info.git',
+				web  => 'https://github.com/hhg7/Structure-info',
 			},
-			bugtracker => { web => 'https://github.com/hhg7/pdb.info/issues' },
+			bugtracker => { web => 'https://github.com/hhg7/Structure-info/issues' },
 		},
 	},
 );
