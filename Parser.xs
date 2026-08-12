@@ -878,15 +878,728 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	(void)hv_stores(out, "n_atom_records",   newSViv(n_atom_rec));
 	(void)hv_stores(out, "n_hetatm_records", newSViv(n_het_rec));
 	(void)hv_stores(out, "n_lines",      newSViv(lineno));
+	(void)hv_stores(out, "format",       newSVpvs("pdb"));
+	return out;
+}
+
+/*mmCIF -- the same structures, written down differently.
+
+The same structures, written down differently.  A PDB file is fixed columns; an
+mmCIF file is tag/value pairs and `loop_' tables, free-form, with quoting.  So
+none of the column arithmetic above applies and the whole reader is separate --
+but it fills in exactly the same output hash, atom for atom and field for field,
+because everything above this point in the module and everything in Perl below
+it is written against that hash and not against either file format.  A caller
+who reads 1cka.pdb and 1cka.cif gets two structures that compare equal.
+
+Where the two formats disagree about how to write the same fact, this reader
+converts to what the PDB reader would have produced: a formal charge of -1 comes
+back as "1-", auth_* identifiers are preferred over label_* ones because auth_*
+is what the PDB record carried, and a `.' or `?' -- mmCIF for "not applicable"
+and "unknown" -- comes back as the empty field the PDB record would have had.*/
+
+#define CT_EOF   0
+#define CT_VALUE 1
+#define CT_TAG   2
+#define CT_LOOP  3
+#define CT_DATA  4
+#define CT_SAVE  5
+#define CT_STOP  6
+
+typedef struct {
+	const char *buf;
+	const char *end;
+	const char *p;
+} cif_lex;
+
+typedef struct {
+	const char *s;
+	STRLEN n;
+	int kind;
+	/*a quoted value is text and nothing else: '.' in quotes is a full stop, and
+	only a bare '.' is the null the format means*/
+	int quoted;
+} cif_tok;
+
+static int cif_iskw(const char *CSP_RESTRICT s, STRLEN n, const char *CSP_RESTRICT kw,
+                    STRLEN kwn)
+{
+	STRLEN i;
+	if (n < kwn) return 0;
+	for (i = 0; i < kwn; i++)
+		if (tolower((unsigned char)s[i]) != kw[i]) return 0;
+	return 1;
+}
+
+static int cif_space(char c)
+{
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+//a bare '.' (not applicable) or '?' (unknown): the field was not filled in
+static int cif_null(const cif_tok *CSP_RESTRICT t)
+{
+	return !t->quoted && t->n == 1 && (t->s[0] == '.' || t->s[0] == '?');
+}
+
+/*cif_next() -- one token.  The four shapes a value can arrive in are a bare
+word, a quoted string, and a semicolon-delimited text field, which is the only
+one that can span lines and the only one whose delimiter is position-sensitive:
+a ';' is a delimiter only as the first character of a line, and anywhere else it
+is an ordinary character in a value.*/
+static void cif_next(cif_lex *CSP_RESTRICT lx, cif_tok *CSP_RESTRICT t)
+{
+	const char *p = lx->p, *end = lx->end;
+	t->quoted = 0;
+	for (;;) {
+		while (p < end && cif_space(*p)) p++;
+		if (p >= end) { lx->p = end; t->kind = CT_EOF; t->s = end; t->n = 0; return; }
+		if (*p == '#') {                       //a comment runs to the end of its line
+			while (p < end && *p != '\n') p++;
+			continue;
+		}
+		break;
+	}
+
+	if (*p == ';' && (p == lx->buf || p[-1] == '\n')) {
+		const char *s = p + 1, *q = s;
+		for (;;) {
+			const char *nl = (const char *)memchr(q, '\n', (STRLEN)(end - q));
+			if (!nl) { q = end; lx->p = end; break; }
+			if (nl + 1 < end && nl[1] == ';') { q = nl; lx->p = nl + 2; break; }
+			if (nl + 1 >= end) { q = nl; lx->p = end; break; }
+			q = nl + 1;
+		}
+		t->s = s;
+		t->n = (STRLEN)(q - s);
+		t->kind = CT_VALUE;
+		t->quoted = 1;
+		return;
+	}
+
+	if (*p == '\'' || *p == '"') {
+		/*the closing quote is one followed by whitespace or the end of the file.
+		Anything else is a quote inside the value, which is how a CIF writes
+		O5' without escaping it.*/
+		char qc = *p;
+		const char *s = p + 1, *q = s;
+		for (;;) {
+			while (q < end && *q != qc) q++;
+			if (q >= end) break;
+			if (q + 1 >= end || cif_space(q[1])) break;
+			q++;
+		}
+		t->s = s;
+		t->n = (STRLEN)(q - s);
+		t->kind = CT_VALUE;
+		t->quoted = 1;
+		lx->p = q < end ? q + 1 : end;
+		return;
+	}
+
+	{
+		const char *s = p;
+		STRLEN n;
+		while (p < end && !cif_space(*p)) p++;
+		n = (STRLEN)(p - s);
+		lx->p = p;
+		t->s = s;
+		t->n = n;
+		if (s[0] == '_')                             t->kind = CT_TAG;
+		else if (n == 5 && cif_iskw(s, n, "loop_", 5))  t->kind = CT_LOOP;
+		else if (n == 5 && cif_iskw(s, n, "stop_", 5))  t->kind = CT_STOP;
+		else if (n == 7 && cif_iskw(s, n, "global_", 7)) t->kind = CT_STOP;
+		else if (n >= 5 && cif_iskw(s, n, "data_", 5)) { t->kind = CT_DATA; t->s = s + 5; t->n = n - 5; }
+		else if (n >= 5 && cif_iskw(s, n, "save_", 5)) { t->kind = CT_SAVE; t->s = s + 5; t->n = n - 5; }
+		else t->kind = CT_VALUE;
+	}
+}
+
+/*a tag is _category.item.  Both halves are wanted -- the category says which
+table a loop is, the item says which column -- and both are matched without
+regard to case, which the format allows and real files use.*/
+static STRLEN cif_split_tag(const char *CSP_RESTRICT s, STRLEN n,
+                            const char **CSP_RESTRICT item, STRLEN *CSP_RESTRICT itemn)
+{
+	const char *dot = (const char *)memchr(s, '.', n);
+	if (!dot) { *item = s; *itemn = n; return n; }   //core CIF: no category half
+	*item  = dot + 1;
+	*itemn = n - (STRLEN)(dot - s) - 1;
+	return (STRLEN)(dot - s);
+}
+
+//the _atom_site columns this reader knows what to do with
+static const char *const cif_atom_item[] = {
+	"group_pdb", "id", "type_symbol", "label_atom_id", "label_alt_id",
+	"label_comp_id", "label_asym_id", "label_seq_id", "pdbx_pdb_ins_code",
+	"cartn_x", "cartn_y", "cartn_z", "occupancy", "b_iso_or_equiv",
+	"pdbx_formal_charge", "auth_seq_id", "auth_comp_id", "auth_asym_id",
+	"auth_atom_id", "pdbx_pdb_model_num"
+};
+enum {
+	A_GROUP, A_ID, A_SYMBOL, A_LATOM, A_ALT, A_LCOMP, A_LASYM, A_LSEQ, A_ICODE,
+	A_X, A_Y, A_Z, A_OCC, A_B, A_CHARGE, A_ASEQ, A_ACOMP, A_AASYM, A_AATOM,
+	A_MODEL, A_NFIELD
+};
+
+static int cif_atom_field(const char *CSP_RESTRICT item, STRLEN n)
+{
+	int i;
+	for (i = 0; i < A_NFIELD; i++) {
+		STRLEN kn = strlen(cif_atom_item[i]);
+		if (kn == n && cif_iskw(item, n, cif_atom_item[i], kn)) return i;
+	}
+	return -1;
+}
+
+/*mmCIF writes a formal charge as a signed integer and PDB as a magnitude
+followed by its sign, so -1 there is "1-" here.  A value that is not an integer
+is passed through: some writers already put the PDB spelling in this field.
+
+A charge of zero comes back as "0" rather than as nothing, because the two are
+different answers and the PDB reader keeps them apart: "the field was blank"
+against "the field said zero".  mmCIF spells the first '?', which arrives here
+as a field that was never set, so nothing is lost by reading the second
+literally -- and 6cc9, which writes a 0 in columns 79-80, reads the same from
+either format because of it.*/
+static STRLEN cif_charge(const char *CSP_RESTRICT s, STRLEN n, char *CSP_RESTRICT buf)
+{
+	IV c;
+	if (n == 0) return 0;
+	if (!str2iv(s, n, &c)) {
+		if (n > 2) n = 2;
+		memcpy(buf, s, n);
+		return n;
+	}
+	if (c == 0) { buf[0] = '0'; return 1; }
+	if (c < 0) { c = -c; buf[1] = '-'; } else buf[1] = '+';
+	if (c > 9) return 0;
+	buf[0] = (char)('0' + c);
+	return 2;
+}
+
+/*guess_element() reads an atom name out of the four columns a PDB record gives
+it, and its rule is where in those four the name starts.  mmCIF has no columns,
+so the name goes back where the PDB convention would have put it before the
+question is asked.  Only reached when _atom_site.type_symbol is missing, which
+is rare -- but a file without it should still not read CA as calcium.*/
+static STRLEN cif_guess_element(const char *CSP_RESTRICT s, STRLEN n, char *CSP_RESTRICT buf)
+{
+	char pad[4];
+	STRLEN i;
+	if (n >= 4) return guess_element(s, 4, buf);
+	pad[0] = ' ';
+	for (i = 0; i < n; i++)     pad[1 + i] = s[i];
+	for (i = n + 1; i < 4; i++) pad[i] = ' ';
+	return guess_element(pad, 4, buf);
+}
+
+/*Everything one _atom_site row needs to add itself to, gathered up so that a
+row can be handed to one function.  A loop_ is the ordinary way to write the
+table and a run of plain tags is the legal way to write a table with one row in
+it; both end up in cif_atom_row() rather than in two copies of it.*/
+typedef struct {
+	AV **col;
+	AV **res_sum;
+	AV *res_first, *res_last, *atom_hv, *model_nums;
+	HV *elements, *want_chain;
+	IV n_hydrogen, n_water_atom, bn;
+	NV bmin, bmax, bsum;
+	NV xmin, ymin, zmin, xmax, ymax, zmax;
+	int have_bbox;
+	NV rsx, rsy, rsz, rsb;
+	IV rnc, rnb;
+	IV want_model, n_models, n_anisou, n_skipped, n_atom, n_atom_rec, n_het_rec;
+	IV cur_model;
+	int keep_h, keep_water, keep_het, keep_anisou, build_atoms;
+	int have_res, seen_model;
+	char p_chain[8], p_icode[4], p_resname[8];
+	IV p_resseq, p_model;
+	int p_het;
+} cif_state;
+
+/*one row of _atom_site.  v[] holds a pointer and a length per known column, or
+NULL where the row said `.' or `?' or the file has no such column, so that "the
+field was not given" is one test wherever it is asked.
+
+The order of the tests below is the order the PDB reader uses -- model, then
+HETATM, then water, then chain, then hydrogen -- because n_skipped counts what
+was thrown away and the two readers have to agree on the count as well as on
+the structure.*/
+static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
+                         const char **CSP_RESTRICT v, STRLEN *CSP_RESTRICT vn)
+{
+	char resname[8], chain[8], icode[4], elbuf[4], chgbuf[4];
+	STRLEN resname_len, chain_len, ellen, chg_n;
+	const char *nm_s, *alt_s;
+	STRLEN nm_n, alt_n;
+	res_info ri;
+	int known, het, changed;
+	IV rs = 0, serial = 0, model = 1;
+	int have_rs, have_serial, have_occ, have_xyz, have_b;
+	NV xv = 0, yv = 0, zv = 0, ov = 0, bv = 0;
+
+	//which model this row belongs to, counted before anything can skip the row
+	if (v[A_MODEL] && str2iv(v[A_MODEL], vn[A_MODEL], &model)) {
+		if (!st->seen_model || model != st->cur_model) {
+			st->cur_model = model;
+			st->seen_model = 1;
+			st->n_models++;
+			av_push(st->model_nums, newSViv(model));
+		}
+	} else if (!st->seen_model) {
+		st->cur_model = 1;
+		st->seen_model = 1;
+		st->n_models++;
+		av_push(st->model_nums, newSViv(1));
+	}
+
+	het = v[A_GROUP] && vn[A_GROUP] >= 6 && cif_iskw(v[A_GROUP], vn[A_GROUP], "hetatm", 6);
+	if (het) st->n_het_rec++; else st->n_atom_rec++;
+
+	if (st->want_model >= 0 && st->cur_model != st->want_model) { st->n_skipped++; return; }
+	if (het && !st->keep_het) { st->n_skipped++; return; }
+
+	//residue name: auth_comp_id is the name the PDB record carried
+	{
+		const char *s = v[A_ACOMP] ? v[A_ACOMP] : v[A_LCOMP];
+		STRLEN n = v[A_ACOMP] ? vn[A_ACOMP] : (v[A_LCOMP] ? vn[A_LCOMP] : 0);
+		if (!s) { s = ""; n = 0; }
+		resname_len = n > sizeof(resname) - 1 ? sizeof(resname) - 1 : n;
+		memcpy(resname, s, resname_len);
+		resname[resname_len] = '\0';
+	}
+	known = res_lookup(resname, resname_len, &ri);
+	if (!st->keep_water && known && ri.type == RT_WATER) { st->n_skipped++; return; }
+
+	{
+		const char *s = v[A_AASYM] ? v[A_AASYM] : v[A_LASYM];
+		STRLEN n = v[A_AASYM] ? vn[A_AASYM] : (v[A_LASYM] ? vn[A_LASYM] : 0);
+		if (!s) { s = ""; n = 0; }
+		chain_len = n > sizeof(chain) - 1 ? sizeof(chain) - 1 : n;
+		memcpy(chain, s, chain_len);
+		chain[chain_len] = '\0';
+	}
+	if (st->want_chain && !hv_exists(st->want_chain, chain, (I32)chain_len)) {
+		st->n_skipped++;
+		return;
+	}
+
+	nm_s = v[A_AATOM] ? v[A_AATOM] : v[A_LATOM];
+	nm_n = v[A_AATOM] ? vn[A_AATOM] : (v[A_LATOM] ? vn[A_LATOM] : 0);
+	if (!nm_s) { nm_s = ""; nm_n = 0; }
+	alt_s = v[A_ALT] ? v[A_ALT] : "";
+	alt_n = v[A_ALT] ? vn[A_ALT] : 0;
+
+	if (v[A_SYMBOL]) {
+		STRLEN k;
+		ellen = vn[A_SYMBOL] > 2 ? 2 : vn[A_SYMBOL];
+		for (k = 0; k < ellen; k++) elbuf[k] = (char)toupper((unsigned char)v[A_SYMBOL][k]);
+	} else {
+		ellen = cif_guess_element(nm_s, nm_n, elbuf);
+	}
+	if (!st->keep_h && ellen == 1 && (elbuf[0] == 'H' || elbuf[0] == 'D')) {
+		st->n_skipped++;
+		return;
+	}
+
+	//kept.  auth_seq_id is the residue number the PDB record carried; label_seq_id
+	//is the position in the entity, and is null for everything that is not polymer
+	have_rs = 0;
+	if (v[A_ASEQ])      have_rs = str2iv(v[A_ASEQ], vn[A_ASEQ], &rs);
+	if (!have_rs && v[A_LSEQ]) have_rs = str2iv(v[A_LSEQ], vn[A_LSEQ], &rs);
+	if (!have_rs) rs = 0;
+	icode[0] = (v[A_ICODE] && vn[A_ICODE]) ? v[A_ICODE][0] : '\0';
+	icode[1] = '\0';
+
+	changed = !st->have_res
+	        || rs != st->p_resseq
+	        || st->p_model != st->cur_model
+	        || st->p_het != het
+	        || strcmp(st->p_chain, chain) != 0
+	        || strcmp(st->p_icode, icode) != 0
+	        || strcmp(st->p_resname, resname) != 0;
+	if (changed) {
+		if (st->have_res) {
+			av_push(st->res_last, newSViv(st->n_atom - 1));
+			flush_residue(aTHX_ st->res_sum, st->rsx, st->rsy, st->rsz, st->rnc, st->rsb, st->rnb);
+		}
+		st->rsx = st->rsy = st->rsz = st->rsb = 0;
+		st->rnc = st->rnb = 0;
+		av_push(st->res_first, newSViv(st->n_atom));
+		st->have_res = 1;
+		st->p_resseq = rs;
+		st->p_model  = st->cur_model;
+		st->p_het    = het;
+		my_strlcpy(st->p_chain, chain, sizeof(st->p_chain));
+		my_strlcpy(st->p_icode, icode, sizeof(st->p_icode));
+		my_strlcpy(st->p_resname, resname, sizeof(st->p_resname));
+	}
+
+	have_xyz = v[A_X] && v[A_Y] && v[A_Z]
+	         && str2nv(v[A_X], vn[A_X], &xv)
+	         && str2nv(v[A_Y], vn[A_Y], &yv)
+	         && str2nv(v[A_Z], vn[A_Z], &zv);
+	have_occ    = v[A_OCC] && str2nv(v[A_OCC], vn[A_OCC], &ov);
+	have_b      = v[A_B]   && str2nv(v[A_B],   vn[A_B],   &bv);
+	have_serial = v[A_ID]  && str2iv(v[A_ID],  vn[A_ID],  &serial);
+	chg_n = v[A_CHARGE] ? cif_charge(v[A_CHARGE], vn[A_CHARGE], chgbuf) : 0;
+
+	if (have_xyz) {
+		st->rsx += xv; st->rsy += yv; st->rsz += zv; st->rnc++;
+		if (!st->have_bbox) {
+			st->xmin = st->xmax = xv; st->ymin = st->ymax = yv; st->zmin = st->zmax = zv;
+			st->have_bbox = 1;
+		} else {
+			if (xv < st->xmin) st->xmin = xv; else if (xv > st->xmax) st->xmax = xv;
+			if (yv < st->ymin) st->ymin = yv; else if (yv > st->ymax) st->ymax = yv;
+			if (zv < st->zmin) st->zmin = zv; else if (zv > st->zmax) st->zmax = zv;
+		}
+	}
+	if (have_b) {
+		st->rsb += bv; st->rnb++;
+		if (!st->bn++) { st->bmin = st->bmax = bv; }
+		else if (bv < st->bmin) st->bmin = bv;
+		else if (bv > st->bmax) st->bmax = bv;
+		st->bsum += bv;
+	}
+	if (ellen) {
+		SV **cnt = hv_fetch(st->elements, elbuf, (I32)ellen, 1);
+		if (cnt && *cnt) sv_inc(*cnt);
+		if (ellen == 1 && (elbuf[0] == 'H' || elbuf[0] == 'D')) st->n_hydrogen++;
+	}
+	if (known && ri.type == RT_WATER) st->n_water_atom++;
+
+	if (st->build_atoms) {
+		HV *a = newHV();
+		(void)hv_stores(a, "name",   newSVpvn(nm_s, nm_n));
+		(void)hv_stores(a, "serial", have_serial ? newSViv(serial) : newSVsv(&PL_sv_undef));
+		(void)hv_stores(a, "altloc", newSVpvn(alt_s, alt_n));
+		(void)hv_stores(a, "x", have_xyz ? newSVnv(xv) : newSVsv(&PL_sv_undef));
+		(void)hv_stores(a, "y", have_xyz ? newSVnv(yv) : newSVsv(&PL_sv_undef));
+		(void)hv_stores(a, "z", have_xyz ? newSVnv(zv) : newSVsv(&PL_sv_undef));
+		(void)hv_stores(a, "occupancy", have_occ ? newSVnv(ov) : newSVsv(&PL_sv_undef));
+		(void)hv_stores(a, "bfactor",   have_b   ? newSVnv(bv) : newSVsv(&PL_sv_undef));
+		(void)hv_stores(a, "element", newSVpvn(elbuf, ellen));
+		(void)hv_stores(a, "charge",  newSVpvn(chgbuf, chg_n));
+		(void)hv_stores(a, "hetero",  newSViv(het));
+		av_push(st->atom_hv, newRV_noinc((SV *)a));
+	} else {
+		av_push(st->col[C_SERIAL], have_serial ? newSViv(serial) : newSVsv(&PL_sv_undef));
+		av_push(st->col[C_NAME],   newSVpvn(nm_s, nm_n));
+		av_push(st->col[C_ALTLOC], newSVpvn(alt_s, alt_n));
+		av_push(st->col[C_X], have_xyz ? newSVnv(xv) : newSVsv(&PL_sv_undef));
+		av_push(st->col[C_Y], have_xyz ? newSVnv(yv) : newSVsv(&PL_sv_undef));
+		av_push(st->col[C_Z], have_xyz ? newSVnv(zv) : newSVsv(&PL_sv_undef));
+		av_push(st->col[C_OCC], have_occ ? newSVnv(ov) : newSVsv(&PL_sv_undef));
+		av_push(st->col[C_B],   have_b   ? newSVnv(bv) : newSVsv(&PL_sv_undef));
+		av_push(st->col[C_ELEMENT], newSVpvn(elbuf, ellen));
+		av_push(st->col[C_CHARGE],  newSVpvn(chgbuf, chg_n));
+	}
+
+	av_push(st->col[C_RESNAME], newSVpvn(resname, resname_len));
+	av_push(st->col[C_CHAIN],   newSVpvn(chain, chain_len));
+	av_push(st->col[C_RESSEQ],  have_rs ? newSViv(rs) : newSVsv(&PL_sv_undef));
+	av_push(st->col[C_ICODE],   newSVpvn(icode, icode[0] ? 1 : 0));
+	av_push(st->col[C_HET],     newSViv(het));
+	av_push(st->col[C_MODEL],   newSViv(st->cur_model));
+	st->n_atom++;
+}
+
+//a token as the SV a caller reads: a null field is undef, not an empty string
+static SV *cif_sv(pTHX_ const cif_tok *CSP_RESTRICT t)
+{
+	return cif_null(t) ? newSVsv(&PL_sv_undef) : newSVpvn(t->s, t->n);
+}
+
+//lowercased, so that a caller looking a tag up never has to guess at its case
+static SV *cif_key(pTHX_ const char *CSP_RESTRICT s, STRLEN n)
+{
+	SV *sv = newSVpvn(s, n);
+	char *p = SvPVX(sv);
+	STRLEN i;
+	for (i = 0; i < n; i++) p[i] = (char)tolower((unsigned char)p[i]);
+	return sv;
+}
+
+static void cif_store_lc(pTHX_ HV *CSP_RESTRICT h, const char *CSP_RESTRICT k, STRLEN kn,
+                         SV *CSP_RESTRICT val)
+{
+	SV *key = cif_key(aTHX_ k, kn);
+	(void)hv_store_ent(h, key, val, 0);
+	SvREFCNT_dec(key);
+}
+
+static AV *cif_loop_av(pTHX_ HV *CSP_RESTRICT loops, const char *CSP_RESTRICT cat, STRLEN catn)
+{
+	SV *key = cif_key(aTHX_ cat, catn);
+	HE *he = hv_fetch_ent(loops, key, 0, 0);
+	AV *av;
+	if (he && HeVAL(he) && SvROK(HeVAL(he))) {
+		av = (AV *)SvRV(HeVAL(he));
+	} else {
+		av = newAV();
+		(void)hv_store_ent(loops, key, newRV_noinc((SV *)av), 0);
+	}
+	SvREFCNT_dec(key);
+	return av;
+}
+
+/*parse_cif_buf() -- the whole file, once through, into the same hash
+parse_buf() fills.  The atom table goes to cif_atom_row(); everything else is
+kept as it was written, single tags in `cif' and loops in `cif_loops', for Perl
+to make sense of.  Nothing here decides what a category means: that is the same
+division of labour the PDB reader keeps, where C reads the coordinates and Perl
+reads the header.*/
+static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RESTRICT opts)
+{
+	HV *out = newHV();
+	HV *meta = newHV(), *cif = newHV(), *loops = newHV();
+	AV *col[NCOL], *res_sum[NRSUM];
+	cif_state st;
+	cif_lex lx;
+	cif_tok tk;
+	int i, keep_meta;
+	IV lineno = 0;
+	SV *block = NULL;
+	const char *v[A_NFIELD];
+	STRLEN vn[A_NFIELD];
+	//an _atom_site table written as plain tags rather than as a loop_
+	const char *sv_[A_NFIELD];
+	STRLEN svn_[A_NFIELD];
+	int have_single = 0;
+
+	Zero(&st, 1, cif_state);
+	for (i = 0; i < NCOL; i++)  col[i] = newAV();
+	for (i = 0; i < NRSUM; i++) res_sum[i] = newAV();
+	for (i = 0; i < A_NFIELD; i++) { sv_[i] = NULL; svn_[i] = 0; }
+
+	st.col        = col;
+	st.res_sum    = res_sum;
+	st.res_first  = newAV();
+	st.res_last   = newAV();
+	st.atom_hv    = newAV();
+	st.model_nums = newAV();
+	st.elements   = newHV();
+	st.cur_model  = 1;
+	st.want_model = opt_iv(aTHX_ opts, "model", 1);
+	st.keep_h     = opt_bool(aTHX_ opts, "hydrogens", 1);
+	st.keep_water = opt_bool(aTHX_ opts, "waters", 1);
+	st.keep_het   = opt_bool(aTHX_ opts, "hetatm", 1);
+	st.keep_anisou= opt_bool(aTHX_ opts, "anisou", 0);
+	st.build_atoms= opt_bool(aTHX_ opts, "atom_hashes", 0);
+	keep_meta     = opt_bool(aTHX_ opts, "meta", 1);
+	{
+		SV *c = opt_get(aTHX_ opts, "chains");
+		if (c && SvROK(c) && SvTYPE(SvRV(c)) == SVt_PVHV) st.want_chain = (HV *)SvRV(c);
+	}
+
+	{	//lines are not what this format is made of, but callers still count them
+		const char *p = buf, *e = buf + len;
+		while (p < e) {
+			const char *nl = (const char *)memchr(p, '\n', (STRLEN)(e - p));
+			lineno++;
+			if (!nl) break;
+			p = nl + 1;
+		}
+	}
+
+	lx.buf = buf;
+	lx.end = buf + len;
+	lx.p   = buf;
+
+	for (;;) {
+		cif_next(&lx, &tk);
+		if (tk.kind == CT_EOF) break;
+
+		if (tk.kind == CT_DATA) {
+			if (!block && tk.n) block = newSVpvn(tk.s, tk.n);
+			continue;
+		}
+		if (tk.kind == CT_STOP || tk.kind == CT_SAVE) continue;
+
+		if (tk.kind == CT_LOOP) {
+			const char **tags = NULL;
+			STRLEN *tagn = NULL;
+			int *fld_of = NULL;
+			int ntags = 0, cap = 16, is_atom = 0, is_aniso = 0, keep_loop = 0;
+			const char *cat = NULL;
+			STRLEN catn = 0;
+			AV *rows = NULL;
+
+			Newx(tags, cap, const char *);
+			Newx(tagn, cap, STRLEN);
+			for (;;) {
+				const char *save = lx.p;
+				cif_next(&lx, &tk);
+				if (tk.kind != CT_TAG) { lx.p = save; break; }
+				if (ntags == cap) {
+					cap *= 2;
+					Renew(tags, cap, const char *);
+					Renew(tagn, cap, STRLEN);
+				}
+				tags[ntags] = tk.s;
+				tagn[ntags] = tk.n;
+				ntags++;
+			}
+			if (ntags == 0) { Safefree(tags); Safefree(tagn); continue; }
+
+			{
+				const char *item;
+				STRLEN itemn;
+				catn = cif_split_tag(tags[0], tagn[0], &item, &itemn);
+				cat  = tags[0];
+				is_atom  = (catn == 10 && cif_iskw(cat, catn, "_atom_site", 10));
+				is_aniso = (catn == 20 && cif_iskw(cat, catn, "_atom_site_anisotrop", 20));
+			}
+			/*_atom_site_anisotrop is as long as the atom table and is wanted about
+			as often as ANISOU is, which is to say hardly ever; it is counted
+			always and kept only when the caller asked for it*/
+			keep_loop = keep_meta && !is_atom && (!is_aniso || st.keep_anisou);
+			if (keep_loop) rows = cif_loop_av(aTHX_ loops, cat, catn);
+
+			Newx(fld_of, ntags, int);
+			for (i = 0; i < ntags; i++) {
+				const char *item;
+				STRLEN itemn;
+				(void)cif_split_tag(tags[i], tagn[i], &item, &itemn);
+				fld_of[i] = is_atom ? cif_atom_field(item, itemn) : -1;
+			}
+
+			for (;;) {
+				const char *save = lx.p;
+				int col_i;
+				HV *row = NULL;
+				cif_next(&lx, &tk);
+				if (tk.kind != CT_VALUE) { lx.p = save; break; }
+				if (is_atom) for (i = 0; i < A_NFIELD; i++) { v[i] = NULL; vn[i] = 0; }
+				if (keep_loop) row = newHV();
+
+				for (col_i = 0; ; col_i++) {
+					if (col_i > 0) {
+						save = lx.p;
+						cif_next(&lx, &tk);
+						if (tk.kind != CT_VALUE) { lx.p = save; break; }
+					}
+					if (is_atom) {
+						int f = fld_of[col_i];
+						if (f >= 0 && !cif_null(&tk)) { v[f] = tk.s; vn[f] = tk.n; }
+					} else if (row) {
+						const char *item;
+						STRLEN itemn;
+						(void)cif_split_tag(tags[col_i], tagn[col_i], &item, &itemn);
+						cif_store_lc(aTHX_ row, item, itemn, cif_sv(aTHX_ &tk));
+					}
+					if (col_i + 1 >= ntags) break;
+				}
+				if (is_atom)      cif_atom_row(aTHX_ &st, v, vn);
+				else if (is_aniso) st.n_anisou++;
+				if (row) av_push(rows, newRV_noinc((SV *)row));
+			}
+			Safefree(tags);
+			Safefree(tagn);
+			Safefree(fld_of);
+			continue;
+		}
+
+		if (tk.kind == CT_TAG) {
+			const char *tag = tk.s, *item;
+			STRLEN tagn = tk.n, itemn, catn;
+			const char *save = lx.p;
+			catn = cif_split_tag(tag, tagn, &item, &itemn);
+			cif_next(&lx, &tk);
+			if (tk.kind != CT_VALUE) { lx.p = save; continue; }   //a tag with no value
+			if (catn == 10 && cif_iskw(tag, catn, "_atom_site", 10)) {
+				int f = cif_atom_field(item, itemn);
+				if (f >= 0 && !cif_null(&tk)) { sv_[f] = tk.s; svn_[f] = tk.n; have_single = 1; }
+				continue;
+			}
+			if (catn == 20 && cif_iskw(tag, catn, "_atom_site_anisotrop", 20)) {
+				st.n_anisou++;
+				continue;
+			}
+			if (keep_meta) cif_store_lc(aTHX_ cif, tag, tagn, cif_sv(aTHX_ &tk));
+			continue;
+		}
+		//a stray value with no tag in front of it: nothing to attach it to
+	}
+
+	if (have_single) cif_atom_row(aTHX_ &st, sv_, svn_);
+
+	if (st.have_res) {
+		av_push(st.res_last, newSViv(st.n_atom - 1));
+		flush_residue(aTHX_ res_sum, st.rsx, st.rsy, st.rsz, st.rnc, st.rsb, st.rnb);
+	}
+
+	(void)hv_stores(out, "atoms", newRV_noinc((SV *)st.atom_hv));
+	for (i = 0; i < NRSUM; i++)
+		(void)hv_store(out, res_sum_name[i], (I32)strlen(res_sum_name[i]),
+		               newRV_noinc((SV *)res_sum[i]), 0);
+	(void)hv_stores(out, "elements",      newRV_noinc((SV *)st.elements));
+	(void)hv_stores(out, "n_hydrogens",   newSViv(st.n_hydrogen));
+	(void)hv_stores(out, "n_water_atoms", newSViv(st.n_water_atom));
+	if (st.bn) {
+		HV *b = newHV();
+		(void)hv_stores(b, "min",  newSVnv(st.bmin));
+		(void)hv_stores(b, "max",  newSVnv(st.bmax));
+		(void)hv_stores(b, "mean", newSVnv(st.bsum / (NV)st.bn));
+		(void)hv_stores(b, "n",    newSViv(st.bn));
+		(void)hv_stores(out, "bfactor_stats", newRV_noinc((SV *)b));
+	} else {
+		(void)hv_stores(out, "bfactor_stats", newSVsv(&PL_sv_undef));
+	}
+	if (st.have_bbox) {
+		HV *bb = newHV();
+		AV *ctr = newAV();
+		(void)hv_stores(bb, "xmin", newSVnv(st.xmin));
+		(void)hv_stores(bb, "ymin", newSVnv(st.ymin));
+		(void)hv_stores(bb, "zmin", newSVnv(st.zmin));
+		(void)hv_stores(bb, "xmax", newSVnv(st.xmax));
+		(void)hv_stores(bb, "ymax", newSVnv(st.ymax));
+		(void)hv_stores(bb, "zmax", newSVnv(st.zmax));
+		av_push(ctr, newSVnv((st.xmin + st.xmax) / 2));
+		av_push(ctr, newSVnv((st.ymin + st.ymax) / 2));
+		av_push(ctr, newSVnv((st.zmin + st.zmax) / 2));
+		(void)hv_stores(out, "bbox",   newRV_noinc((SV *)bb));
+		(void)hv_stores(out, "center", newRV_noinc((SV *)ctr));
+	} else {
+		(void)hv_stores(out, "bbox",   newSVsv(&PL_sv_undef));
+		(void)hv_stores(out, "center", newSVsv(&PL_sv_undef));
+	}
+
+	for (i = 0; i < NCOL; i++) {
+		if (i == C_LINENO) { SvREFCNT_dec((SV *)col[i]); continue; }
+		(void)hv_store(out, col_name[i], (I32)strlen(col_name[i]),
+		               newRV_noinc((SV *)col[i]), 0);
+	}
+	(void)hv_stores(out, "res_first",     newRV_noinc((SV *)st.res_first));
+	(void)hv_stores(out, "res_last",      newRV_noinc((SV *)st.res_last));
+	//TER is a PDB record and has no mmCIF counterpart; the key is here so that
+	//a caller reading it does not have to know which format the file was
+	(void)hv_stores(out, "ter",           newRV_noinc((SV *)newAV()));
+	(void)hv_stores(out, "meta",          newRV_noinc((SV *)meta));
+	(void)hv_stores(out, "cif",           newRV_noinc((SV *)cif));
+	(void)hv_stores(out, "cif_loops",     newRV_noinc((SV *)loops));
+	(void)hv_stores(out, "data_block",    block ? block : newSVsv(&PL_sv_undef));
+	(void)hv_stores(out, "model_numbers", newRV_noinc((SV *)st.model_nums));
+	(void)hv_stores(out, "n_atoms",       newSViv(st.n_atom));
+	(void)hv_stores(out, "n_residues",    newSViv(av_len(st.res_first) + 1));
+	(void)hv_stores(out, "n_models",      newSViv(st.n_models ? st.n_models : 1));
+	(void)hv_stores(out, "n_anisou",      newSViv(st.n_anisou));
+	(void)hv_stores(out, "n_skipped",     newSViv(st.n_skipped));
+	(void)hv_stores(out, "n_atom_records",   newSViv(st.n_atom_rec));
+	(void)hv_stores(out, "n_hetatm_records", newSViv(st.n_het_rec));
+	(void)hv_stores(out, "n_lines",       newSViv(lineno));
+	(void)hv_stores(out, "format",        newSVpvs("mmcif"));
 	return out;
 }
 
 /*slurp() -- read the whole file.  Chunked rather than stat-then-read so that
 a named pipe or /dev/stdin works the same as a file on disk.*/
-static char *slurp(pTHX_ const char *CSP_RESTRICT path, STRLEN *CSP_RESTRICT lenp)
+static char *slurp(pTHX_ const char *restrict CSP_RESTRICT path, STRLEN *restrict CSP_RESTRICT lenp)
 {
-	FILE *fh = fopen(path, "rb");
-	char *buf;
+	FILE *restrict fh = fopen(path, "rb");
+	char *restrict buf;
 	STRLEN cap = 1 << 20, len = 0;
 	if (!fh) croak("Chem::Structure::Parser: cannot read '%s': %s", path, Strerror(errno));
 	Newx(buf, cap, char);
@@ -915,15 +1628,14 @@ MODULE = Chem::Structure::Parser		PACKAGE = Chem::Structure::Parser
 
 PROTOTYPES: DISABLE
 
-SV *
-_parse_file(path, opts = &PL_sv_undef)
+SV * _parse_file(path, opts = &PL_sv_undef)
 	SV *path
 	SV *opts
 	PREINIT:
-		char *buf;
+		char *restrict buf;
 		STRLEN len;
 		HV *o = NULL, *res;
-		const char *p;
+		const char *restrict p;
 	CODE:
 		if (!SvOK(path)) croak("Chem::Structure::Parser: file name is undefined");
 		if (SvOK(opts)) {
@@ -940,13 +1652,12 @@ _parse_file(path, opts = &PL_sv_undef)
 	OUTPUT:
 		RETVAL
 
-SV *
-_parse_string(text, opts = &PL_sv_undef)
+SV * _parse_string(text, opts = &PL_sv_undef)
 	SV *text
 	SV *opts
 	PREINIT:
 		STRLEN len;
-		const char *buf;
+		const char *restrict buf;
 		HV *o = NULL, *res;
 	CODE:
 		if (!SvOK(text)) croak("Chem::Structure::Parser: PDB text is undefined");
@@ -961,12 +1672,58 @@ _parse_string(text, opts = &PL_sv_undef)
 	OUTPUT:
 		RETVAL
 
+SV *
+_parse_cif_file(path, opts = &PL_sv_undef)
+	SV *path
+	SV *opts
+	PREINIT:
+		char *restrict buf;
+		STRLEN len;
+		HV *o = NULL, *res;
+		const char *restrict p;
+	CODE:
+		if (!SvOK(path)) croak("Chem::Structure::Parser: file name is undefined");
+		if (SvOK(opts)) {
+			if (!SvROK(opts) || SvTYPE(SvRV(opts)) != SVt_PVHV)
+				croak("Chem::Structure::Parser: options must be a hash reference");
+			o = (HV *)SvRV(opts);
+		}
+		p = SvPV_nolen(path);
+		buf = slurp(aTHX_ p, &len);
+		res = parse_cif_buf(aTHX_ buf, len, o);
+		Safefree(buf);
+		(void)hv_stores(res, "file", newSVsv(path));
+		RETVAL = newRV_noinc((SV *)res);
+	OUTPUT:
+		RETVAL
+
+SV *
+_parse_cif_string(text, opts = &PL_sv_undef)
+	SV *text
+	SV *opts
+	PREINIT:
+		STRLEN len;
+		const char *restrict buf;
+		HV *o = NULL, *res;
+	CODE:
+		if (!SvOK(text)) croak("Chem::Structure::Parser: mmCIF text is undefined");
+		if (SvOK(opts)) {
+			if (!SvROK(opts) || SvTYPE(SvRV(opts)) != SVt_PVHV)
+				croak("Chem::Structure::Parser: options must be a hash reference");
+			o = (HV *)SvRV(opts);
+		}
+		buf = SvPV_const(text, len);
+		res = parse_cif_buf(aTHX_ buf, len, o);
+		RETVAL = newRV_noinc((SV *)res);
+	OUTPUT:
+		RETVAL
+
 void
 _str2nv_paths(text)
 	SV *text
 	PREINIT:
 		STRLEN n;
-		const char *s;
+		const char *restrict s;
 		NV a = 0, b = 0;
 		int ok_a, ok_b;
 	PPCODE:

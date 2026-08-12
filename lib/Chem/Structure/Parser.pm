@@ -12,7 +12,7 @@ use Scalar::Util 'reftype';
 XSLoader::load('Chem::Structure::Parser', $VERSION);
 
 our @EXPORT_OK = qw(
-	structure_info structure_info_string pdb_info
+	structure_info structure_info_string pdb_info cif_info
 	structure_atoms structure_residues structure_ligands structure_sequences
 	chain_sequence structure_summary
 	aa3to1 aa1to3 res1 res_type formats h
@@ -34,15 +34,35 @@ our @EXPORT = @EXPORT_OK;
 # know that a second format exists.
 #
 my %READER = (
-	pdb => \&_read_pdb,
+	pdb   => \&_read_pdb,
+	mmcif => \&_read_cif,
+);
+
+# The XS parser for each format.  Both fill the same hash -- the same column
+# arrays, the same residue boundaries, the same counts -- so everything below
+# this table is written once and reads either format.  What differs is the
+# header: a PDB file hands its header back as raw lines by record name, an
+# mmCIF file as tags and loops, and that is the one place the two part company.
+my %XS = (
+	pdb   => { file => \&_parse_file,     string => \&_parse_string     },
+	mmcif => { file => \&_parse_cif_file, string => \&_parse_cif_string },
 );
 
 # formats a reader is not written for yet, kept here so that handing one over
 # gets a straight answer rather than a puzzling parse of the wrong thing
 my %NOT_YET = (
-	mmcif => 'mmCIF/PDBx (.cif)',
-	mol2  => 'Tripos MOL2 (.mol2)',
-	sdf   => 'MDL SDF/MOL (.sdf, .mol)',
+	mol2 => 'Tripos MOL2 (.mol2)',
+	sdf  => 'MDL SDF/MOL (.sdf, .mol)',
+);
+
+# The names a format goes by, for format => .  A caller writing
+# format => 'cif' means the format whose files are called .cif, and dying at
+# them over the difference between that and 'mmcif' would be pedantry: there is
+# only one thing they could have meant.  The name a format is filed under is
+# still the one it reports back as, so $info->{format} has one spelling.
+my %ALIAS = (
+	cif => 'mmcif', pdbx => 'mmcif', mmcif => 'mmcif',
+	ent => 'pdb',   pdb  => 'pdb',
 );
 
 # 
@@ -103,7 +123,7 @@ sub structure_info {
 	die "structure_info: '$file' does not exist"  unless -e $file;
 	die "structure_info: '$file' is a directory"  if -d $file;
 	my $o   = _options(\%opt, 'structure_info');
-	my $fmt = defined $o->{format} ? lc $o->{format} : _detect_format($file);
+	my $fmt = defined $o->{format} ? _alias($o->{format}) : _detect_format($file);
 	my $reader = $READER{$fmt}
 		or die "structure_info: cannot read '$file': "
 		       . (exists $NOT_YET{$fmt}
@@ -118,12 +138,20 @@ sub pdb_info {
 	return structure_info($file, %opt, format => 'pdb');
 }
 
+# cif_info($file, %opt) -- the same for mmCIF/PDBx.  Both of these exist for a
+# caller who already knows what they have; structure_info() works it out and
+# returns the same thing either way, so neither is the usual way in.
+sub cif_info {
+	my ($file, %opt) = @_;
+	return structure_info($file, %opt, format => 'mmcif');
+}
+
 # structure_info_string($text, %opt) -- the same, from a string already in hand.
 sub structure_info_string {
 	my ($text, %opt) = @_;
 	die 'structure_info_string: text is undefined' unless defined $text;
 	my $o = _options(\%opt, 'structure_info_string');
-	my $fmt = defined $o->{format} ? lc $o->{format} : _sniff_format($text);
+	my $fmt = defined $o->{format} ? _alias($o->{format}) : _sniff_format($text);
 	# a string has no name to go on, and the caller has already said this is a
 	# structure, so text that looks like nothing in particular is read as PDB.
 	# Text that looks like something else still gets a straight answer.
@@ -133,8 +161,9 @@ sub structure_info_string {
 	       ? "$NOT_YET{$fmt} is not implemented yet"
 	       : "no reader for format '$fmt'")
 		unless $READER{$fmt};
-	my $p = _parse_string($text, _xs_options($o));
-	return _build_pdb(_retry_model($p, $o, \&_parse_string, $text), $o, undef);
+	my $parse = $XS{$fmt}{string};
+	my $p = $parse->($text, _xs_options($o));
+	return _build_structure(_retry_model($p, $o, $parse, $text), $o, undef);
 }
 
 # formats() -- the formats that can be read, in list context; in scalar
@@ -318,6 +347,13 @@ sub _xs_options {
 	};
 }
 
+# the format a caller named, under the name it is filed under here
+sub _alias {
+	my ($fmt) = @_;
+	$fmt = lc $fmt;
+	return exists $ALIAS{$fmt} ? $ALIAS{$fmt} : $fmt;
+}
+
 sub _detect_format {
 	my ($file) = @_;
 	my $name = $file;
@@ -377,22 +413,30 @@ sub _slurp_maybe_gzipped {
 	return $text;
 }
 
-# 
-# The PDB reader
-# 
+#
+# The readers
+#
+# There is one of these per format and they differ only in which XS parser
+# they call, because the parsers agree about what they hand back.  Keeping
+# them as two named subs rather than one closure is so that %READER reads as a
+# list of formats and the die message above can name them.
+#
 
-sub _read_pdb {
-	my ($file, $o) = @_;
+sub _read_pdb { return _read($XS{pdb},   @_) }
+sub _read_cif { return _read($XS{mmcif}, @_) }
+
+sub _read {
+	my ($xs, $file, $o) = @_;
 	my $p;
 	if ($file =~ /\.gz\z/i) {
 		my $text = _slurp_maybe_gzipped($file, undef);
-		$p = _parse_string($text, _xs_options($o));
-		$p = _retry_model($p, $o, \&_parse_string, $text);
+		$p = $xs->{string}->($text, _xs_options($o));
+		$p = _retry_model($p, $o, $xs->{string}, $text);
 	} else {
-		$p = _parse_file($file, _xs_options($o));
-		$p = _retry_model($p, $o, \&_parse_file, $file);
+		$p = $xs->{file}->($file, _xs_options($o));
+		$p = _retry_model($p, $o, $xs->{file}, $file);
 	}
-	return _build_pdb($p, $o, $file);
+	return _build_structure($p, $o, $file);
 }
 
 # An NMR ensemble whose models are numbered from 0, or a file whose only model
@@ -411,12 +455,12 @@ sub _retry_model {
 	return $q;
 }
 
-sub _build_pdb {
+sub _build_structure {
 	my ($p, $o, $file) = @_;
-	my $meta = $p->{meta} || {};
+	my $fmt = $p->{format} || 'pdb';
 	my $info = {
 		file     => $file,
-		format   => 'pdb',
+		format   => $fmt,
 		model    => (defined $p->{requested_model} ? $p->{requested_model}
 		             : $o->{model} eq 'all' ? 'all' : $o->{model}),
 		n_models => $p->{n_models},
@@ -441,7 +485,12 @@ sub _build_pdb {
 		},
 	};
 
-	_parse_meta($info, $meta) if $o->{meta};
+	# the one place the two formats are read differently, and the reason it is
+	# the only one: everything below works off $info, which is the same shape
+	# whichever of these filled it in
+	if ($o->{meta}) {
+		$fmt eq 'mmcif' ? _parse_cif_meta($info, $p) : _parse_meta($info, $p->{meta} || {});
+	}
 
 	my $by_model = _assemble($p, $o, $info);
 	my @models = sort { $a <=> $b } keys %$by_model;
@@ -770,16 +819,24 @@ sub _id_from {
 # dozen lines of them in a file, they are irregular, and they are where a new
 # quirk turns up every few hundred structures.  That is Perl's job, not C's.
 # 
-sub _parse_meta {
-	my ($info, $meta) = @_;
-
-	# defaults, so that callers can read a key without testing for it first
+# The keys a parsed structure always has, whatever was in the file and
+# whichever format it was in.  Set before either reader runs, so that a caller
+# can read $info->{resolution} without first asking whether the file was an
+# mmCIF, and get undef for "the file does not say" in both.
+sub _meta_defaults {
+	my ($info) = @_;
 	$info->{$_} = undef for qw(title resolution r_work r_free);
 	$info->{$_} = []    for qw(keywords experiment authors);
 	$info->{$_} = {}    for qw(header compound source seqres het hetnam formul
 	                           remarks dbref entity_of_chain cryst1 journal
 	                           modres);
 	$info->{$_} = []    for qw(helix sheet ssbond link cispep revdat site conect);
+	return $info;
+}
+
+sub _parse_meta {
+	my ($info, $meta) = @_;
+	_meta_defaults($info);
 
 	if (my $h = $meta->{HEADER}) {
 		my $l = $h->[0];
@@ -1056,6 +1113,427 @@ sub _entities {
 	return $info;
 }
 
+#
+# mmCIF header categories
+#
+# The same facts, filed differently.  A PDB file says the resolution on a
+# REMARK 2 line and an mmCIF file says it in _refine.ls_d_res_high, and a
+# caller who wants to know the resolution should not have to care which.  So
+# this fills in the same $info keys _parse_meta() fills in, from the
+# categories that carry the same information.
+#
+# Where a fact exists in one format and not the other it is left alone rather
+# than invented: an mmCIF file has no REMARK records, so $info->{remarks} stays
+# empty, and reading it gets the same "nothing there" a PDB file with no
+# remarks would give.
+#
+# Identifiers are the auth_* ones throughout -- pdbx_strand_id, auth_asym_id --
+# because those are the chain ids the coordinates were read under and the ones
+# the PDB record carried.  Using label_asym_id here would file the annotations
+# under chains that the chains hash does not have.
+#
+
+sub _parse_cif_meta {
+	my ($info, $p) = @_;
+	_meta_defaults($info);
+	my $cif   = $p->{cif}       || {};
+	my $loops = $p->{cif_loops} || {};
+
+	my $id = _cif1($p, '_entry', 'id');
+	$info->{header} = {
+		classification => _cif1($p, '_struct_keywords', 'pdbx_keywords'),
+		deposit_date   => _cif1($p, '_pdbx_database_status', 'recvd_initial_deposition_date'),
+		id_code        => defined $id ? uc $id : '',
+	};
+	# The data_ block name is deliberately not a key of its own.  It is usually
+	# the entry id, which $info->{id} already has, and where it is not -- a file
+	# written by a simulation program calls its block 'cell' -- it is worse than
+	# the file name _id_from() falls back to.  A key only one of the two formats
+	# could ever fill in is a key a caller has to test the format for.
+
+	$info->{title}    = _cif1($p, '_struct', 'title');
+	$info->{keywords} = [ grep { length } map { _t($_) }
+	                      split /,/, (_cif1($p, '_struct_keywords', 'text') || '') ];
+	$info->{experiment} = [ grep { defined && length }
+	                        map { $_->{method} } @{ _cif_rows($p, '_exptl') } ];
+	$info->{authors}    = [ grep { defined && length }
+	                        map { $_->{name} } @{ _cif_rows($p, '_audit_author') } ];
+
+	# resolution: refined structures say so in _refine; the others say it
+	# wherever their method says it
+	for my $where ([ '_refine', 'ls_d_res_high' ],
+	               [ '_reflns', 'd_resolution_high' ],
+	               [ '_em_3d_reconstruction', 'resolution' ]) {
+		my $v = _cifn($p, @$where);
+		next unless defined $v;
+		$info->{resolution} = $v;
+		last;
+	}
+	$info->{r_work}      = _cifn($p, '_refine', 'ls_r_factor_r_work');
+	$info->{r_free}      = _cifn($p, '_refine', 'ls_r_factor_r_free');
+	$info->{temperature} = _cifn($p, '_diffrn', 'ambient_temp');
+	$info->{ph}          = _cifn($p, '_exptl_crystal_grow', 'ph');
+	my $nmr = _cifn($p, '_pdbx_nmr_ensemble', 'conformers_submitted_total_number');
+	$info->{n_models_declared} = $nmr if defined $nmr;
+
+	# the paper.  'primary' is the entry's own citation; anything else in the
+	# category is a reference it cites.
+	my @cites = @{ _cif_rows($p, '_citation') };
+	my ($cite) = ((grep { ($_->{id} || '') eq 'primary' } @cites), @cites);
+	if ($cite) {
+		my %j;
+		$j{titl} = $cite->{title}                    if defined $cite->{title};
+		$j{pmid} = $cite->{pdbx_database_id_pubmed}  if defined $cite->{pdbx_database_id_pubmed};
+		$j{doi}  = $cite->{pdbx_database_id_doi}     if defined $cite->{pdbx_database_id_doi};
+		my @ref = grep { defined && length }
+		          @{$cite}{qw(journal_abbrev journal_volume page_first year)};
+		$j{ref} = join ' ', @ref if @ref;
+		my $cid = $cite->{id};
+		my @auth = map { $_->{name} }
+		           grep { !defined $cid || !defined $_->{citation_id} || $_->{citation_id} eq $cid }
+		           @{ _cif_rows($p, '_citation_author') };
+		$j{auth} = [ grep { defined && length } @auth ] if @auth;
+		$info->{journal} = \%j;
+	}
+
+	if (my @cell = grep { defined } map { _cifn($p, '_cell', $_) }
+	               qw(length_a length_b length_c angle_alpha angle_beta angle_gamma)) {
+		$info->{cryst1} = {
+			a     => _cifn($p, '_cell', 'length_a'),
+			b     => _cifn($p, '_cell', 'length_b'),
+			c     => _cifn($p, '_cell', 'length_c'),
+			alpha => _cifn($p, '_cell', 'angle_alpha'),
+			beta  => _cifn($p, '_cell', 'angle_beta'),
+			gamma => _cifn($p, '_cell', 'angle_gamma'),
+			sgroup => _cif1($p, '_symmetry', 'space_group_name_h-m'),
+			z      => _cif1($p, '_cell', 'z_pdb'),
+		} if @cell;
+	}
+
+	_cif_entities($info, $p);
+	_cif_seqres($info, $p);
+	_cif_het($info, $p);
+	_cif_annotations($info, $p);
+
+	# what the file actually contained, by category, which is the mmCIF answer
+	# to the question $info->{records} answers for a PDB file
+	my %rec = map { $_ => scalar @{ $loops->{$_} } } keys %$loops;
+	for my $tag (keys %$cif) {
+		my ($cat) = $tag =~ /\A([^.]+)/;
+		$rec{$cat} ||= 1;
+	}
+	$info->{records} = \%rec;
+	return $info;
+}
+
+# --- the entities, and which chains they are -------------------------------
+#
+# COMPND and SOURCE in a PDB file are one _entity plus one _entity_src_* here,
+# so they are put back into the shape _entities() already knows how to turn
+# into a per-chain record.
+sub _cif_entities {
+	my ($info, $p) = @_;
+
+	# Only the polymer entities claim chains, which is the rule COMPND follows:
+	# a chain is the molecule its polymer is, and the ligands, ions and waters
+	# sitting in it are not what it is.  They share the chain id -- the zinc in
+	# chain A is written as chain A -- so a non-polymer entity that claimed its
+	# chains here would take the chain's name over from the protein, and
+	# whichever entity happened to be looked at last would win.  Where the
+	# ligands are is $info->{het}, which is where a PDB file keeps it too.
+	my %chains_of;
+	for my $r (@{ _cif_rows($p, '_entity_poly') }) {
+		next unless defined $r->{entity_id};
+		$chains_of{ $r->{entity_id} } = [ grep { length } map { _t($_) }
+		                                  split /,/, ($r->{pdbx_strand_id} || '') ];
+	}
+
+	my (%compound, %source);
+	for my $r (@{ _cif_rows($p, '_entity') }) {
+		my $e = $r->{id};
+		next unless defined $e;
+		$compound{$e} = {
+			mol_id   => $e,
+			molecule => $r->{pdbx_description},
+			chain    => $chains_of{$e} || [],
+			type     => $r->{type},
+		};
+		$compound{$e}{ec} = $r->{pdbx_ec} if defined $r->{pdbx_ec};
+	}
+	# an entity that only shows up in _entity_poly still has to have a record,
+	# or its chains lose their molecule name
+	for my $e (keys %chains_of) {
+		$compound{$e} ||= { mol_id => $e, chain => $chains_of{$e} };
+	}
+
+	for my $r (@{ _cif_rows($p, '_entity_src_gen') }) {
+		my $e = $r->{entity_id};
+		next unless defined $e;
+		$source{$e} = {
+			mol_id              => $e,
+			organism_scientific => $r->{pdbx_gene_src_scientific_name},
+			organism_taxid      => $r->{pdbx_gene_src_ncbi_taxonomy_id},
+			expression_system   => $r->{pdbx_host_org_scientific_name},
+		};
+	}
+	for my $r (@{ _cif_rows($p, '_entity_src_nat') }) {
+		my $e = $r->{entity_id};
+		next unless defined $e;
+		$source{$e} ||= {
+			mol_id              => $e,
+			organism_scientific => $r->{pdbx_organism_scientific},
+			organism_taxid      => $r->{pdbx_ncbi_taxonomy_id},
+		};
+	}
+
+	$info->{compound} = \%compound;
+	$info->{source}   = \%source;
+	_entities($info);
+	return $info;
+}
+
+# --- SEQRES ----------------------------------------------------------------
+#
+# _entity_poly_seq is the residue list, one row per position, per entity;
+# _entity_poly says which chains an entity was crystallised as.  A chain's
+# seqres is therefore its entity's list, and two chains of the same entity get
+# the same one -- which is what a PDB file writes out twice.
+sub _cif_seqres {
+	my ($info, $p) = @_;
+	my %res_of;
+	for my $r (@{ _cif_rows($p, '_entity_poly_seq') }) {
+		next unless defined $r->{entity_id} && defined $r->{mon_id};
+		push @{ $res_of{ $r->{entity_id} } }, $r->{mon_id};
+	}
+	for my $r (@{ _cif_rows($p, '_entity_poly') }) {
+		my $e = $r->{entity_id};
+		next unless defined $e;
+		my @chains = grep { length } map { _t($_) } split /,/, ($r->{pdbx_strand_id} || '');
+		next unless @chains;
+		my $residues = $res_of{$e};
+		my $seq;
+		if ($residues) {
+			$seq = join '', map { my $o = res1($_); length $o ? $o : 'X' } @$residues;
+		}
+		else {
+			# a file with no _entity_poly_seq still carries the sequence as a
+			# string; the residue names are what is lost, not the sequence
+			my $one = $r->{pdbx_seq_one_letter_code_can} || $r->{pdbx_seq_one_letter_code};
+			next unless defined $one;
+			$seq = $one;
+			$seq =~ s/\s+//g;
+			$seq =~ s/\([^)]*\)/X/g;   # a modified residue, spelled out in brackets
+		}
+		for my $cid (@chains) {
+			$info->{seqres}{$cid} = {
+				chain    => $cid,
+				residues => ($residues ? [ @$residues ] : []),
+				sequence => $seq,
+				length   => ($residues ? scalar @$residues : length $seq),
+			};
+		}
+	}
+	return $info;
+}
+
+# --- heterogens ------------------------------------------------------------
+#
+# _chem_comp describes every residue in the file, standard ones included;
+# $info->{het} is what HET/HETNAM/FORMUL describe, which is the rest.
+sub _cif_het {
+	my ($info, $p) = @_;
+	for my $r (@{ _cif_rows($p, '_chem_comp') }) {
+		my $cid = $r->{id};
+		next unless defined $cid && length $cid;
+		next if $STANDARD{$cid};
+		my $h = $info->{het}{$cid} ||= { het_id => $cid };
+		$h->{name}    = $r->{name}            if defined $r->{name};
+		$h->{formula} = $r->{formula}         if defined $r->{formula};
+		$h->{synonym} = $r->{pdbx_synonyms}   if defined $r->{pdbx_synonyms};
+		$h->{water}   = 1 if $cid eq 'HOH' || $cid eq 'DOD' || $cid eq 'WAT';
+	}
+	for my $r (@{ _cif_rows($p, '_pdbx_nonpoly_scheme') }) {
+		my $cid = $r->{mon_id};
+		next unless defined $cid && length $cid;
+		my $h = $info->{het}{$cid} ||= { het_id => $cid };
+		push @{ $h->{instances} }, {
+			chain  => $r->{pdb_strand_id},
+			resseq => $r->{pdb_seq_num},
+			icode  => (defined $r->{pdb_ins_code} ? $r->{pdb_ins_code} : ''),
+		};
+	}
+	for my $r (@{ _cif_rows($p, '_pdbx_struct_mod_residue') }) {
+		my $cid = $r->{auth_comp_id} || $r->{label_comp_id};
+		next unless defined $cid && length $cid;
+		$info->{modres}{$cid} ||= {
+			resname  => $cid,
+			standard => $r->{parent_comp_id},
+			comment  => $r->{details},
+		};
+	}
+	return $info;
+}
+
+# --- secondary structure, bonds and database cross-references --------------
+sub _cif_annotations {
+	my ($info, $p) = @_;
+
+	for my $r (@{ _cif_rows($p, '_struct_conf') }) {
+		next unless ($r->{conf_type_id} || '') =~ /\AHELX/i;
+		push @{ $info->{helix} }, {
+			id           => $r->{id},
+			init_resname => _cif_auth($r, 'beg', 'comp_id'),
+			init_chain   => _cif_auth($r, 'beg', 'asym_id'),
+			init_resseq  => _cif_auth($r, 'beg', 'seq_id'),
+			end_resname  => _cif_auth($r, 'end', 'comp_id'),
+			end_chain    => _cif_auth($r, 'end', 'asym_id'),
+			end_resseq   => _cif_auth($r, 'end', 'seq_id'),
+			class        => $r->{pdbx_pdb_helix_class},
+			length       => $r->{pdbx_pdb_helix_length},
+		};
+	}
+	for my $r (@{ _cif_rows($p, '_struct_sheet_range') }) {
+		push @{ $info->{sheet} }, {
+			strand       => $r->{id},
+			id           => $r->{sheet_id},
+			init_resname => _cif_auth($r, 'beg', 'comp_id'),
+			init_chain   => _cif_auth($r, 'beg', 'asym_id'),
+			init_resseq  => _cif_auth($r, 'beg', 'seq_id'),
+			end_resname  => _cif_auth($r, 'end', 'comp_id'),
+			end_chain    => _cif_auth($r, 'end', 'asym_id'),
+			end_resseq   => _cif_auth($r, 'end', 'seq_id'),
+		};
+	}
+
+	# SSBOND and LINK are one category here, told apart by the bond type
+	for my $r (@{ _cif_rows($p, '_struct_conn') }) {
+		my $type = lc($r->{conn_type_id} || '');
+		if ($type eq 'disulf') {
+			push @{ $info->{ssbond} }, {
+				chain1  => _cif_ptnr($r, 1, 'asym_id'),
+				resseq1 => _cif_ptnr($r, 1, 'seq_id'),
+				chain2  => _cif_ptnr($r, 2, 'asym_id'),
+				resseq2 => _cif_ptnr($r, 2, 'seq_id'),
+				length  => $r->{pdbx_dist_value},
+			};
+			next;
+		}
+		next if $type eq 'hydrog';
+		push @{ $info->{link} }, {
+			name1    => $r->{ptnr1_label_atom_id}, resname1 => _cif_ptnr($r, 1, 'comp_id'),
+			chain1   => _cif_ptnr($r, 1, 'asym_id'), resseq1 => _cif_ptnr($r, 1, 'seq_id'),
+			name2    => $r->{ptnr2_label_atom_id}, resname2 => _cif_ptnr($r, 2, 'comp_id'),
+			chain2   => _cif_ptnr($r, 2, 'asym_id'), resseq2 => _cif_ptnr($r, 2, 'seq_id'),
+			length   => $r->{pdbx_dist_value},
+		};
+	}
+
+	for my $r (@{ _cif_rows($p, '_struct_mon_prot_cis') }) {
+		push @{ $info->{cispep} }, {
+			resname1 => $r->{auth_comp_id}, chain1 => $r->{auth_asym_id},
+			resseq1  => $r->{auth_seq_id},
+			resname2 => $r->{pdbx_auth_comp_id_2}, chain2 => $r->{pdbx_auth_asym_id_2},
+			resseq2  => $r->{pdbx_auth_seq_id_2},
+			angle    => $r->{pdbx_omega_angle},
+		};
+	}
+
+	my %db;
+	for my $r (@{ _cif_rows($p, '_struct_ref') }) {
+		next unless defined $r->{id};
+		$db{ $r->{id} } = $r;
+	}
+	for my $r (@{ _cif_rows($p, '_struct_ref_seq') }) {
+		my $cid = $r->{pdbx_strand_id};
+		next unless defined $cid && length $cid;
+		my $ref = (defined $r->{ref_id} && $db{ $r->{ref_id} }) || {};
+		push @{ $info->{dbref}{$cid} }, {
+			chain     => $cid,
+			seq_begin => $r->{pdbx_auth_seq_align_beg},
+			seq_end   => $r->{pdbx_auth_seq_align_end},
+			database  => $ref->{db_name},
+			accession => (defined $r->{pdbx_db_accession} ? $r->{pdbx_db_accession} : $ref->{pdbx_db_accession}),
+			db_id     => $ref->{db_code},
+			db_begin  => $r->{db_align_beg},
+			db_end    => $r->{db_align_end},
+		};
+	}
+
+	for my $r (@{ _cif_rows($p, '_pdbx_audit_revision_history') }) {
+		push @{ $info->{revdat} }, {
+			num  => $r->{ordinal},
+			date => $r->{revision_date},
+			id   => $info->{header}{id_code},
+			type => $r->{data_content_type},
+		};
+	}
+	return $info;
+}
+
+# --- reading the parsed categories -----------------------------------------
+
+# _cif_rows($p, $category) -- a category as a list of rows, whether it was
+# written as a loop_ or, having only one row, as a run of plain tags.  The
+# format allows both for the same category and files use both, so asking for
+# the rows has to work either way.
+#
+# The two are folded together once, on the first call, rather than on each:
+# reading the header asks for forty-odd categories and a real entry has
+# several hundred plain tags, so doing it per call would walk the lot forty
+# times over to answer forty questions.
+sub _cif_rows {
+	my ($p, $cat) = @_;
+	my $by_cat = $p->{_by_category} ||= do {
+		my %c;
+		while (my ($tag, $val) = each %{ $p->{cif} || {} }) {
+			my $dot = index($tag, '.');
+			# a core CIF tag has no category half, and is its own category
+			my ($k, $item) = $dot < 0 ? ($tag, $tag)
+			                          : (substr($tag, 0, $dot), substr($tag, $dot + 1));
+			($c{$k} ||= [ {} ])->[0]{$item} = $val;
+		}
+		# a loop_ is the category, where there is one: a file that wrote both
+		# meant the loop, since that is the one that can hold what it holds
+		%c = (%c, %{ $p->{cif_loops} || {} });
+		\%c;
+	};
+	return $by_cat->{$cat} || [];
+}
+
+# one item from a category that has one row, which is most of them
+sub _cif1 {
+	my ($p, $cat, $item) = @_;
+	my $rows = _cif_rows($p, $cat);
+	return undef unless @$rows;
+	my $v = $rows->[0]{$item};
+	return defined $v && length $v ? $v : undef;
+}
+
+# the same, as a number.  '?' and '.' already came back as undef; what is left
+# to guard against is a field holding text where a number belongs.
+sub _cifn {
+	my $v = _cif1(@_);
+	return defined $v ? _n($v) : undef;
+}
+
+# auth_* first, then label_*: the same rule the coordinates were read under,
+# so an annotation and the chain it annotates agree about the chain's name
+sub _cif_auth {
+	my ($r, $which, $item) = @_;
+	for my $k ("${which}_auth_$item", "${which}_label_$item") {
+		return $r->{$k} if defined $r->{$k} && length $r->{$k};
+	}
+	return undef;
+}
+
+sub _cif_ptnr {
+	my ($r, $n, $item) = @_;
+	for my $k ("ptnr${n}_auth_$item", "ptnr${n}_label_$item") {
+		return $r->{$k} if defined $r->{$k} && length $r->{$k};
+	}
+	return undef;
+}
+
 # --- small helpers ---------------------------------------------------------
 
 sub _t {
@@ -1195,6 +1673,11 @@ Chem::Structure::Parser - read a molecular structure file into a hash of hashes
 
     print structure_summary($info);
 
+    # PDB or mmCIF, the same call and the same answer
+    my $a = structure_info('1a22.pdb');
+    my $b = structure_info('1a22.cif');
+    $a->{chains}{A}{sequence} eq $b->{chains}{A}{sequence};        # true
+
 =head1 DESCRIPTION
 
 One call reads a structure file and returns everything in it as a hash of
@@ -1205,40 +1688,89 @@ directory of structures; the header records are parsed in Perl, because they
 are irregular and there are only a few dozen of them per file.
 
 The module is named for structures rather than for PDB because the shape of
-what it returns has nothing to do with the file format it came from.  Today
-it reads PDB; C<formats()> says what it reads at any moment.
+what it returns has nothing to do with the file format it came from.  It reads
+PDB and mmCIF/PDBx; C<formats()> says what it reads at any moment.
+
+=head1 PDB AND mmCIF
+
+Reading is one call, C<structure_info()>, whichever of the two formats the
+file is in.  The format is worked out from the file name and, when the name
+gives nothing away, from the first records in the file; the hash that comes
+back has the same keys, the same nesting and the same values either way.  So a
+caller never branches on the format, and code written against a directory of
+C<.pdb> files works unchanged on a directory of C<.cif> ones.
+
+Equality here means equality: t/cif.t reads fixture pairs both ways and
+compares the whole coordinate half of the structure with C<is_deeply>, and
+t/real_cif.t converts real entries from the PDB archive into mmCIF and asserts
+that every chain, residue, atom and count comes back identical.
+
+Two things follow from that promise and are worth knowing.
+
+B<The identifiers are the auth_* ones.>  An mmCIF file carries two sets: the
+C<label_*> identifiers the archive assigns, and the C<auth_*> ones the
+depositor used.  Only C<auth_*> matches what the PDB record carried, so those
+are the chain ids and residue numbers used throughout, in the coordinates and
+in the annotations alike.  A structure read from C<.cif> therefore has the same
+chain C<A> and the same residue C<54> as the same structure read from C<.pdb>,
+not the C<label_asym_id> lettering that runs through the waters.
+
+B<Values are converted, not passed through.>  Where the two formats spell the
+same fact differently, the mmCIF reader produces what the PDB reader would
+have: a C<_atom_site.pdbx_formal_charge> of C<-1> reads back as C<'1-'>, and
+C<.> and C<?> -- mmCIF for "not applicable" and "unknown" -- read back as the
+empty field a PDB record would have had.  A charge of C<0> is kept as C<'0'>,
+because "the field said zero" and "the field was blank" are different answers
+and either format can say either.
+
+What is not the same is what only one format has.  An mmCIF file has no REMARK
+records, so C<< $info->{remarks} >> is empty for one; a PDB file has no
+C<_entity> category, so a chain read from one may not know which entity it
+belongs to.  Every key is present in both cases, so reading one is a test of
+what the file said and never of which format it was.
 
 =head2 structure_info
 
     my $info = structure_info($file, %options);
 
 Reads C<$file> and returns a hash reference.  The format is worked out from
-the file name, and from the first records in the file when the name gives
-nothing away.  C<.gz> files are read as they are.
+the file name -- C<.pdb>, C<.ent>, C<.cif>, C<.mmcif>, C<.pdbx> -- and from the
+first records in the file when the name gives nothing away.  C<.gz> files are
+read as they are.
 
-The returned hash:
+The returned hash, with the PDB record and the mmCIF category each key comes
+from.  Neither column is the definition: the key is, and either format fills
+it in.
 
     file        the path it was read from
-    format      'pdb'
-    id          the four-character PDB id, from HEADER or the file name
-    title       TITLE, continuation lines joined
+    format      'pdb' or 'mmcif'
+    id          the four-character PDB id  (HEADER / _entry.id / the file name)
+    title       TITLE / _struct.title
     header      { classification, deposit_date, id_code }
-    experiment  [ 'X-RAY DIFFRACTION' ]
-    resolution  2.6                         (from REMARK 2)
-    r_work      0.196                       (from REMARK 3)
-    r_free      0.278
-    keywords    [ ... ]                     (KEYWDS)
-    authors     [ ... ]                     (AUTHOR)
-    journal     { auth => [...], titl, ref, pmid, doi }
-    compound    { 1 => { molecule, chain => [...], engineered, ... } }
-    source      { 1 => { organism_scientific, organism_taxid, ... } }
+    experiment  [ 'X-RAY DIFFRACTION' ]     (EXPDTA / _exptl.method)
+    resolution  2.6                         (REMARK 2 / _refine.ls_d_res_high)
+    r_work      0.196                       (REMARK 3 / _refine.ls_R_factor_R_work)
+    r_free      0.278                       (REMARK 3 / _refine.ls_R_factor_R_free)
+    keywords    [ ... ]                     (KEYWDS / _struct_keywords.text)
+    authors     [ ... ]                     (AUTHOR / _audit_author)
+    journal     { auth => [...], titl, ref, pmid, doi }   (JRNL / _citation)
+    compound    { 1 => { molecule, chain => [...], ... } } (COMPND / _entity)
+    source      { 1 => { organism_scientific, ... } }  (SOURCE / _entity_src_*)
     seqres      { A => { sequence, residues => [...], length } }
+                                            (SEQRES / _entity_poly[_seq])
     het         { NAG => { name, formula, instances => [...] } }
-    helix sheet ssbond link cispep          [ { ... }, ... ]
+                                (HET/HETNAM/FORMUL / _chem_comp + _pdbx_nonpoly_scheme)
+    helix       [ { ... } ]                 (HELIX / _struct_conf)
+    sheet       [ { ... } ]                 (SHEET / _struct_sheet_range)
+    ssbond link [ { ... } ]                 (SSBOND, LINK / _struct_conn)
+    cispep      [ { ... } ]                 (CISPEP / _struct_mon_prot_cis)
+    modres      { MSE => { ... } }          (MODRES / _pdbx_struct_mod_residue)
+    dbref       { A => [ { ... } ] }        (DBREF / _struct_ref + _struct_ref_seq)
     cryst1      { a, b, c, alpha, beta, gamma, sgroup, z }
-    remarks     { 2 => [ lines ], 350 => [ lines ], ... }
-    conect      [ [ serial, serial, ... ], ... ]
-    n_models    how many MODEL records the file has
+                                            (CRYST1 / _cell + _symmetry)
+    remarks     { 2 => [ lines ], 350 => [ lines ], ... }   (REMARK; PDB only)
+    conect      [ [ serial, serial, ... ], ... ]            (CONECT; PDB only)
+    n_models    how many models the file has  (MODEL / _atom_site.pdbx_PDB_model_num)
     model       which one the chains below were built from
     models      every model, when called with model => 'all'
     chains      { A => { ... } }
@@ -1299,7 +1831,8 @@ Options:
     meta      => 1          parse the header records
     anisou    => 0          keep ANISOU lines
     chains    => ['A','B']  read only these chains
-    format    => 'pdb'      skip format detection
+    format    => 'pdb'      skip format detection: 'pdb' or 'mmcif'
+                            ('cif', 'pdbx' and 'ent' name the same two)
 
 Every option is checked; an unknown one is fatal, because an ignored typo is
 a wrong answer that arrives silently.
@@ -1323,11 +1856,21 @@ away afterwards.
 C<structure_info()> with the format settled in advance.  Use it when the file
 is known to be PDB whatever it is called.
 
+Telling it wrongly reads no atoms rather than dying, which is what forcing a
+format means; C<structure_info()> looks at the file and is the usual way in.
+
+=head2 cif_info
+
+    my $info = cif_info($file, %options);
+
+The same for mmCIF/PDBx.
+
 =head2 structure_info_string
 
     my $info = structure_info_string($text, %options);
 
-The same, for a structure already in a string.
+The same, for a structure already in a string.  The format is worked out from
+the text, and text that looks like nothing in particular is read as PDB.
 
 =head2 structure_atoms
 
@@ -1441,7 +1984,7 @@ many atoms the residue has.
 
 =head2 formats
 
-    my @can = formats();          # ('pdb')
+    my @can = formats();          # ('mmcif', 'pdb')
     my $all = formats();          # every format known, supported or not
 
 =head2 h
@@ -1501,6 +2044,16 @@ residues rather than atoms.
 Everything else is Perl.  The header records are irregular, they are a few
 dozen lines per file rather than hundreds of thousands, and they are where the
 next surprise will turn up; none of that is worth writing in C.
+
+The mmCIF reader is a second pass written to the same division.  A PDB file is
+fixed columns and an mmCIF file is tag/value pairs and C<loop_> tables, so
+none of the column arithmetic carries over and the tokenizer -- quoting,
+semicolon text fields, comments, the two spellings of null -- is its own code.
+What it is not is a second answer: it fills in the same output, the same
+column arrays and residue boundaries and counts, so everything downstream of
+it, in C and in Perl, is written once.  C<_atom_site> goes through that path;
+every other category is handed to Perl as tags and loops, which is the same
+place the line between the two languages falls for PDB.
 
 On 200 structures from PDBbind v2020, the parse runs at about 2.8 times the
 speed of the same parse written in Perl.  C<structure_info()> as a whole comes

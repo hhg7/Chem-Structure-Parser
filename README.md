@@ -43,8 +43,84 @@ few dozen of them in a file.
 
 The module is called `Chem::Structure::Parser` and not `PDB::Info` because the
 shape of what it hands back has nothing to do with the format it came out of.
-Today it reads PDB; `formats()` says what it reads at any moment, and a format
-it knows the name of but cannot read yet says so rather than misreading it.
+It reads PDB and mmCIF/PDBx; `formats()` says what it reads at any moment, and
+a format it knows the name of but cannot read yet says so rather than
+misreading it.
+
+# PDB and mmCIF
+
+Reading is the same call either way. `structure_info()` works out the format
+from the file name — `.pdb`, `.ent`, `.cif`, `.mmcif`, `.pdbx` — and from the
+first records in the file when the name gives nothing away, and the hash that
+comes back has the same keys, the same nesting and the same values whichever
+it was.
+
+```perl
+my $a = structure_info('1a22.pdb');
+my $b = structure_info('1a22.cif');
+
+$a->{chains}{A}{sequence} eq $b->{chains}{A}{sequence};              # true
+$a->{chains}{A}{residues}{54}{atoms}{CA}{x}
+	== $b->{chains}{A}{residues}{54}{atoms}{CA}{x};                  # true
+```
+
+So no calling code branches on the format, and a script written against a
+directory of `.pdb` files works unchanged on a directory of `.cif` ones.
+
+Equality here means equality rather than approximately: `t/cif.t` reads
+fixture pairs both ways and compares the whole coordinate half of the returned
+structure with `is_deeply`, and `t/real_cif.t` converts real entries from the
+PDB archive into mmCIF and asserts that every chain, residue, atom and count
+comes back identical.
+
+Two consequences are worth knowing.
+
+**The identifiers are the auth_\* ones.** An mmCIF file carries two sets: the
+`label_*` identifiers the archive assigns, and the `auth_*` ones the depositor
+used. Only `auth_*` matches what the PDB record carried, so those are the
+chain ids and residue numbers used throughout — in the coordinates and in the
+annotations alike. A structure read from a `.cif` therefore has the same chain
+`A` and the same residue `54` as the same structure read from a `.pdb`, not
+the `label_asym_id` lettering that runs on through the waters.
+
+**Values are converted, not passed through.** Where the two formats spell the
+same fact differently, the mmCIF reader produces what the PDB reader would
+have: `_atom_site.pdbx_formal_charge` of `-1` reads back as `'1-'`, and `.`
+and `?` — mmCIF for "not applicable" and "unknown" — read back as the empty
+field a PDB record would have had. A charge of `0` is kept as `'0'`, because
+"the field said zero" and "the field was blank" are different answers and both
+formats can say either.
+
+What is *not* the same is what only one of the formats has. An mmCIF file has
+no REMARK records, so `$info->{remarks}` is empty for one; a PDB file has no
+`_entity` category, so a chain read from one may not know which entity it
+belongs to. Every key is present in both cases, so reading one is a test of
+what the file said and never of which format it was.
+
+Where the same fact is filed under different names, it is folded into the same
+key:
+
+| `$info` key | PDB record | mmCIF category |
+| --- | --- | --- |
+| `title` | `TITLE` | `_struct.title` |
+| `id` | `HEADER` | `_entry.id` |
+| `experiment` | `EXPDTA` | `_exptl.method` |
+| `resolution` | `REMARK 2` | `_refine.ls_d_res_high` |
+| `r_work`, `r_free` | `REMARK 3` | `_refine.ls_R_factor_R_*` |
+| `keywords` | `KEYWDS` | `_struct_keywords.text` |
+| `authors` | `AUTHOR` | `_audit_author` |
+| `journal` | `JRNL` | `_citation`, `_citation_author` |
+| `compound`, `source` | `COMPND`, `SOURCE` | `_entity`, `_entity_src_*` |
+| `seqres` | `SEQRES` | `_entity_poly`, `_entity_poly_seq` |
+| `het` | `HET`, `HETNAM`, `FORMUL` | `_chem_comp`, `_pdbx_nonpoly_scheme` |
+| `helix` | `HELIX` | `_struct_conf` |
+| `sheet` | `SHEET` | `_struct_sheet_range` |
+| `ssbond`, `link` | `SSBOND`, `LINK` | `_struct_conn` |
+| `cispep` | `CISPEP` | `_struct_mon_prot_cis` |
+| `modres` | `MODRES` | `_pdbx_struct_mod_residue` |
+| `dbref` | `DBREF` | `_struct_ref`, `_struct_ref_seq` |
+| `cryst1` | `CRYST1` | `_cell`, `_symmetry` |
+| `n_models` | `MODEL` | `_atom_site.pdbx_PDB_model_num` |
 
 # Installing
 
@@ -56,8 +132,16 @@ it knows the name of but cannot read yet says so rather than misreading it.
 `make test` reads the fixtures in `t/data`. If a directory of real structures
 is to hand it reads a sample of those too; point it somewhere with
 
-    STRUCTURE_INFO_TEST_DIR=/path/to/structures make test
+    STRUCTURE_INFO_TEST_DIR=/path/to/pdbs  make test
+    STRUCTURE_INFO_TEST_CIF_DIR=/path/to/cifs  make test
     STRUCTURE_INFO_TEST_ALL=1 STRUCTURE_INFO_TEST_DIR=/path make test   # all of them
+
+`STRUCTURE_INFO_TEST_DIR` is used twice: `t/real.t` reads those files as PDB
+and checks them against a second reader written in plain Perl, and
+`t/real_cif.t` converts each one into mmCIF and asserts that reading it back
+gives the same structure to the last digit.
+`STRUCTURE_INFO_TEST_CIF_DIR` takes a directory of real `.cif` files, either
+flat or one subdirectory per structure, and reads those directly.
 
 With no such directory those tests skip, so the distribution builds on a
 machine with no structures on it.
@@ -85,8 +169,9 @@ every function here is exported, so Perl parses the bareword as a call to
     my $info = structure_info($file, %options);
 
 Reads `$file` and returns a hash reference. The format is worked out from the
-file name, and from the first records in the file when the name gives nothing
-away. `.gz` files are read as they are, without unpacking to a temporary file.
+file name — `.pdb`, `.ent`, `.cif`, `.mmcif`, `.pdbx` — and from the first
+records in the file when the name gives nothing away. `.gz` files are read as
+they are, without unpacking to a temporary file.
 
 ### What comes back
 
@@ -96,7 +181,7 @@ file, real values, the long lists cut short:
 ```
 $info
 ├── file            '1a22.ent.pdb'          the path it was read from
-├── format          'pdb'
+├── format          'pdb'                   or 'mmcif'
 ├── id              '1A22'                  from HEADER, or from the file name
 ├── title           'HUMAN GROWTH HORMONE BOUND TO SINGLE RECEPTOR'
 ├── header
@@ -311,7 +396,8 @@ that goes unnoticed until the ten-thousandth file.
     meta      => 1          parse the header records
     anisou    => 0          keep ANISOU lines
     chains    => ['A','B']  read only these chains
-    format    => 'pdb'      skip the format detection
+    format    => 'pdb'      skip the format detection: 'pdb' or 'mmcif'
+                            ('cif', 'pdbx' and 'ent' name the same two)
 
 Every option is checked. A misspelled one is fatal, because an ignored typo is
 a wrong answer that arrives without a word: `hydrogen => 0` that is quietly
@@ -334,6 +420,15 @@ value, so `hydrogens => 0` is cheaper than reading them and throwing them away.
 
 `structure_info()` with the format settled in advance. Use it when the file is
 known to be a PDB whatever it happens to be called.
+
+Telling it wrongly reads no atoms rather than dying, which is what forcing a
+format means; `structure_info()` looks at the file and is the usual way in.
+
+## cif_info
+
+    my $info = cif_info($file, %options);
+
+The same for mmCIF/PDBx.
 
 ## structure_info_string
 
@@ -469,8 +564,8 @@ atoms the residue has and what they are.
 
 ## formats
 
-    my @can = formats();          # ('pdb')
-    my $all = formats();          # every format known, supported or not
+    my @can = formats(); # ('mmcif', 'pdb')
+    my $all = formats(); # every format known, supported or not
 
 ## h
 

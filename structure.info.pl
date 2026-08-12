@@ -3,9 +3,12 @@
 #
 #     structure.info.pl 1a22.ent.pdb                  # a summary
 #     structure.info.pl --fasta *.pdb                 # the sequences, as FASTA
-#     structure.info.pl --tsv   *.pdb                 # one row per structure
-#     structure.info.pl --ligands *.pdb               # what is bound to what
+#     structure.info.pl --tsv   *.cif                 # one row per structure
+#     structure.info.pl --ligands *.pdb *.cif         # what is bound to what
 #     structure.info.pl --dump 1a22.ent.pdb           # the whole hash of hashes
+#
+# PDB and mmCIF are read the same way and print the same thing, so a mixed
+# directory needs no sorting out first.
 require 5.010;
 use strict;
 use warnings FATAL => 'all';
@@ -18,7 +21,7 @@ GetOptions(\%opt, 'fasta', 'tsv', 'ligands', 'dump', 'seqres', 'chain=s', 'help'
 
 if ($opt{help} || !@ARGV) {
 	print <<'USAGE';
-usage: structure.info.pl [options] file.pdb ...
+usage: structure.info.pl [options] file.pdb|file.cif ...
 
     --fasta      print every chain's sequence as FASTA
     --seqres     with --fasta, print SEQRES rather than the observed sequence

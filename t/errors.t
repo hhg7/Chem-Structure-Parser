@@ -32,13 +32,14 @@ throws_ok { structure_info($data) } qr/is a directory/, 'a directory dies';
 #--------
 {
 	my $dir = tempdir(CLEANUP => 1);
-	# an mmCIF: recognised, and refused in a way that says why
-	open my $fh, '>', "$dir/x.cif" or die $!;
-	print {$fh} "data_1ABC\n_atom_site.id\n";
+	# a format that is recognised and not written yet says so, and says what
+	# can be read instead
+	open my $fh, '>', "$dir/x.mol2" or die $!;
+	print {$fh} "\@<TRIPOS>MOLECULE\n";
 	close $fh;
-	throws_ok { structure_info("$dir/x.cif") } qr/mmCIF.*not implemented/,
+	throws_ok { structure_info("$dir/x.mol2") } qr/MOL2.*not implemented/,
 		'a format that is recognised but not written yet says so';
-	throws_ok { structure_info("$dir/x.cif") } qr/formats read today: pdb/,
+	throws_ok { structure_info("$dir/x.mol2") } qr/formats read today: mmcif, pdb/,
 		'and says what can be read instead';
 
 	# something that is not a structure at all

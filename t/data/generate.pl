@@ -257,7 +257,309 @@ for my $r ([ 'VAL', 1 ], [ 'LYS', 2 ]) {
 }
 push @bare, 'END';
 
-for my $f ([ 'mini.pdb', \@mini ], [ 'nmr.pdb', \@nmr ], [ 'bare.pdb', \@bare ]) {
+# --- the mmCIF twins ------------------------------------------------------
+#
+# The same structures, written the other way.  The coordinates are converted
+# from the records above rather than typed again, because the point of the
+# .cif fixtures is that reading either file gives the same answer, and a
+# fixture pair that was typed twice tests the typing.
+#
+# What is deliberately not converted is the naming.  A real mmCIF file carries
+# two sets of identifiers -- label_* assigned by the archive, auth_* as the
+# depositor numbered them -- and only the auth_* ones match the PDB record.
+# So the label_* columns written below are the other ones on purpose: chains
+# lettered straight through including the waters, residues numbered from 1
+# with no gap and no insertion code.  A reader that reached for label_asym_id
+# would produce a structure with six chains in it, and t/cif.t would say so.
+
+# cifq() -- one value, quoted the way the format needs it
+sub cifq {
+	my ($v) = @_;
+	return '?' unless defined $v && length $v;
+	return $v unless $v =~ /[\s'"]/ || $v =~ /\A[_\#\$\[\]]/ || $v =~ /\A(?:data|loop|save|stop|global)_/i;
+	return "'$v'" if $v !~ /'/;
+	return "\"$v\"" if $v !~ /"/;
+	return "\n;$v\n;";      # a value holding both quotes has only one way left
+}
+
+my @ATOM_ITEM = qw(
+	group_PDB id type_symbol label_atom_id label_alt_id label_comp_id
+	label_asym_id label_entity_id label_seq_id pdbx_PDB_ins_code
+	Cartn_x Cartn_y Cartn_z occupancy B_iso_or_equiv pdbx_formal_charge
+	auth_seq_id auth_comp_id auth_asym_id auth_atom_id pdbx_PDB_model_num
+);
+
+# atom_site_loop() -- the ATOM/HETATM records of a PDB file as an mmCIF loop.
+# Read by column, because that is where a PDB record keeps its fields, and the
+# whole point is to carry every one of them across unchanged.
+sub atom_site_loop {
+	my ($lines, %opt) = @_;
+	my (@rows, %asym, $model, $seq);
+	$model = 1;
+	my %seq_of;      # label_seq_id: the polymer position, counted per label asym
+	for my $l (@$lines) {
+		if ($l =~ /\AMODEL\s+(\d+)/) { $model = $1; next }
+		next unless $l =~ /\A(ATOM  |HETATM)/;
+		my %a = (
+			group   => ($1 eq 'ATOM  ' ? 'ATOM' : 'HETATM'),
+			serial  => _t(substr($l, 6, 5)),
+			name    => _t(substr($l, 12, 4)),
+			altloc  => _t(substr($l, 16, 1)),
+			resname => _t(substr($l, 17, 3)),
+			chain   => _t(substr($l, 21, 1)),
+			resseq  => _t(substr($l, 22, 4)),
+			icode   => _t(substr($l, 26, 1)),
+			x       => _t(substr($l, 30, 8)),
+			y       => _t(substr($l, 38, 8)),
+			z       => _t(substr($l, 46, 8)),
+			occ     => _t(substr($l, 54, 6)),
+			b       => _t(substr($l, 60, 6)),
+			element => (length($l) > 76 ? _t(substr($l, 76, 2)) : ''),
+			charge  => (length($l) > 78 ? _t(substr($l, 78, 2)) : ''),
+		);
+		# label_asym_id: a fresh letter per chain and per kind of thing in it,
+		# which is how the archive assigns them and is not the PDB chain id
+		my $kind = $a{group} eq 'HETATM' ? ($a{resname} eq 'HOH' ? 'w' : "h$a{resname}") : 'p';
+		# lettered from B rather than from A, so that no label_asym_id can
+		# coincide with the auth_asym_id of the chain it belongs to and a
+		# reader that took the wrong one cannot pass by luck
+		my $ak = "$a{chain}/$kind";
+		$asym{$ak} = chr(ord('B') + $asym{n}++) unless exists $asym{$ak};
+		my $lasym = $asym{$ak};
+		my $lseq  = '.';
+		if ($kind eq 'p') {
+			my $rk = "$ak/$a{resseq}$a{icode}";
+			$seq_of{$lasym}{$rk} ||= ++$seq_of{$lasym}{n};
+			$lseq = $seq_of{$lasym}{$rk};
+		}
+		# a PDB charge is "2+", an mmCIF one is 2; converted here so that the
+		# reader has the conversion to undo
+		my $chg = '?';
+		if ($a{charge} =~ /\A(\d)([-+])\z/) { $chg = ($2 eq '-' ? "-$1" : $1) }
+		# the two spellings of nothing: '.' where the item does not apply to
+		# this row, '?' where it does and the file does not know it.  Both are
+		# written, because both have to read back as an empty field.
+		push @rows, [
+			$a{group}, $a{serial},
+			(length $a{element} ? $a{element} : '?'),
+			$a{name},
+			(length $a{altloc} ? $a{altloc} : '.'),
+			$a{resname}, $lasym, ($kind eq 'p' ? 1 : 2), $lseq,
+			(length $a{icode} ? $a{icode} : '?'),
+			$a{x}, $a{y}, $a{z}, $a{occ}, $a{b}, $chg,
+			$a{resseq}, $a{resname}, $a{chain}, $a{name}, $model,
+		];
+	}
+	my @items = @ATOM_ITEM;
+	my @keep  = 0 .. $#items;
+	if ($opt{no_element}) {      # a file with no type_symbol, as bare.pdb has no element
+		@keep  = grep { $items[$_] ne 'type_symbol' } @keep;
+	}
+	my @out = ('loop_', map { "_atom_site.$items[$_]" } @keep);
+	for my $r (@rows) {
+		push @out, join ' ', map { ($_ eq '.' || $_ eq '?') ? $_ : cifq($_) } @{$r}[@keep];
+	}
+	return @out;
+}
+
+sub _t { my $s = shift; return '' unless defined $s; $s =~ s/\A\s+//; $s =~ s/\s+\z//; return $s }
+
+# a category with one row, written as plain tags
+sub cif_pairs {
+	my ($cat, @kv) = @_;
+	my @out;
+	while (@kv) {
+		my ($k, $v) = splice @kv, 0, 2;
+		push @out, sprintf('%-52s %s', "_$cat.$k", cifq($v));
+	}
+	return @out;
+}
+
+# a category with several rows, written as a loop_
+sub cif_loop {
+	my ($cat, $items, @rows) = @_;
+	my @out = ('loop_', map { "_$cat.$_" } @$items);
+	push @out, join ' ', map { cifq($_) } @$_ for @rows;
+	return @out;
+}
+
+my @minicif = ('data_9XYZ', '#');
+push @minicif,
+	cif_pairs('entry', id => '9XYZ'), '#',
+	# a semicolon text field, which is the only way the format has of writing
+	# a value too long for a line -- and the only token that spans lines
+	'_struct.entry_id   9XYZ',
+	'_struct.title',
+	';A SMALL TEST STRUCTURE WITH A GAP, AN INSERTION CODE, AN ALTERNATE CONFORMER AND A LIGAND',
+	';', '#',
+	cif_pairs('struct_keywords',
+		entry_id      => '9XYZ',
+		pdbx_keywords => 'HYDROLASE/PEPTIDE INHIBITOR',
+		text          => 'HYDROLASE, TEST STRUCTURE, COMPLEX (HYDROLASE-PEPTIDE)'), '#',
+	cif_pairs('pdbx_database_status', entry_id => '9XYZ',
+		recvd_initial_deposition_date => '2020-01-01'), '#',
+	cif_pairs('exptl', entry_id => '9XYZ', method => 'X-RAY DIFFRACTION'), '#',
+	cif_pairs('refine',
+		entry_id            => '9XYZ',
+		'ls_d_res_high'     => '1.85',
+		'ls_R_factor_R_work'=> '0.174',
+		'ls_R_factor_R_free'=> '0.219'), '#',
+	cif_pairs('diffrn', id => 1, ambient_temp => '100.0'), '#',
+	cif_pairs('exptl_crystal_grow', crystal_id => 1, pH => '7.5'), '#',
+	cif_loop('audit_author', [qw(name pdbx_ordinal)],
+		[ 'Condon, D.E.', 1 ], [ 'Other, A.N.', 2 ]), '#',
+	cif_loop('citation',
+		[qw(id title journal_abbrev journal_volume page_first year
+		    pdbx_database_id_PubMed pdbx_database_id_DOI)],
+		[ 'primary', 'A STRUCTURE MADE UP FOR A TEST SUITE, AND WHAT IT CONTAINS',
+		  'J.Invented.Res.', 10, 42, 2020, 12345678, '10.1000/INVENTED.2020.42' ]), '#',
+	cif_loop('citation_author', [qw(citation_id name ordinal)],
+		[ 'primary', 'Condon, D.E.', 1 ], [ 'primary', 'Other, A.N.', 2 ]), '#',
+	cif_pairs('cell', entry_id => '9XYZ',
+		length_a => '40.100', length_b => '50.200', length_c => '60.300',
+		angle_alpha => '90.00', angle_beta => '95.50', angle_gamma => '90.00',
+		'Z_PDB' => 4), '#',
+	cif_pairs('symmetry', entry_id => '9XYZ', 'space_group_name_H-M' => 'P 1 21 1'), '#',
+	cif_loop('entity', [qw(id type src_method pdbx_description pdbx_ec)],
+		[ 1, 'polymer',     'man', 'TEST PROTEIN', '3.4.21.5' ],
+		[ 2, 'polymer',     'syn', 'TEST DNA',     undef ],
+		[ 3, 'non-polymer', 'syn', '2-ACETAMIDO-2-DEOXY-BETA-D-GLUCOPYRANOSE', undef ],
+		[ 4, 'non-polymer', 'syn', 'ZINC ION',     undef ],
+		[ 5, 'water',       'nat', 'water',        undef ]), '#',
+	cif_loop('entity_poly', [qw(entity_id type pdbx_seq_one_letter_code_can pdbx_strand_id)],
+		[ 1, 'polypeptide(L)',       'MAGLKCMHHSC', 'A' ],
+		[ 2, 'polydeoxyribonucleotide', 'ACGT',      'B' ]), '#',
+	cif_loop('entity_poly_seq', [qw(entity_id num mon_id hetero)],
+		(map { [ 1, $_->[0], $_->[1], 'n' ] }
+		 map { [ $_ + 1, (qw(MET ALA GLY LEU LYS CYS MSE HIS HIS SER CYS))[$_] ] } 0 .. 10),
+		(map { [ 2, $_->[0], $_->[1], 'n' ] }
+		 map { [ $_ + 1, (qw(DA DC DG DT))[$_] ] } 0 .. 3)), '#',
+	cif_pairs('entity_src_gen',
+		entity_id                        => 1,
+		pdbx_gene_src_scientific_name    => 'HOMO SAPIENS',
+		pdbx_gene_src_ncbi_taxonomy_id   => 9606,
+		pdbx_host_org_scientific_name    => 'ESCHERICHIA COLI'), '#',
+	cif_loop('chem_comp', [qw(id name formula type)],
+		[ 'MSE', 'SELENOMETHIONINE', 'C5 H11 N O2 Se', 'L-peptide linking' ],
+		[ 'NAG', '2-ACETAMIDO-2-DEOXY-BETA-D-GLUCOPYRANOSE', 'C8 H15 N O6', 'D-saccharide' ],
+		[ 'ZN',  'ZINC ION',  'ZN 2+', 'non-polymer' ],
+		[ 'HOH', 'WATER',     'H2 O',  'water' ]), '#',
+	cif_loop('pdbx_nonpoly_scheme',
+		[qw(asym_id entity_id mon_id pdb_strand_id pdb_seq_num pdb_ins_code)],
+		[ 'C', 3, 'NAG', 'A', 201, '.' ],
+		[ 'D', 4, 'ZN',  'A', 202, '.' ],
+		[ 'E', 5, 'HOH', 'A', 301, '.' ],
+		[ 'E', 5, 'HOH', 'A', 302, '.' ]), '#',
+	cif_loop('pdbx_struct_mod_residue',
+		[qw(id label_comp_id auth_comp_id auth_asym_id auth_seq_id parent_comp_id details)],
+		[ 1, 'MSE', 'MSE', 'A', 7, 'MET', 'SELENOMETHIONINE' ]), '#',
+	cif_loop('struct_conf',
+		[qw(conf_type_id id beg_auth_comp_id beg_auth_asym_id beg_auth_seq_id
+		    end_auth_comp_id end_auth_asym_id end_auth_seq_id
+		    pdbx_PDB_helix_class pdbx_PDB_helix_length)],
+		[ 'HELX_P', 'AA1', 'MET', 'A', 1, 'GLY', 'A', 3, 1, 3 ]), '#',
+	cif_loop('struct_sheet_range',
+		[qw(sheet_id id beg_auth_comp_id beg_auth_asym_id beg_auth_seq_id
+		    end_auth_comp_id end_auth_asym_id end_auth_seq_id)],
+		[ 'AA1', 1, 'CYS', 'A', 6, 'HIS', 'A', 8 ]), '#',
+	cif_loop('struct_conn',
+		[qw(id conn_type_id ptnr1_label_atom_id ptnr1_auth_comp_id ptnr1_auth_asym_id
+		    ptnr1_auth_seq_id ptnr2_label_atom_id ptnr2_auth_comp_id ptnr2_auth_asym_id
+		    ptnr2_auth_seq_id pdbx_dist_value)],
+		[ 'disulf1', 'disulf', 'SG', 'CYS', 'A', 6,  'SG', 'CYS', 'A', 10, '2.03' ],
+		[ 'covale1', 'covale', 'ZN', 'ZN',  'A', 202, 'SG', 'CYS', 'A', 6,  '2.31' ]), '#',
+	cif_loop('struct_mon_prot_cis',
+		[qw(pdbx_id auth_comp_id auth_asym_id auth_seq_id pdbx_auth_comp_id_2
+		    pdbx_auth_asym_id_2 pdbx_auth_seq_id_2 pdbx_omega_angle)],
+		[ 1, 'GLY', 'A', 3, 'CYS', 'A', 6, '-0.42' ]), '#',
+	cif_loop('struct_ref', [qw(id db_name db_code pdbx_db_accession entity_id)],
+		[ 1, 'UNP', 'TEST_HUMAN', 'P12345', 1 ]), '#',
+	cif_loop('struct_ref_seq',
+		[qw(align_id ref_id pdbx_strand_id pdbx_auth_seq_align_beg
+		    pdbx_auth_seq_align_end pdbx_db_accession db_align_beg db_align_end)],
+		[ 1, 1, 'A', 1, 11, 'P12345', 1, 11 ]), '#';
+push @minicif, atom_site_loop(\@mini), '#';
+
+my @nmrcif = ('data_9NMR', '#');
+push @nmrcif,
+	cif_pairs('entry', id => '9NMR'), '#',
+	'_struct.title    "A THREE MODEL ENSEMBLE"', '#',
+	cif_pairs('exptl', entry_id => '9NMR', method => 'SOLUTION NMR'), '#',
+	cif_pairs('pdbx_nmr_ensemble', entry_id => '9NMR',
+		conformers_submitted_total_number => 3), '#',
+	cif_loop('entity', [qw(id type pdbx_description)], [ 1, 'polymer', 'TEST PEPTIDE' ]), '#',
+	cif_loop('entity_poly', [qw(entity_id pdbx_strand_id)], [ 1, 'A' ]), '#',
+	cif_loop('entity_poly_seq', [qw(entity_id num mon_id)],
+		[ 1, 1, 'GLY' ], [ 1, 2, 'SER' ], [ 1, 3, 'TRP' ]), '#';
+push @nmrcif, atom_site_loop(\@nmr), '#';
+
+# bare.cif -- coordinates and nothing else, and no type_symbol, so the element
+# has to come out of the atom name here exactly as it does from a PDB record
+# with no element columns
+my @barecif = ('data_bare', '#', atom_site_loop(\@bare, no_element => 1), '#');
+
+# quirks.cif -- everything about the way the format is written down that a
+# reader has to get right, in one file: comments in every position, both kinds
+# of quote, a quote inside a value (O5', which is an atom name and not a
+# string that someone forgot to close), a semicolon text field, '.' and '?' for
+# the two kinds of nothing, a quoted '.' that is a full stop and not a null, a
+# formal charge in the mmCIF spelling, a category written as plain tags where
+# it is usually a loop, and columns in an order no writer uses.
+my @quirks = (
+'# a comment before anything at all',
+'data_QRK    # and one after the block name',
+'#',
+'_entry.id   QRK',
+'_struct.title     "A file that leans on the syntax"',
+"_struct_keywords.text    'one, two, three'",
+'_exptl.method',
+';SOLUTION NMR',
+';',
+'#',
+'loop_',
+'_atom_site.auth_atom_id',          # the columns in a deliberately odd order
+'_atom_site.pdbx_formal_charge',
+'_atom_site.auth_comp_id',
+'_atom_site.group_PDB',
+'_atom_site.auth_asym_id',
+'_atom_site.Cartn_x',
+'_atom_site.Cartn_y',
+'_atom_site.Cartn_z',
+'_atom_site.auth_seq_id',
+'_atom_site.type_symbol',
+'_atom_site.id',
+'_atom_site.label_alt_id',
+'_atom_site.occupancy',
+'_atom_site.B_iso_or_equiv',
+'_atom_site.pdbx_PDB_ins_code',
+"P     ?   G  ATOM   B  1.000 2.000 3.000 1 P  1 . 1.00 10.00 ?",
+"OP1   -1  G  ATOM   B  2.000 3.000 4.000 1 O  2 . 1.00 11.00 ?",
+"\"O5'\" 0   G  ATOM   B  3.000 4.000 5.000 1 O  3 . 1.00 12.00 ?",
+"\"C1'\" 3   G  ATOM   B  4.000 5.000 6.000 1 C  4 . 1.00 13.00 ?",
+'# the ion is a HETATM, is charged, and has an insertion code',
+"ZN    2   ZN HETATM B  9.000 9.000 9.000 40 ZN 5 . 1.00 14.00 A",
+'#',
+'# a category that is usually a loop, written as plain tags because it has',
+'# one row -- which the format allows and a reader has to accept',
+"_chem_comp.id        ZN",
+"_chem_comp.name      'ZINC ION'",
+"_chem_comp.formula   'ZN 2+'",
+'#',
+'loop_',
+'_citation.id',
+'_citation.title',
+'_citation.year',
+"primary  'A paper with a full stop.  And two sentences.'  2021",
+'#',
+'_cell.length_a    .',                  # not applicable
+'_cell.length_b    ?',                  # unknown
+"_pdbx_database_status.recvd_initial_deposition_date  '.'",  # quoted: a value
+'#',
+);
+
+for my $f ([ 'mini.pdb', \@mini ], [ 'nmr.pdb', \@nmr ], [ 'bare.pdb', \@bare ],
+           [ 'mini.cif', \@minicif ], [ 'nmr.cif', \@nmrcif ], [ 'bare.cif', \@barecif ],
+           [ 'quirks.cif', \@quirks ]) {
 	open my $fh, '>', $f->[0];
 	print {$fh} "$_\n" for @{ $f->[1] };
 	close $fh;
@@ -268,3 +570,6 @@ for my $f ([ 'mini.pdb', \@mini ], [ 'nmr.pdb', \@nmr ], [ 'bare.pdb', \@bare ])
 open my $e, '>', 'empty.pdb';
 close $e;
 print "wrote empty.pdb\n";
+open my $ec, '>', 'empty.cif';
+close $ec;
+print "wrote empty.cif\n";
