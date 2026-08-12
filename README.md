@@ -5,7 +5,7 @@ hashes — the header, the annotations, every chain, every residue, every atom,
 and the single-letter sequence of each chain — in one call.
 
 ```perl
-use Structure::Info;
+use Chem::Structure::Parser;
 
 my $info = structure_info('1a22.ent.pdb');
 
@@ -13,7 +13,7 @@ print $info->{id};                                  # 1A22
 print $info->{resolution};                          # 2.6
 print $info->{chains}{A}{sequence};                 # FPTIPLSRLFDNAMLRAHRLHQL...
 print $info->{chains}{A}{molecule};                 # GROWTH HORMONE
-print $info->{chains}{A}{residues}{54}{resname};    # LEU
+print $info->{chains}{A}{residues}{54}{resname};    # PHE
 print $info->{chains}{A}{residues}{54}{atoms}{CA}{x};
 
 print structure_summary($info);
@@ -41,10 +41,10 @@ structures it is millions of lines: the largest entry in PDBbind v2020 is
 records are parsed in Perl, because they are irregular and there are only a
 few dozen of them in a file.
 
-The module is called `Structure::Info` and not `PDB::Info` because the shape
-of what it hands back has nothing to do with the format it came out of. Today
-it reads PDB; `formats()` says what it reads at any moment, and a format it
-knows the name of but cannot read yet says so rather than misreading it.
+The module is called `Chem::Structure::Parser` and not `PDB::Info` because the
+shape of what it hands back has nothing to do with the format it came out of.
+Today it reads PDB; `formats()` says what it reads at any moment, and a format
+it knows the name of but cannot read yet says so rather than misreading it.
 
 # Installing
 
@@ -72,7 +72,7 @@ the spirit of R's `?function` at the prompt. It takes the name three ways:
     h(\&aa3to1);            # by reference
     h();                    # the list of documented functions
 
-    perl -MStructure::Info -e 'h(*structure_info)'   # straight from the shell
+    perl -MChem::Structure::Parser -e 'h(*structure_info)'   # straight from the shell
 
 Note that `h(res_type)`, with no quotes and no sigil, cannot be made to work:
 every function here is exported, so Perl parses the bareword as a call to
@@ -90,40 +90,183 @@ away. `.gz` files are read as they are, without unpacking to a temporary file.
 
 ### What comes back
 
-    file        the path it was read from
-    format      'pdb'
-    id          the four-character id, from HEADER or from the file name
-    title       TITLE, continuation lines joined
-    header      { classification, deposit_date, id_code }
-    experiment  [ 'X-RAY DIFFRACTION' ]
-    resolution  2.6                        from REMARK 2
-    r_work      0.187                      from REMARK 3
-    r_free      0.278
-    temperature 100                        from REMARK 200
-    ph          7.5
-    keywords    [ ... ]                    KEYWDS
-    authors     [ ... ]                    AUTHOR
-    journal     { auth => [...], titl, ref, pmid, doi }
-    compound    { 1 => { molecule, chain => [...], engineered, ... } }
-    source      { 1 => { organism_scientific, organism_taxid, ... } }
-    seqres      { A => { sequence, residues => [...], length } }
-    dbref       { A => [ { database, accession, db_id, ... } ] }
-    seqadv      [ ... ]                    where the entry differs from the database
-    modres      { MSE => { standard => 'MET', comment } }
-    het         { NAG => { name, formula, instances => [...] } }
-    helix sheet ssbond link cispep         [ { ... }, ... ]
-    cryst1      { a, b, c, alpha, beta, gamma, sgroup, z }
-    remarks     { 2 => [ lines ], 350 => [ lines ], ... }
-    conect      [ [ serial, serial, ... ], ... ]
-    records     { REMARK => 340, SEQRES => 24, ... }   every record, counted
-    n_models    how many MODEL records the file has
-    model       which one the chains below were built from
-    models      every model, when called with model => 'all'
-    chains      { A => { ... } }
-    chain_order [ 'A', 'B' ]               the order the file has them in
-    stats       { n_atoms, n_hetatm, n_hydrogens, n_water_atoms,
-                  elements => { C => 1946, N => 507, ... },
-                  bfactor => { min, max, mean, n }, bbox, center }
+Laid out the way `tree` lays out a directory, this is `1a22.ent.pdb` — a real
+file, real values, the long lists cut short:
+
+```
+$info
+├── file            '1a22.ent.pdb'          the path it was read from
+├── format          'pdb'
+├── id              '1A22'                  from HEADER, or from the file name
+├── title           'HUMAN GROWTH HORMONE BOUND TO SINGLE RECEPTOR'
+├── header
+│   ├── classification  'COMPLEX (HORMONE/RECEPTOR)'
+│   ├── deposit_date    '15-JAN-98'
+│   └── id_code         '1A22'
+├── experiment      [ 'X-RAY DIFFRACTION' ]
+├── resolution      2.6                     REMARK 2
+├── r_work          0.187                   REMARK 3
+├── r_free          undef                   this entry does not report one
+├── temperature     287                     REMARK 200
+├── ph              6.5
+├── keywords        [ 'COMPLEX (HORMONE-RECEPTOR)', 'PITUITARY HORMONE', ... ]
+├── authors         [ 'A.M.DE VOS', 'M.ULTSCH' ]
+├── journal
+│   ├── auth        [ 'T.CLACKSON', 'M.H.ULTSCH', 'J.A.WELLS', 'A.M.DE VOS' ]
+│   ├── titl        'STRUCTURAL AND FUNCTIONAL ANALYSIS OF THE 1:1 GROWTH...'
+│   ├── ref         'J.MOL.BIOL.                   V. 277  1111 1998'
+│   ├── refn        'ISSN 0022-2836'
+│   ├── pmid        '9571026'
+│   └── doi         '10.1006/JMBI.1998.1669'
+├── compound                                COMPND, by MOL_ID
+│   ├── 1
+│   │   ├── mol_id      '1'
+│   │   ├── molecule    'GROWTH HORMONE'
+│   │   ├── chain       [ 'A' ]
+│   │   ├── engineered  'YES'
+│   │   └── mutation    'YES'
+│   └── 2           { molecule 'GROWTH HORMONE RECEPTOR', chain [ 'B' ],
+│                     fragment 'EXTRACELLULAR DOMAIN', engineered 'YES' }
+├── source                                  SOURCE, by MOL_ID
+│   └── 1           { organism_scientific 'HOMO SAPIENS', organism_common
+│                     'HUMAN', organism_taxid '9606', mol_id '1',
+│                     expression_system 'ESCHERICHIA COLI',
+│                     expression_system_taxid '562' }
+├── entity_of_chain                         COMPND and SOURCE, by chain
+│   ├── A           { mol_id '1', molecule 'GROWTH HORMONE', fragment undef,
+│   │                 ec undef, organism 'HOMO SAPIENS', taxid '9606',
+│   │                 expressed_in 'ESCHERICHIA COLI' }
+│   └── B           { ..., fragment 'EXTRACELLULAR DOMAIN' }
+├── seqres                                  what SEQRES says was in the crystal
+│   ├── A
+│   │   ├── sequence    'FPTIPLSRLFDNAMLRAHRLHQLAFDTYQEFEEAYIPKEQKYSFLQ...'
+│   │   ├── residues    [ 'PHE', 'PRO', 'THR', 'ILE', ... ]        191 of them
+│   │   └── length      191
+│   └── B               { sequence, residues, length 238 }
+├── dbref
+│   └── A           [ { database 'UNP', accession 'P01241',
+│                       db_id 'SOMA_HUMAN', seq_begin '1', seq_end '191',
+│                       db_begin '27', db_end '217', chain 'A' } ]
+├── seqadv          [ { chain 'A', resseq '120', resname 'ARG',
+│                       db_res 'GLY', db_seq '146', comment 'ENGINEERED' } ]
+├── modres          { }                     no MSE-style residues here
+├── het
+│   └── HOH         { het_id 'HOH', formula '69(H2 O)', water 1 }
+├── hetnam          { }
+├── formul          { }
+├── helix           [ { id '1', class '1', length '29',
+│                       init_chain 'A', init_resname 'SER', init_resseq '7',
+│                       end_chain 'A', end_resname 'TYR', end_resseq '35' },
+│                     ... ]                                     12 of them
+├── sheet           [ ... ]                                     12
+├── ssbond          [ { chain1 'A', resseq1 '53',
+│                       chain2 'A', resseq2 '165', length '2.02' }, ... ]  5
+├── link            [ ]
+├── cispep          [ ]
+├── site            [ ]
+├── cryst1          { a '67.7', b '67.7', c '228',
+│                     alpha '90', beta '90', gamma '90',
+│                     sgroup 'P 43 21 2', z '8' }
+├── biological_assembly  [ 32 lines of REMARK 350, verbatim ]
+├── revdat          [ { num '3', date '18-APR-18', id '1A22',
+│                       type '1', what 'REMARK' }, ... ]
+├── remarks                                 every REMARK, by number
+│   ├── 2           [ '', 'RESOLUTION.    2.60 ANGSTROMS.' ]
+│   ├── 350         [ ... ]                                     32 lines
+│   └── ...         1, 3, 4, 100, 200, 280, 290, 300, 465, 470, 500
+├── conect          [ [ 448, 1255 ], ... ]                      10
+├── records                                 every record type, counted
+│   ├── REMARK      365
+│   ├── SEQRES      34
+│   ├── HELIX       12
+│   └── ...         AUTHOR, COMPND, CONECT, CRYST1, DBREF, SOURCE, SSBOND, ...
+├── n_models        1                       how many MODEL records the file has
+├── model           1                       which one the chains below are
+├── models                                  there only with model => 'all'
+├── stats
+│   ├── n_atoms         3113
+│   ├── n_hetatm        69
+│   ├── n_hydrogens     0
+│   ├── n_water_atoms   69
+│   ├── n_lines         3605
+│   ├── n_atom_records  3044    ATOM lines seen, whether kept or not
+│   ├── n_hetatm_records 69     HETATM lines, likewise
+│   ├── n_anisou        0
+│   ├── n_skipped       0       coordinate lines the options threw away
+│   ├── elements        { C 1946, O 643, N 507, S 17 }
+│   ├── bfactor         { min '2.7', max '85.39', mean 30.83, n 3113 }
+│   ├── bbox            { xmin '12.142', xmax '80.34', ymin '2.011', ... }
+│   └── center          [ '46.241', '29.135', '134.559' ]
+├── chain_order     [ 'A', 'B' ]            the order the file has them in
+└── chains
+    ├── A
+    │   ├── id              'A'
+    │   ├── type            'protein'   protein dna rna water hetero unknown
+    │   ├── sequence        'FPTIPLSRLFDNAMLRAHRLHQLAFDTYQEFEEAYIPKEQ...'
+    │   │                               single-letter, what has coordinates
+    │   ├── seqres          'FPTIPLSRLFDNAMLRAHRLHQLAFDTYQEFEEAYIPKEQ...'
+    │   ├── seqres_length   191
+    │   ├── n_residues      206
+    │   ├── n_polymer       180
+    │   ├── n_water         26
+    │   ├── n_ligand        0
+    │   ├── n_atoms         1492
+    │   ├── n_hetatm        26
+    │   ├── n_missing       11          SEQRES less what was modelled
+    │   ├── gaps            [ { after 129, before 136, missing 6 },
+    │   │                     { after 148, before 154, missing 5 } ]
+    │   ├── n_gaps          2
+    │   ├── first           1           the first and last polymer residue keys
+    │   ├── last            191
+    │   ├── residue_types   { amino_acid 180, water 26 }
+    │   ├── molecule        'GROWTH HORMONE'            from COMPND
+    │   ├── organism        'HOMO SAPIENS'              from SOURCE
+    │   ├── mol_id          '1'
+    │   ├── dbref           [ { ... } ]     as in the top-level dbref
+    │   │                                   ec and fragment are here too, in a
+    │   │                                   chain whose file gives them
+    │   ├── residue_order   [ '1', '2', '3', ... '574' ]        file order, 206
+    │   └── residues                    keyed number + insertion code
+    │       ├── 54
+    │       │   ├── resname     'PHE'
+    │       │   ├── number      54
+    │       │   ├── icode       ''
+    │       │   ├── key         '54'
+    │       │   ├── chain       'A'
+    │       │   ├── one         'F'     '' when there is no letter for it
+    │       │   ├── type        'amino_acid'
+    │       │   │                       nucleotide water ligand ion
+    │       │   ├── standard    1       one of the twenty, or a standard base
+    │       │   ├── modified    0       1 for MSE, still an M in the sequence
+    │       │   ├── hetero      0       1 when it was written as HETATM
+    │       │   ├── free                not here; 1 for a free amino acid
+    │       │   │                       bound in a site (see below)
+    │       │   ├── n_atoms     11
+    │       │   ├── b_mean      22.55
+    │       │   ├── center      [ 65.311, 17.127, 140.515 ]
+    │       │   ├── atom_order  [ 'N', 'CA', 'C', 'O', 'CB', ... ]
+    │       │   └── atoms
+    │       │       ├── CA
+    │       │       │   ├── name       'CA'
+    │       │       │   ├── serial     450
+    │       │       │   ├── element    'C'
+    │       │       │   ├── charge     ''
+    │       │       │   ├── x          '66.446'
+    │       │       │   ├── y          '18.25'
+    │       │       │   ├── z          '141.982'
+    │       │       │   ├── occupancy  '1'
+    │       │       │   ├── bfactor    '24.53'
+    │       │       │   ├── altloc     ''
+    │       │       │   ├── hetero     0
+    │       │       │   └── altlocs    [ { altloc, x, y, z, occupancy,
+    │       │       │                      bfactor }, ... ]
+    │       │       │                  present only when the atom has
+    │       │       │                  alternate conformers; every conformer
+    │       │       │                  is listed, the chosen one included
+    │       │       └── ...    N, C, O, CB, CG, CD1, CD2, CE1, CE2, CZ
+    │       └── ...            1 .. 191, then the waters at 512 .. 574
+    └── B                      the same again: 235 residues, 1621 atoms
+```
 
 A record that is not in the file reads as `undef`, and a list that is not in
 the file reads as an empty arrayref — `title` being `undef` means there was no
@@ -132,57 +275,26 @@ TITLE, which is a different thing from a TITLE that was blank.
 Everything the module does not take apart is still in `remarks` and in the
 raw record counts, so nothing in the file is lost.
 
-### A chain
-
-    id            'A'
-    type          protein | dna | rna | water | hetero | unknown
-    sequence      single-letter, the residues that have coordinates
-    seqres        single-letter, what SEQRES says was in the crystal
-    n_residues n_polymer n_water n_ligand n_atoms n_hetatm
-    n_missing     the SEQRES length less the residues actually modelled
-    gaps          [ { after, before, missing } ]   unmodelled stretches
-    n_gaps
-    first last    the first and last polymer residue keys
-    residue_types { amino_acid => 191, water => 69, ligand => 1 }
-    molecule      from COMPND, e.g. 'GROWTH HORMONE'
-    organism      from SOURCE
-    ec fragment mol_id dbref
-    residue_order [ '1', '2', '3', '3A', ... ]      file order
-    residues      { '54' => { ... } }
+### The two sequences
 
 `sequence` and `seqres` are the two different questions people mean by "the
 sequence": what was modelled, and what was in the crystal. They differ
 wherever a terminus or a loop went unmodelled, which is what `gaps` counts and
-`n_missing` totals.
+`n_missing` totals — eleven residues of chain A above, in two stretches.
 
-### A residue
+### How residues are keyed
 
-Keyed by residue number with its insertion code appended, so `100`, `100A` and
-`100B` are three separate keys and nothing is silently overwritten.
+By residue number with the insertion code appended, so `100`, `100A` and
+`100B` are three separate keys and nothing is silently overwritten. Waters and
+ligands are in `residues` alongside the polymer, which is why chain A above
+has 206 residues to its 191-long SEQRES.
 
-    resname   'LEU'          number 54       icode ''      key '54'
-    one       'L'            the single-letter code, '' when there is none
-    type      amino_acid | nucleotide | water | ligand | ion
-    standard  1 for the twenty and the standard nucleotides
-    modified  1 for a residue like MSE, which is still an M in the sequence
-    hetero    1 when it was written as HETATM
-    free      1 for a free amino acid bound in a site (see below)
-    n_atoms   center [ x, y, z ]   b_mean
-    atom_order [ 'N', 'CA', 'C', 'O', ... ]
-    atoms      { CA => { ... } }
+### Nothing points back up
 
-### An atom
-
-    name 'CA'   serial 384   element 'C'   charge ''
-    x y z       occupancy    bfactor       altloc   hetero
-    altlocs   [ { altloc, x, y, z, occupancy, bfactor }, ... ]
-              present only when the atom has alternate conformers; every
-              conformer is listed, including the one chosen above
-
-Nothing in the structure points back up at its parent — a residue does not
-hold its chain, an atom does not hold its residue. Parent links would make the
-whole thing one reference cycle, and a cycle is a leak that goes unnoticed
-until the ten-thousandth file.
+A residue does not hold its chain and an atom does not hold its residue — the
+names are there, `chain => 'A'` on the residue, but not the references. Parent
+links would make the whole thing one reference cycle, and a cycle is a leak
+that goes unnoticed until the ten-thousandth file.
 
 ### Options
 
@@ -306,6 +418,34 @@ structure that soaked in selenomethionine has the same sequence as one that
 did not, and a sequence with an `X` every seventh position is no use to
 anyone.
 
+## aa1to3
+
+    aa1to3('A');      # 'ALA'
+    aa1to3('X');      # 'UNK'
+    aa1to3('B');      # 'ASX'   ASP or ASN, as the format spells it
+    aa1to3('*');      # ''      not a single-letter code
+
+`aa3to1` backwards: the three-letter name a single-letter code stands for, and
+the empty string for anything that is not one of the twenty-six. Blanks and
+case do not matter, since the letter usually comes out of a sequence string
+rather than out of a file.
+
+Every letter of the alphabet has a name, because the ambiguity codes have one
+of their own — `B` is ASX, `Z` is GLX, `J` is XLE, `X` is UNK. Going this way
+there is only ever one answer: `aa3to1` maps sixty-odd names onto `C`, and
+only CYS comes back.
+
+Amino acids only, as the name says. `aa1to3('A')` is ALA and not adenine, and
+`aa1to3('T')` is THR and not thymine — a caller who wants `' DA'` already
+knows the chain is DNA, and a function that guessed from a bare letter would be
+wrong half the time.
+
+It is in the XS rather than in Perl because it is both faster and smaller
+there: the table is 104 bytes of read-only memory in the shared object, shared
+between every process that loads the module, against 3,350 bytes of hash per
+interpreter, and the lookup is one bounds check and one array index instead of
+a hash lookup — about 4.5× the throughput measured a letter at a time.
+
 ## res1
 
     res1('ALA');      # 'A'
@@ -358,72 +498,6 @@ chain whose SEQRES is 309 long. Those are flagged `free => 1` and typed as
 ligands.
 
 Neither is a rule the format states; both are what the format means.
-
-# What the C is worth
-
-`benchmark.pl` measures it rather than asserting it. Against a pure-Perl
-reader that slices the same columns in the same order and builds the same
-nested hash — not a straw man, just the same job done per line in Perl —
-reading 200 structures from PDBbind v2020, best of three:
-
-    structure_info                           6.30 s     168,000 atoms/s
-    structure_info, atoms => 0               4.05 s     262,000 atoms/s
-    the XS parse alone                       1.97 s     538,000 atoms/s
-    the same reader, in pure Perl            5.48 s     193,000 atoms/s
-    pure Perl, and the same statistics       7.14 s     148,000 atoms/s
-
-**The parse is 2.8x the same parse written in Perl.** That is what the C buys.
-
-`structure_info()` as a whole lands at 0.9x the plain Perl reader and 1.1x the
-one that also gathers the statistics — while doing a good deal more than
-either: the header records, SEQRES, the gaps between the declared sequence and
-the modelled one, chain typing, ligand and ion classification. Building a hash
-of hashes out of what was read costs what it costs in any language, because
-the hashes are the answer. Reading is the part worth writing in C, and reading
-is the part that got faster.
-
-Two rounds of that measurement changed the code. The first showed the whole
-read coming out *slower* than the naive Perl reader, because every per-atom
-statistic was being gathered in Perl over data C had just finished reading;
-those moved into the parse. The second showed each atom being built twice —
-once as columns in C, once as a hash in Perl — and the parse now builds the
-hash itself, which took another 25% off both the time and the memory.
-
-# What is written in C, and what is not
-
-The C side makes one pass over the bytes and does three things: it splits
-ATOM/HETATM records into parallel per-field arrays, it marks where each
-residue begins and ends, and it groups every other record by record name for
-Perl to take apart. Residue name lookup — three letters to one letter, and the
-amino acid/nucleotide/water question — is a switch on three packed bytes, and
-one table serves `aa3to1()`, `res1()` and `res_type()` so the three can never
-disagree.
-
-The per-atom result is columnar — one array per field rather than one hash per
-atom — which is both faster to build and about an order of magnitude smaller
-while it is being built. Perl turns it into the nested hash afterwards, and
-only for the atoms that were kept.
-
-Everything else is Perl. The header records are irregular, they are a few
-dozen lines per file rather than hundreds of thousands, and they are where the
-next surprise will turn up; none of that is worth writing in C.
-
-Two details in there are worth knowing about, because they are where a PDB
-reader is usually wrong:
-
-**Coordinates.** `x`, `y` and `z` are adjacent eight-column fields with no
-separator between them, so a reader that scans for a number instead of slicing
-the columns runs `-12.500 111.000` together. They are sliced, and converted
-with `strtod` on the slice.
-
-**Elements.** Columns 77-78 hold the element symbol, and when they are missing
-— older files, and files written by programs that should know better — it has
-to come from the atom name. A one-letter element is right-justified from
-column 14, so ` CA ` is a carbon alpha, and a two-letter element starts in
-column 13, so `CA  ` is a calcium. A hydrogen with a long name like `HG11`
-also starts in column 13, and taking its first two letters makes it mercury;
-what separates them is that it fills all four columns, which no two-letter
-element's name does.
 
 # Author
 

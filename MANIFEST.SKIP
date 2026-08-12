@@ -1,11 +1,11 @@
 # Build artifacts
-\bInfo\.c\b
+\bParser\.c\b
 \.[oa]$
 \.so$
 \.bs$
 \.dylib$
 \.dll$
-^Info\.def$
+^Parser\.def$
 
 # Makemaker generated files
 ^Makefile$
@@ -15,4 +15,4 @@
 ^MYMETA\.
 
 # Release archives
-^Structure-Info-.*\.tar\.gz$
+^Chem-Structure-Parser-.*\.tar\.gz$

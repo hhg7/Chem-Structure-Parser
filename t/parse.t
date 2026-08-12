@@ -6,11 +6,11 @@
 require 5.010;
 use strict;
 use warnings FATAL => 'all';
-use Structure::Info;
+use Chem::Structure::Parser;
 use Test::Exception;
 use Test::More;
 
-my $p = Structure::Info::_parse_string(<<'PDB', {});
+my $p = Chem::Structure::Parser::_parse_string(<<'PDB', {});
 HEADER    TEST                                    01-JAN-20   9ABC
 ATOM      1  N   MET A   1      11.104  13.207  10.000  1.00 15.00           N
 ATOM      2  CA AMET A   1     -12.500 111.000 -10.500  0.40 16.00           C
@@ -83,7 +83,7 @@ for my $case (
 	[ 'residue name',   'ATOM      2  N   ALA A   1      11.000  13.000  10.000' ],
 ) {
 	my ($what, $second) = @$case;
-	my $q = Structure::Info::_parse_string(
+	my $q = Chem::Structure::Parser::_parse_string(
 		"ATOM      1  N   MET A   1      10.000  10.000  10.000\n$second\n", {});
 	is(scalar @{ $q->{res_first} }, 2, "a change of $what starts a new residue");
 }
@@ -94,7 +94,7 @@ for my $case (
 {
 	# right-trimmed lines: the file stops before the B-factor and before the
 	# element columns, which is legal and common in older files
-	my $q = Structure::Info::_parse_string(
+	my $q = Chem::Structure::Parser::_parse_string(
 		"ATOM      1  CA  ALA A   1      10.000  10.000  10.000\n", {});
 	is($q->{n_atoms}, 1, 'a line that stops after the coordinates is still an atom');
 	is($q->{occupancy}[0], undef, 'a missing occupancy is undef, not zero');
@@ -103,27 +103,27 @@ for my $case (
 }
 {
 	# DOS line endings
-	my $q = Structure::Info::_parse_string(
+	my $q = Chem::Structure::Parser::_parse_string(
 		"ATOM      1  CA  ALA A   1      10.000  10.000  10.000  1.00 20.00           C  \r\n", {});
 	is($q->{element}[0], 'C', 'a CRLF line ending does not end up in the element');
 	is($q->{n_atoms}, 1, 'a CRLF file parses');
 }
 {
 	# a serial number that has overflowed its five columns
-	my $q = Structure::Info::_parse_string(
+	my $q = Chem::Structure::Parser::_parse_string(
 		"ATOM  ***** CA  ALA A   1      10.000  10.000  10.000\n", {});
 	is($q->{n_atoms}, 1, 'an overflowed serial number does not lose the atom');
 	is($q->{serial}[0], undef, 'and comes back undef rather than as a wrong number');
 }
 {
-	my $q = Structure::Info::_parse_string('', {});
+	my $q = Chem::Structure::Parser::_parse_string('', {});
 	is($q->{n_atoms}, 0, 'an empty string parses to nothing');
 	is($q->{n_lines}, 0, 'and no lines');
 	is_deeply($q->{res_first}, [], 'and no residues');
 }
 {
 	# a blank line in the middle, and a file with no trailing newline
-	my $q = Structure::Info::_parse_string(
+	my $q = Chem::Structure::Parser::_parse_string(
 		"ATOM      1  CA  ALA A   1      10.000  10.000  10.000\n\nEND", {});
 	is($q->{n_atoms}, 1, 'blank lines and a missing final newline are fine');
 }
@@ -134,7 +134,7 @@ for my $case (
 # column the name starts in, and getting it wrong turns hydrogens into mercury.
 #--------
 {
-	my $q = Structure::Info::_parse_string(join('', map { "$_\n" }
+	my $q = Chem::Structure::Parser::_parse_string(join('', map { "$_\n" }
 		'ATOM      1  CA  ALA A   1      10.000  10.000  10.000',
 		'HETATM    2 CA    CA A   2      10.000  10.000  10.000',
 		'ATOM      3 HG11 LEU A   3      10.000  10.000  10.000',
@@ -148,13 +148,13 @@ for my $case (
 #--------
 # arguments
 #--------
-throws_ok { Structure::Info::_parse_string(undef) } qr/undefined/,
+throws_ok { Chem::Structure::Parser::_parse_string(undef) } qr/undefined/,
 	'_parse_string: undefined text dies';
-throws_ok { Structure::Info::_parse_file(undef) } qr/undefined/,
+throws_ok { Chem::Structure::Parser::_parse_file(undef) } qr/undefined/,
 	'_parse_file: an undefined file name dies';
-throws_ok { Structure::Info::_parse_file('t/data/does.not.exist.pdb') } qr/cannot read/,
+throws_ok { Chem::Structure::Parser::_parse_file('t/data/does.not.exist.pdb') } qr/cannot read/,
 	'_parse_file: a missing file dies, and says so';
-throws_ok { Structure::Info::_parse_string('', 'not a hashref') } qr/hash reference/,
+throws_ok { Chem::Structure::Parser::_parse_string('', 'not a hashref') } qr/hash reference/,
 	'_parse_string: options must be a hash reference';
 
 done_testing();

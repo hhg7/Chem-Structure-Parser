@@ -3,7 +3,7 @@
 require 5.010;
 use strict;
 use warnings FATAL => 'all';
-use Structure::Info;
+use Chem::Structure::Parser;
 use Test::Exception;
 use Test::More;
 
@@ -103,10 +103,46 @@ is(res_type($_), 'water', "res_type: $_ is water") for qw(HOH WAT DOD H2O SOL);
 is(res_type($_), 'other', "res_type: $_ is neither polymer nor water") for qw(NAG ZN SO4 ATP HEM);
 
 #--------
+# aa1to3() -- the other direction
+#--------
+is(aa1to3($STANDARD{$_}), $_, "aa1to3: $STANDARD{$_} is $_") for sort keys %STANDARD;
+
+is(aa1to3('B'), 'ASX', 'aa1to3: B is ASX (ASP or ASN)');
+is(aa1to3('Z'), 'GLX', 'aa1to3: Z is GLX (GLU or GLN)');
+is(aa1to3('J'), 'XLE', 'aa1to3: J is XLE (LEU or ILE)');
+is(aa1to3('U'), 'SEC', 'aa1to3: U is SEC (selenocysteine)');
+is(aa1to3('O'), 'PYL', 'aa1to3: O is PYL (pyrrolysine)');
+is(aa1to3('X'), 'UNK', 'aa1to3: X is UNK');
+
+# the reverse table and the switch in the XS are written out separately, so
+# every letter goes back through aa3to1() to prove they still agree
+is(aa3to1(aa1to3($_)), $_, "aa1to3 then aa3to1: $_ round-trips") for 'A' .. 'Z';
+
+# the letters aa3to1() can produce are exactly the letters aa1to3() knows: no
+# letter is a dead end, and none of the twenty-six is missing
+is_deeply([ grep { length aa1to3($_) } 'A' .. 'Z' ], [ 'A' .. 'Z' ],
+	'aa1to3: every letter of the alphabet is an amino acid code');
+
+is(aa1to3('a'),   'ALA', 'aa1to3: lower case is accepted');
+is(aa1to3(' c '), 'CYS', 'aa1to3: blanks on both sides are ignored');
+is(aa1to3(''),    '',    'aa1to3: the empty string has no name');
+is(aa1to3('  '),  '',    'aa1to3: blanks alone have no name');
+is(aa1to3('AC'),  '',    'aa1to3: two letters are not a single-letter code');
+is(aa1to3('1'),   '',    'aa1to3: a digit is not a single-letter code');
+is(aa1to3('*'),   '',    'aa1to3: nor is a gap character');
+
+# 'A' is alanine here even though res1(' DA') is also 'A'.  A nucleotide has
+# no one-letter answer to give back, and guessing between ALA and DA from a
+# bare letter would be wrong half the time.
+is(aa1to3('A'), 'ALA', 'aa1to3: A is alanine, not adenine');
+is(aa1to3('T'), 'THR', 'aa1to3: T is threonine, not thymine');
+
+#--------
 # an undefined name is a mistake worth hearing about: it means a column was
 # read out of a record that did not have one
 #--------
 throws_ok { aa3to1(undef)   } qr/undefined/, 'aa3to1: undef dies';
+throws_ok { aa1to3(undef)   } qr/undefined/, 'aa1to3: undef dies';
 throws_ok { res1(undef)     } qr/undefined/, 'res1: undef dies';
 throws_ok { res_type(undef) } qr/undefined/, 'res_type: undef dies';
 

@@ -12,7 +12,7 @@ require 5.010;
 use strict;
 use warnings FATAL => 'all';
 use Time::HiRes 'time';
-use Structure::Info;
+use Chem::Structure::Parser;
 
 my $dir = shift || die "usage: benchmark.pl <directory of .pdb files> [count]\n";
 my $want = shift || 200;
@@ -107,7 +107,7 @@ timeit('structure_info, meta => 0', sub {
 	return $i->{stats}{n_atoms};
 });
 my $raw = timeit('the XS parse alone', sub {
-	my $p = Structure::Info::_parse_file($_[0], {});
+	my $p = Chem::Structure::Parser::_parse_file($_[0], {});
 	return $p->{n_atoms};
 });
 my $pp = timeit('the same reader, in pure Perl', sub {

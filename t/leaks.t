@@ -20,28 +20,29 @@ BEGIN {
 	eval { require Test::LeakTrace; Test::LeakTrace->import('no_leaks_ok'); 1 }
 		or plan skip_all => 'Test::LeakTrace is not installed';
 }
-use Structure::Info;
+use Chem::Structure::Parser;
 
 #--------
 # the XS parse
 #--------
 no_leaks_ok {
-	Structure::Info::_parse_file("$data/mini.pdb", {});
+	Chem::Structure::Parser::_parse_file("$data/mini.pdb", {});
 } '_parse_file does not leak';
 
 no_leaks_ok {
-	Structure::Info::_parse_string("ATOM      1  CA  ALA A   1      1.0  2.0  3.0\n", {});
+	Chem::Structure::Parser::_parse_string("ATOM      1  CA  ALA A   1      1.0  2.0  3.0\n", {});
 } '_parse_string does not leak';
 
 no_leaks_ok {
-	eval { Structure::Info::_parse_file("$data/no.such.file.pdb", {}) };
+	eval { Chem::Structure::Parser::_parse_file("$data/no.such.file.pdb", {}) };
 } 'a failed open does not leak the buffer it had already allocated';
 
 no_leaks_ok {
-	eval { Structure::Info::_parse_string('', 'not a hashref') };
+	eval { Chem::Structure::Parser::_parse_string('', 'not a hashref') };
 } 'a rejected argument does not leak';
 
-no_leaks_ok { aa3to1('ALA'); aa3to1('NAG'); res1('DA'); res_type('HOH') }
+no_leaks_ok { aa3to1('ALA'); aa3to1('NAG'); res1('DA'); res_type('HOH');
+              aa1to3('A'); aa1to3('*') }
 	'the residue name lookups do not leak';
 
 no_leaks_ok { eval { aa3to1(undef) } } 'nor does the croak on an undefined name';

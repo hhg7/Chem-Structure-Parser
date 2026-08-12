@@ -1,4 +1,4 @@
-Revision history for Structure-Info
+Revision history for Chem-Structure-Parser
 
 0.01
     - initial version: reads PDB into a hash of hashes, single-letter

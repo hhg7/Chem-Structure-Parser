@@ -14,7 +14,7 @@ use strict;
 use warnings FATAL => 'all';
 use Cwd 'abs_path';
 use File::Basename 'dirname';
-use Structure::Info;
+use Chem::Structure::Parser;
 use Test::More;
 
 my @DIRS = grep { defined && -d } (

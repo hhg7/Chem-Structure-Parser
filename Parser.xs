@@ -1,8 +1,8 @@
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE /* glibc / Linux */
+#define _GNU_SOURCE // glibc / Linux
 #endif
 #ifndef __EXTENSIONS__
-#define __EXTENSIONS__ 1 /* Solaris/illumos */
+#define __EXTENSIONS__ 1 // Solaris/illumos
 #endif
 #define PERL_NO_GET_CONTEXT
 #include "EXTERN.h"
@@ -14,38 +14,62 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+/*Chem::Structure::Parser -- the parts of reading a PDB file worth doing in C.
 
-/* ===========================================================================
- * Structure::Info -- the parts of reading a PDB file that are worth doing in C.
- *
- * A PDB file is one record per line, and every field sits at a fixed column
- * range (the format is punched-card old).  Two things about that make XS pay
- * for itself here, and only two:
- *
- *   1. the coordinate section is enormous -- the largest file in PDBbind
- *      v2020 is 33 MB, ~400,000 ATOM/HETATM lines -- and every one of those
- *      lines wants a dozen substr()s and three numeric conversions.  Done in
- *      Perl that is a dozen SVs per line born and buried;
- *   2. residue names are looked up constantly (three letters -> one letter,
- *      and "is this an amino acid, a nucleotide or water?"), which is a
- *      switch on three bytes in C and a hash lookup plus a sub call in Perl.
- *
- * So C does exactly that: one pass over the bytes, ATOM/HETATM split into
- * parallel column arrays (a "columnar" result -- one array per field, not one
- * hash per atom, which keeps peak memory down by roughly an order of
- * magnitude), residue boundaries marked as it goes, and every other record
- * handed back as raw lines grouped by record name.
- *
- * The header records (HEADER, COMPND, REMARK, SEQRES, ...) are parsed in
- * Perl.  There are a few dozen of them, they are irregular, and they are the
- * part most likely to need fixing later; none of that belongs in C.
- * ======================================================================== */
+A PDB file is one record per line with every field at a fixed column range
+(the format is punched-card old).  Two things about that make XS pay for
+itself here, and only two: the coordinate section is enormous -- the largest
+file in PDBbind v2020 is 33 MB, ~400,000 ATOM/HETATM lines -- and every one
+of those lines wants a dozen substr()s and three numeric conversions, which
+in Perl is a dozen SVs per line born and buried; and residue names are looked
+up constantly (three letters -> one letter, "amino acid, nucleotide or
+water?"), a switch on three bytes in C against a hash lookup plus a sub call
+in Perl.
 
-/* --- residue table -------------------------------------------------------
- * One table serves aa3to1(), res1() and res_type(), so the three can never
- * disagree about what a residue is.  Keyed on the three-byte name packed into
- * an int, left-padded with blanks, so that "ALA", " DA" and "  A" are all one
- * switch on an integer. */
+So C does exactly that: one pass over the bytes, ATOM/HETATM split into
+parallel column arrays (one array per field, not one hash per atom, which
+keeps peak memory down by roughly an order of magnitude), residue boundaries
+marked as it goes, every other record handed back as raw lines grouped by
+record name.  The header records (HEADER, COMPND, REMARK, SEQRES, ...) are
+parsed in Perl: a few dozen of them, irregular, and the part most likely to
+need fixing later.*/
+
+/*CSP_RESTRICT -- "no other pointer here reaches this object".  Worth spelling
+out because perl's ccflags carry -fno-strict-aliasing, which switches off the
+type-based aliasing analysis a C compiler would otherwise use; restrict is one
+of the few aliasing facts still available to it, and the parse below is full of
+the pattern it wants -- a const char * into the file buffer read alongside a
+char * being written, both the same type, neither able to touch the other.
+
+Not spelled `restrict' directly: that is C99, and the perls this builds against
+are configured with whatever -std their Configure chose (5.10 on an old gcc gets
+gnu89).  GCC and clang take __restrict__ in any mode, MSVC takes __restrict,
+and a compiler with neither loses the hint and nothing else.  Predefine it empty
+-- OPTIMIZE='-O2 -DCSP_RESTRICT=' -- to build without the hint, which is how the
+before/after timings were taken and the escape hatch if a compiler mishandles
+it.*/
+#ifndef CSP_RESTRICT
+#if defined(__cplusplus)
+#  if defined(__GNUC__) || defined(_MSC_VER)
+#    define CSP_RESTRICT __restrict
+#  else
+#    define CSP_RESTRICT
+#  endif
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#  define CSP_RESTRICT restrict
+#elif defined(__GNUC__) && __GNUC__ >= 3
+#  define CSP_RESTRICT __restrict__
+#elif defined(_MSC_VER) && _MSC_VER >= 1400
+#  define CSP_RESTRICT __restrict
+#else
+#  define CSP_RESTRICT
+#endif
+#endif
+
+/*residue table.  One table serves aa3to1(), res1() and res_type(), so the
+three can never disagree about what a residue is.  Keyed on the three-byte
+name packed into an int, left-padded with blanks, so that "ALA", " DA" and
+"  A" are all one switch on an integer.*/
 #define RT_OTHER 0
 #define RT_AA    1
 #define RT_NUC   2
@@ -54,12 +78,12 @@
 #define K3(a, b, c) (((unsigned)(a) << 16) | ((unsigned)(b) << 8) | (unsigned)(c))
 
 typedef struct {
-	char one;           /* single-letter code; '\0' when there isn't one */
-	unsigned char type; /* RT_* */
+	char one;           //single-letter code; '\0' when there isn't one
+	unsigned char type; //RT_*
 } res_info;
 
-/* pack a (possibly blank-padded, possibly short) residue name into a key */
-static unsigned res_key(const char *s, STRLEN len)
+//pack a (possibly blank-padded, possibly short) residue name into a key
+static unsigned res_key(const char *CSP_RESTRICT s, STRLEN len)
 {
 	char b[3];
 	STRLEN i;
@@ -71,15 +95,15 @@ static unsigned res_key(const char *s, STRLEN len)
 	return K3((unsigned char)b[0], (unsigned char)b[1], (unsigned char)b[2]);
 }
 
-/* res_lookup() -- classify a residue name.  Returns 1 when the name is known,
- * 0 when it is not (a ligand, an ion, a sugar: anything the caller has to
- * work out for itself from the atoms). */
-static int res_lookup(const char *s, STRLEN len, res_info *out)
+/*res_lookup() -- classify a residue name.  1 when the name is known, 0 when
+it is not (a ligand, an ion, a sugar: anything the caller has to work out for
+itself from the atoms).*/
+static int res_lookup(const char *CSP_RESTRICT s, STRLEN len, res_info *CSP_RESTRICT out)
 {
 	char one;
 	unsigned char type = RT_AA;
 	switch (res_key(s, len)) {
-		/* the twenty, plus the ambiguity codes the format allows */
+		//the twenty, plus the ambiguity codes the format allows
 		case K3('A','L','A'): one = 'A'; break;
 		case K3('A','R','G'): one = 'R'; break;
 		case K3('A','S','N'): one = 'N'; break;
@@ -100,89 +124,47 @@ static int res_lookup(const char *s, STRLEN len, res_info *out)
 		case K3('T','R','P'): one = 'W'; break;
 		case K3('T','Y','R'): one = 'Y'; break;
 		case K3('V','A','L'): one = 'V'; break;
-		case K3('A','S','X'): one = 'B'; break; /* ASP or ASN     */
-		case K3('G','L','X'): one = 'Z'; break; /* GLU or GLN     */
-		case K3('X','L','E'): one = 'J'; break; /* LEU or ILE     */
-		case K3('S','E','C'): one = 'U'; break; /* selenocysteine */
-		case K3('P','Y','L'): one = 'O'; break; /* pyrrolysine    */
-		case K3('U','N','K'): one = 'X'; break;
-		case K3('X','A','A'): one = 'X'; break;
+		case K3('A','S','X'): one = 'B'; break; //ASX ASP or ASN
+		case K3('G','L','X'): one = 'Z'; break; //GLX GLU or GLN
+		case K3('X','L','E'): one = 'J'; break; //XLE LEU or ILE
+		case K3('S','E','C'): one = 'U'; break; //SEC selenocysteine
+		case K3('P','Y','L'): one = 'O'; break; //PYL pyrrolysine
+		case K3('U','N','K'): case K3('X','A','A'): one = 'X'; break;
 
-		/* modified residues, mapped to the parent they were made from.  A
-		 * structure that soaked in selenomethionine is still the same
-		 * sequence, and a sequence with an 'X' every seventh position is
-		 * no use to anyone. */
-		case K3('M','S','E'): one = 'M'; break; /* selenomethionine */
-		case K3('M','H','O'): one = 'M'; break;
-		case K3('F','M','E'): one = 'M'; break;
-		case K3('C','X','M'): one = 'M'; break;
-		case K3('S','M','E'): one = 'M'; break;
-		case K3('M','E','D'): one = 'M'; break;
-		case K3('C','S','O'): one = 'C'; break;
-		case K3('C','S','D'): one = 'C'; break;
-		case K3('C','S','S'): one = 'C'; break;
-		case K3('C','S','X'): one = 'C'; break;
-		case K3('C','S','W'): one = 'C'; break;
-		case K3('C','M','E'): one = 'C'; break;
-		case K3('C','M','T'): one = 'C'; break;
-		case K3('C','Y','X'): one = 'C'; break;
-		case K3('C','A','S'): one = 'C'; break;
-		case K3('C','A','F'): one = 'C'; break;
-		case K3('O','C','S'): one = 'C'; break;
-		case K3('S','M','C'): one = 'C'; break;
-		case K3('S','N','C'): one = 'C'; break;
-		case K3('Y','C','M'): one = 'C'; break;
-		case K3('S','E','P'): one = 'S'; break; /* phosphoserine    */
-		case K3('S','A','C'): one = 'S'; break;
-		case K3('T','P','O'): one = 'T'; break; /* phosphothreonine */
-		case K3('P','T','R'): one = 'Y'; break; /* phosphotyrosine  */
-		case K3('T','Y','S'): one = 'Y'; break;
-		case K3('T','Y','I'): one = 'Y'; break;
-		case K3('T','Y','Q'): one = 'Y'; break;
-		case K3('T','P','Q'): one = 'Y'; break;
-		case K3('P','A','Q'): one = 'Y'; break;
-		case K3('S','T','Y'): one = 'Y'; break;
-		case K3('I','Y','R'): one = 'Y'; break;
-		case K3('K','C','X'): one = 'K'; break;
-		case K3('L','L','P'): one = 'K'; break;
-		case K3('M','L','Y'): one = 'K'; break;
-		case K3('M','L','Z'): one = 'K'; break;
-		case K3('M','3','L'): one = 'K'; break;
-		case K3('A','L','Y'): one = 'K'; break;
-		case K3('L','Y','Z'): one = 'K'; break;
-		case K3('H','Y','P'): one = 'P'; break; /* hydroxyproline */
-		case K3('H','Y','3'): one = 'P'; break;
-		case K3('P','C','A'): one = 'E'; break; /* pyroglutamate  */
-		case K3('C','G','U'): one = 'E'; break;
-		case K3('G','M','A'): one = 'E'; break;
-		case K3('H','I','C'): one = 'H'; break;
-		case K3('H','I','D'): one = 'H'; break;
-		case K3('H','I','E'): one = 'H'; break;
-		case K3('H','I','P'): one = 'H'; break;
-		case K3('H','S','D'): one = 'H'; break;
-		case K3('H','S','E'): one = 'H'; break;
-		case K3('H','S','P'): one = 'H'; break;
-		case K3('M','H','S'): one = 'H'; break;
+		/*modified residues, mapped to the parent they were made from.  A
+		structure that soaked in selenomethionine is still the same sequence,
+		and a sequence with an 'X' every seventh position is no use to anyone.*/
+		case K3('M','S','E'): case K3('M','H','O'): case K3('F','M','E'): case K3('C','X','M'):
+		case K3('S','M','E'): case K3('M','E','D'): one = 'M'; break; //MSE selenomethionine
+		case K3('C','S','O'): case K3('C','S','D'): case K3('C','S','S'): case K3('C','S','X'):
+		case K3('C','S','W'): case K3('C','M','E'): case K3('C','M','T'): case K3('C','Y','X'):
+		case K3('C','A','S'): case K3('C','A','F'): case K3('O','C','S'): case K3('S','M','C'):
+		case K3('S','N','C'): case K3('Y','C','M'): one = 'C'; break;
+		case K3('S','E','P'): case K3('S','A','C'): one = 'S'; break; //SEP phosphoserine
+		case K3('T','P','O'): one = 'T'; break; //TPO phosphothreonine
+		case K3('P','T','R'): case K3('T','Y','S'): case K3('T','Y','I'): case K3('T','Y','Q'):
+		case K3('T','P','Q'): case K3('P','A','Q'): case K3('S','T','Y'): case K3('I','Y','R'):
+			one = 'Y'; break; //PTR phosphotyrosine
+		case K3('K','C','X'): case K3('L','L','P'): case K3('M','L','Y'): case K3('M','L','Z'):
+		case K3('M','3','L'): case K3('A','L','Y'): case K3('L','Y','Z'): one = 'K'; break;
+		case K3('H','Y','P'): case K3('H','Y','3'): one = 'P'; break; //HYP hydroxyproline
+		//PCA pyroglutamate
+		case K3('P','C','A'): case K3('C','G','U'): case K3('G','M','A'): one = 'E'; break;
+		case K3('H','I','C'): case K3('H','I','D'): case K3('H','I','E'): case K3('H','I','P'):
+		case K3('H','S','D'): case K3('H','S','E'): case K3('H','S','P'): case K3('M','H','S'):
 		case K3('N','E','P'): one = 'H'; break;
-		case K3('A','I','B'): one = 'A'; break;
-		case K3('A','B','A'): one = 'A'; break;
-		case K3('A','L','M'): one = 'A'; break;
-		case K3('A','Y','A'): one = 'A'; break;
+		case K3('A','I','B'): case K3('A','B','A'): case K3('A','L','M'): case K3('A','Y','A'):
 		case K3('B','A','L'): one = 'A'; break;
-		case K3('S','A','R'): one = 'G'; break; /* sarcosine */
-		case K3('M','L','E'): one = 'L'; break;
-		case K3('N','L','E'): one = 'L'; break;
+		case K3('S','A','R'): one = 'G'; break; //SAR sarcosine
+		case K3('M','L','E'): case K3('N','L','E'): one = 'L'; break;
 		case K3('M','V','A'): one = 'V'; break;
-		case K3('C','I','R'): one = 'R'; break; /* citrulline */
-		case K3('O','R','N'): one = 'X'; break; /* ornithine  */
-		case K3('D','A','B'): one = 'X'; break;
+		case K3('C','I','R'): one = 'R'; break; //CIR citrulline
+		case K3('O','R','N'): case K3('D','A','B'): one = 'X'; break; //ORN ornithine
 		case K3('T','R','O'): one = 'W'; break;
-		case K3('P','H','I'): one = 'F'; break;
-		case K3('P','H','L'): one = 'F'; break;
-		case K3('M','E','A'): one = 'F'; break;
+		case K3('P','H','I'): case K3('P','H','L'): case K3('M','E','A'): one = 'F'; break;
 
-		/* D-amino acids -- common in the peptide ligands this was written
-		 * for, and they are the same letter as their L partner */
+		/*D-amino acids -- common in the peptide ligands this was written for,
+		and the same letter as their L partner*/
 		case K3('D','A','L'): one = 'A'; break;
 		case K3('D','A','R'): one = 'R'; break;
 		case K3('D','S','G'): one = 'N'; break;
@@ -200,10 +182,9 @@ static int res_lookup(const char *s, STRLEN len, res_info *out)
 		case K3('D','T','H'): one = 'T'; break;
 		case K3('D','T','R'): one = 'W'; break;
 		case K3('D','T','Y'): one = 'Y'; break;
-		case K3('D','V','A'): one = 'V'; break;
-		case K3('D','I','V'): one = 'V'; break;
+		case K3('D','V','A'): case K3('D','I','V'): one = 'V'; break;
 
-		/* nucleotides: DNA (" DA"), RNA ("  A"), and the pre-v3 spellings */
+		//nucleotides: DNA (" DA"), RNA ("  A"), and the pre-v3 spellings
 		case K3(' ','D','A'): one = 'A'; type = RT_NUC; break;
 		case K3(' ','D','C'): one = 'C'; type = RT_NUC; break;
 		case K3(' ','D','G'): one = 'G'; type = RT_NUC; break;
@@ -221,27 +202,17 @@ static int res_lookup(const char *s, STRLEN len, res_info *out)
 		case K3('C','Y','T'): one = 'C'; type = RT_NUC; break;
 		case K3('G','U','A'): one = 'G'; type = RT_NUC; break;
 		case K3('T','H','Y'): one = 'T'; type = RT_NUC; break;
-		case K3('U','R','I'): one = 'U'; type = RT_NUC; break;
-		case K3('P','S','U'): one = 'U'; type = RT_NUC; break; /* pseudouridine */
-		case K3('H','2','U'): one = 'U'; type = RT_NUC; break;
-		case K3('4','S','U'): one = 'U'; type = RT_NUC; break;
+		case K3('U','R','I'): case K3('P','S','U'): case K3('H','2','U'): case K3('4','S','U'):
+			one = 'U'; type = RT_NUC; break; //PSU pseudouridine
 		case K3('5','M','U'): one = 'T'; type = RT_NUC; break;
-		case K3('5','M','C'): one = 'C'; type = RT_NUC; break;
-		case K3('O','M','C'): one = 'C'; type = RT_NUC; break;
+		case K3('5','M','C'): case K3('O','M','C'): one = 'C'; type = RT_NUC; break;
 		case K3('1','M','A'): one = 'A'; type = RT_NUC; break;
-		case K3('2','M','G'): one = 'G'; type = RT_NUC; break;
-		case K3('7','M','G'): one = 'G'; type = RT_NUC; break;
-		case K3('1','M','G'): one = 'G'; type = RT_NUC; break;
-		case K3('M','2','G'): one = 'G'; type = RT_NUC; break;
+		case K3('2','M','G'): case K3('7','M','G'): case K3('1','M','G'): case K3('M','2','G'):
 		case K3('O','M','G'): one = 'G'; type = RT_NUC; break;
 
-		/* water, under every name it gets written with */
-		case K3('H','O','H'): one = '\0'; type = RT_WATER; break;
-		case K3('W','A','T'): one = '\0'; type = RT_WATER; break;
-		case K3('D','O','D'): one = '\0'; type = RT_WATER; break;
-		case K3('H','2','O'): one = '\0'; type = RT_WATER; break;
-		case K3('S','O','L'): one = '\0'; type = RT_WATER; break;
-		case K3('T','I','P'): one = '\0'; type = RT_WATER; break;
+		//water, under every name it gets written with
+		case K3('H','O','H'): case K3('W','A','T'): case K3('D','O','D'): case K3('H','2','O'):
+		case K3('S','O','L'): case K3('T','I','P'): one = '\0'; type = RT_WATER; break;
 
 		default: return 0;
 	}
@@ -250,12 +221,44 @@ static int res_lookup(const char *s, STRLEN len, res_info *out)
 	return 1;
 }
 
-/* --- column fields -------------------------------------------------------
- * Every accessor below clips to the line's real length first: PDB files in
- * the wild are right-trimmed, so a line can stop before the element column
- * (or before the B-factor) and that is not an error. */
+/*the reverse direction.  res_lookup() is many-to-one: sixty-odd names come
+back as 'C'.  Going the other way there is one answer worth giving, the parent
+residue the letter stands for, so this is a plain table indexed by the letter
+-- 104 bytes of read-only memory, one bounds check and one index per call, and
+no hash to build at load time.
 
-static STRLEN trim_ptr(const char **sp, STRLEN len)
+Every letter A-Z is spoken for, because the ambiguity codes have names of
+their own.  There is nothing here for the nucleotides -- 'A' is ALA on the way
+back, and a caller who wants " DA" knows already that the chain is DNA and
+does not need this to guess.
+
+t/residue_names.t rounds every letter back through aa3to1() so that this table
+and the switch above cannot drift apart.*/
+static const char aa1to3_name[26][4] = {
+	"ALA", "ASX", "CYS", "ASP", "GLU", "PHE", "GLY", "HIS", "ILE", //A-I
+	"XLE", "LYS", "LEU", "MET", "ASN", "PYL", "PRO", "GLN", "ARG", //J-R
+	"SER", "THR", "SEC", "VAL", "TRP", "UNK", "TYR", "GLX"         //S-Z
+};//B ASP or ASN, J LEU or ILE, O pyrrolysine, U selenocysteine, Z GLU or GLN
+
+/*aa1to3_lookup() -- the name for a single-letter code, or NULL.  Blanks and
+case are forgiven, as they are in res_key(), because the letter usually
+arrives out of a sequence string that has been through something else.*/
+static const char *aa1to3_lookup(const char *CSP_RESTRICT s, STRLEN len)
+{
+	int c;
+	while (len && (*s == ' ' || *s == '\t')) { s++; len--; }
+	while (len && (s[len - 1] == ' ' || s[len - 1] == '\t')) len--;
+	if (len != 1) return NULL;
+	c = toupper((unsigned char)*s);
+	if (c < 'A' || c > 'Z') return NULL;
+	return aa1to3_name[c - 'A'];
+}
+
+/*column fields.  Every accessor below clips to the line's real length first:
+PDB files in the wild are right-trimmed, so a line can stop before the element
+column (or before the B-factor) and that is not an error.*/
+
+static STRLEN trim_ptr(const char **CSP_RESTRICT sp, STRLEN len)
 {
 	const char *s = *sp;
 	while (len && (*s == ' ' || *s == '\t')) { s++; len--; }
@@ -264,8 +267,9 @@ static STRLEN trim_ptr(const char **sp, STRLEN len)
 	return len;
 }
 
-/* fld() -- the trimmed contents of columns [from, to], zero-based inclusive */
-static STRLEN fld(const char *line, STRLEN llen, STRLEN from, STRLEN to, const char **out)
+//fld() -- the trimmed contents of columns [from, to], zero-based inclusive
+static STRLEN fld(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLEN to,
+                  const char **CSP_RESTRICT out)
 {
 	const char *s;
 	STRLEN n;
@@ -279,10 +283,10 @@ static STRLEN fld(const char *line, STRLEN llen, STRLEN from, STRLEN to, const c
 	return n;
 }
 
-/* str2iv() -- integers, exactly, without going through a double.  '*****'
- * (what a serial number becomes once it overflows five columns) and anything
- * else non-numeric report failure rather than a wrong number. */
-static int str2iv(const char *s, STRLEN n, IV *out)
+/*str2iv() -- integers, exactly, without going through a double.  '*****'
+(what a serial number becomes once it overflows five columns) and anything
+else non-numeric report failure rather than a wrong number.*/
+static int str2iv(const char *CSP_RESTRICT s, STRLEN n, IV *CSP_RESTRICT out)
 {
 	int neg = 0, seen = 0;
 	IV v = 0;
@@ -298,68 +302,161 @@ static int str2iv(const char *s, STRLEN n, IV *out)
 	return 1;
 }
 
-/* str2nv() -- coordinates and the like.  strtod() on a stack copy: the fields
- * are adjacent in the record (x ends where y begins, with no separator when
- * a coordinate is wide), so strtod() cannot be pointed at the buffer itself. */
-static int str2nv(const char *s, STRLEN n, NV *out)
+/*STR2NV_STRTOD() -- the strtod() that reads a whole NV.  A perl built with
+-Duselongdouble or -Dusequadmath has an NV wider than a double, and parsing
+into a double first loses the bits that the wider type would have kept: 0.60
+becomes 0.599999999999999978 once perl prints it back at full NV precision.
+Perl's own Strtod() picks the right one, but it only exists from 5.22 on, so
+older perls get the choice made here.*/
+#ifdef Strtod
+#  define STR2NV_STRTOD(s, e) Strtod((s), (e))
+#elif defined(USE_QUADMATH)
+#  define STR2NV_STRTOD(s, e) strtoflt128((s), (e))
+#elif defined(USE_LONG_DOUBLE) && defined(HAS_STRTOLD)
+#  define STR2NV_STRTOD(s, e) strtold((s), (e))
+#else
+#  define STR2NV_STRTOD(s, e) strtod((s), (e))
+#endif
+
+/*str2nv_slow() -- whatever the fixed-point reader below declines: an exponent,
+a hex float, inf/nan, a field with rubbish after the number.  strtod() on a
+stack copy, because the fields are adjacent in the record (x ends where y
+begins, with no separator when a coordinate is wide) and so strtod() cannot be
+pointed at the record buffer itself.*/
+static int str2nv_slow(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
 {
 	char buf[64], *end;
-	double v;
+	NV v;
 	if (n == 0 || n >= sizeof(buf)) return 0;
 	memcpy(buf, s, n);
 	buf[n] = '\0';
 	errno = 0;
-	v = strtod(buf, &end);
+	v = STR2NV_STRTOD(buf, &end);
 	if (end == buf) return 0;
-	*out = (NV)v;
+	*out = v;
 	return 1;
 }
 
-static int fld_iv(const char *line, STRLEN llen, STRLEN from, STRLEN to, IV *out)
+/*str2nv_fixed() -- [+-]?digits[.digits], which is every number a coordinate
+section actually contains.  Worth a reader of its own because glibc's strtod()
+was 22% of the instructions in a whole-file parse (____strtod_l_internal,
+str_to_mpn, round_and_return): it is a fully general conversion -- locale, hex
+floats, exponents, an arbitrary-precision slow path -- and none of that can
+appear in a field eight columns wide.
+
+It returns 1 only on consuming the whole field, so anything it does not
+understand falls through to str2nv_slow() and keeps its old meaning.
+
+What it produces is not an approximation of strtod(), it is the same NV bit for
+bit, and the reasoning is worth keeping because a change here could silently
+cost a digit.  Both operands of the division are exact: the mantissa is
+accumulated as an integer in an NV, and every integer up to 2**53 is exact even
+on the narrowest NV perl configures (a plain double), which the fifteen-digit
+cap stays well inside; 10**frac is exact for every power of ten to 10**22.  An
+IEEE 754 division of two exact operands is correctly rounded, and correctly
+rounding the true decimal value is exactly what strtod() is required to return
+-- so they agree, and agree the same way on a long double or __float128 perl.
+Dividing by 10**frac rather than multiplying by 10**-frac is the part that has
+to be this way round: 1e-3 is not representable, so multiplying would round
+once into the reciprocal and again into the product.
+
+Leading zeros count against the cap, which costs a little generality that no
+eight-column field could use, and buys the invariant that keeps the table index
+in range: frac never exceeds the digit count, so it never exceeds the cap.*/
+#define STR2NV_MAX_DIGITS 15
+static const NV str2nv_pow10[STR2NV_MAX_DIGITS + 1] = {
+	1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7,
+	1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15
+};
+
+static int str2nv_fixed(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
+{
+	NV m = 0;
+	STRLEN i = 0, nd = 0, frac = 0;
+	int neg = 0, dot = 0;
+
+	if (n == 0) return 0;
+	if (s[0] == '+' || s[0] == '-') { neg = (s[0] == '-'); i = 1; }
+	for (; i < n; i++) {
+		const char c = s[i];
+		if (c >= '0' && c <= '9') {
+			if (++nd > STR2NV_MAX_DIGITS) return 0;
+			m = m * 10 + (NV)(c - '0');
+			if (dot) frac++;
+		} else if (c == '.' && !dot) {
+			dot = 1;
+		} else {
+			return 0; //an exponent, a stray letter, the '*****' of an overflowed field
+		}
+	}
+	if (nd == 0) return 0; //"", "-", ".", "+."
+	if (frac) m /= str2nv_pow10[frac];
+	*out = neg ? -m : m;
+	return 1;
+}
+
+//str2nv() -- coordinates and the like
+static int str2nv(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
+{
+	return str2nv_fixed(s, n, out) || str2nv_slow(s, n, out);
+}
+
+/*The two above are reachable individually from Perl as _str2nv_paths(), which
+exists for t/numbers.t and asserts that they return the same NV bit for bit.
+There is no other way to compare them: only one of the two is ever reached for
+any given field, and Perl's own string-to-NV conversion cannot referee the
+question because on an older -Duselongdouble perl Perl_my_atof is a hand-rolled
+decimal accumulator rather than strtod().  The XSUB is at the foot of the file
+with the rest of them.*/
+
+static int fld_iv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLEN to,
+                  IV *CSP_RESTRICT out)
 {
 	const char *s;
 	STRLEN n = fld(line, llen, from, to, &s);
 	return n ? str2iv(s, n, out) : 0;
 }
 
-static int fld_nv(const char *line, STRLEN llen, STRLEN from, STRLEN to, NV *out)
+static int fld_nv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLEN to,
+                  NV *CSP_RESTRICT out)
 {
 	const char *s;
 	STRLEN n = fld(line, llen, from, to, &s);
 	return n ? str2nv(s, n, out) : 0;
 }
 
-/* guess_element() -- only when columns 77-78 are absent, which happens in
- * files written before the element column existed and in files written by
- * programs that should know better.
- *
- * The atom name is right-justified from column 14 for one-letter elements and
- * from column 13 for two-letter ones, so " CA " is a carbon alpha and "CA  "
- * is a calcium.  That rule is worth following exactly, because the alternative
- * -- taking the first two letters -- turns every "HG11" hydrogen into mercury. */
-static STRLEN guess_element(const char *raw, STRLEN rawlen, char *buf)
+/*guess_element() -- only when columns 77-78 are absent, which happens in
+files written before the element column existed and in files written by
+programs that should know better.
+
+The atom name is right-justified from column 14 for one-letter elements and
+from column 13 for two-letter ones, so " CA " is a carbon alpha and "CA  " is
+a calcium.  That rule is worth following exactly, because the alternative --
+taking the first two letters -- turns every "HG11" hydrogen into mercury.*/
+static STRLEN guess_element(const char *CSP_RESTRICT raw, STRLEN rawlen,
+                            char *CSP_RESTRICT buf)
 {
 	if (rawlen == 0) return 0;
-	/* A hydrogen with a long name -- HG11, HD22, HE21 -- fills all four
-	 * columns and starts in column 13, exactly where a two-letter element
-	 * starts.  Column position alone cannot separate the two, so take the
-	 * full field as the tie-breaker: no two-letter element has a four
-	 * character atom name, while nearly every hydrogen past the first does.
-	 * Without this, every HG11 in the file becomes mercury. */
+	/*A hydrogen with a long name -- HG11, HD22, HE21 -- fills all four columns
+	and starts in column 13, exactly where a two-letter element starts.  Column
+	position alone cannot separate the two, so take the full field as the
+	tie-breaker: no two-letter element has a four character atom name, while
+	nearly every hydrogen past the first does.  Without this, every HG11 in the
+	file becomes mercury.*/
 	if (rawlen >= 4 && raw[0] != ' ' && raw[1] != ' ' && raw[2] != ' ' && raw[3] != ' '
 	    && (raw[0] == 'H' || raw[0] == 'D' || raw[0] == 'h' || raw[0] == 'd')) {
 		buf[0] = (char)toupper((unsigned char)raw[0]);
 		return 1;
 	}
-	/* a name that starts in column 13 with two letters is a two-letter
-	 * element (FE, ZN, CL, MG); a digit there is a hydrogen count (1HB) */
+	/*a name that starts in column 13 with two letters is a two-letter element
+	(FE, ZN, CL, MG); a digit there is a hydrogen count (1HB)*/
 	if (raw[0] != ' ' && isalpha((unsigned char)raw[0])
 	    && rawlen >= 2 && isalpha((unsigned char)raw[1])) {
 		buf[0] = (char)toupper((unsigned char)raw[0]);
 		buf[1] = (char)toupper((unsigned char)raw[1]);
 		return 2;
 	}
-	{	/* otherwise the first letter in the field is the element */
+	{	//otherwise the first letter in the field is the element
 		STRLEN i;
 		for (i = 0; i < rawlen; i++) {
 			if (isalpha((unsigned char)raw[i])) {
@@ -371,9 +468,8 @@ static STRLEN guess_element(const char *raw, STRLEN rawlen, char *buf)
 	return 0;
 }
 
-/* --- options -------------------------------------------------------------- */
-
-static SV *opt_get(pTHX_ HV *o, const char *k)
+//options
+static SV *opt_get(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k)
 {
 	SV **p;
 	if (!o) return NULL;
@@ -381,21 +477,20 @@ static SV *opt_get(pTHX_ HV *o, const char *k)
 	return (p && *p && SvOK(*p)) ? *p : NULL;
 }
 
-static IV opt_iv(pTHX_ HV *o, const char *k, IV dflt)
+static IV opt_iv(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, IV dflt)
 {
 	SV *v = opt_get(aTHX_ o, k);
 	return v ? SvIV(v) : dflt;
 }
 
-static int opt_bool(pTHX_ HV *o, const char *k, int dflt)
+static int opt_bool(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, int dflt)
 {
 	SV *v = opt_get(aTHX_ o, k);
 	return v ? (SvTRUE(v) ? 1 : 0) : dflt;
 }
 
-/* --- the parse ------------------------------------------------------------ */
-
-#define NCOL 17 /* parallel per-atom columns */
+//the parse
+#define NCOL 17 //parallel per-atom columns
 static const char *const col_name[NCOL] = {
 	"serial", "name", "altloc", "resname", "chain", "resseq", "icode",
 	"x", "y", "z", "occupancy", "bfactor", "element", "charge",
@@ -406,17 +501,17 @@ enum {
 	C_X, C_Y, C_Z, C_OCC, C_B, C_ELEMENT, C_CHARGE, C_HET, C_MODEL, C_LINENO
 };
 
-/* The per-residue sums, kept as sums rather than as means so that Perl can add
- * two of them together: a residue whose atoms are written in two runs -- an
- * alternate conformer group split apart, a ligand interleaved with the polymer
- * -- arrives here as two entries and is one residue by the time Perl is done
- * with it.  Means computed here could not be recombined without the counts,
- * and with the counts they may as well be sums. */
+/*The per-residue sums, kept as sums rather than means so that Perl can add
+two of them together: a residue whose atoms are written in two runs -- an
+alternate conformer group split apart, a ligand interleaved with the polymer
+-- arrives here as two entries and is one residue by the time Perl is done
+with it.  Means computed here could not be recombined without the counts, and
+with the counts they may as well be sums.*/
 #define NRSUM 6
 static const char *const res_sum_name[NRSUM] = { "sx", "sy", "sz", "n_xyz", "sb", "n_b" };
 enum { R_SX, R_SY, R_SZ, R_NXYZ, R_SB, R_NB };
 
-static void flush_residue(pTHX_ AV **rs, NV sx, NV sy, NV sz, IV nc, NV sb, IV nb)
+static void flush_residue(pTHX_ AV **CSP_RESTRICT rs, NV sx, NV sy, NV sz, IV nc, NV sb, IV nb)
 {
 	av_push(rs[R_SX],   nc ? newSVnv(sx) : newSVsv(&PL_sv_undef));
 	av_push(rs[R_SY],   nc ? newSVnv(sy) : newSVsv(&PL_sv_undef));
@@ -426,7 +521,14 @@ static void flush_residue(pTHX_ AV **rs, NV sx, NV sy, NV sz, IV nc, NV sb, IV n
 	av_push(rs[R_NB],   newSViv(nb));
 }
 
-static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
+/*buf is the whole file, and restrict here is the one that earns the most: every
+pointer the loop reads a field through -- line, s, nm_raw -- is derived from it,
+so one qualifier on the parameter covers all of them, and the compiler no longer
+has to assume that av_push() and the newSV*() calls between two reads of a
+record might have rewritten the record.  It holds because the buffer belongs to
+the caller for the duration: slurp()'s Newx() block in _parse_file, and an SV we
+never touch again in _parse_string.  Nothing in here writes through it.*/
+static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RESTRICT opts)
 {
 	HV *out  = newHV();
 	HV *meta = newHV();
@@ -437,27 +539,27 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 	AV *res_first = newAV(), *res_last = newAV();
 	AV *ter = newAV(), *model_nums = newAV();
 	HV *want_chain = NULL;
-	/* whole-structure statistics over the atoms that were kept */
+	//whole-structure statistics over the atoms that were kept
 	IV n_hydrogen = 0, n_water_atom = 0, bn = 0;
 	NV bmin = 0, bmax = 0, bsum = 0;
 	NV xmin = 0, ymin = 0, zmin = 0, xmax = 0, ymax = 0, zmax = 0;
 	int have_bbox = 0;
-	/* the residue being accumulated */
+	//the residue being accumulated
 	NV rsx = 0, rsy = 0, rsz = 0, rsb = 0;
 	IV rnc = 0, rnb = 0;
 	IV want_model, n_models = 0, n_anisou = 0, n_skipped = 0, n_atom = 0;
 	IV n_atom_rec = 0, n_het_rec = 0, cur_model = 1, lineno = 0;
 	int keep_h, keep_water, keep_het, keep_meta, keep_anisou, keep_lineno, build_atoms;
 	int i, have_res = 0;
-	/* previous kept atom's residue identity, for boundary detection */
+	//previous kept atom's residue identity, for boundary detection
 	char p_chain[8], p_icode[4], p_resname[8];
 	IV p_resseq = 0, p_model = 0;
 	int p_het = 0;
 	STRLEN pos = 0;
 
-	/* a negative model number means every model.  Zero cannot be the sentinel:
-	 * an ensemble whose models are numbered from 0 is unusual but legal, and
-	 * "model 0" would then quietly mean "all of them". */
+	/*a negative model number means every model.  Zero cannot be the sentinel:
+	an ensemble whose models are numbered from 0 is unusual but legal, and
+	"model 0" would then quietly mean "all of them".*/
 	want_model  = opt_iv(aTHX_ opts, "model", 1);
 	keep_h      = opt_bool(aTHX_ opts, "hydrogens", 1);
 	keep_water  = opt_bool(aTHX_ opts, "waters", 1);
@@ -482,7 +584,7 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 		pos += llen + (nl ? 1 : 0);
 		lineno++;
 		while (llen && (line[llen - 1] == '\r' || line[llen - 1] == ' ' || line[llen - 1] == '\t'))
-			llen--; /* DOS line ends, and the trailing blanks of a padded record */
+			llen--; //DOS line ends, and the trailing blanks of a padded record
 		if (llen == 0) continue;
 
 		if (llen >= 6 && (memcmp(line, "ATOM  ", 6) == 0 || memcmp(line, "HETATM", 6) == 0)) {
@@ -502,7 +604,7 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 			if (want_model >= 0 && cur_model != want_model) { n_skipped++; continue; }
 			if (het && !keep_het) { n_skipped++; continue; }
 
-			/* residue name, columns 18-20 */
+			//residue name, columns 18-20
 			n = fld(line, llen, 17, 19, &s);
 			resname_len = n > sizeof(resname) - 1 ? sizeof(resname) - 1 : n;
 			memcpy(resname, s, resname_len);
@@ -510,8 +612,8 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 			known = res_lookup(resname, resname_len, &ri);
 			if (!keep_water && known && ri.type == RT_WATER) { n_skipped++; continue; }
 
-			/* chain, column 22 -- with column 21 as a fallback, because a
-			 * two-character chain id (some large assemblies) spills left */
+			/*chain, column 22 -- with column 21 as a fallback, because a
+			two-character chain id (some large assemblies) spills left*/
 			chain[0] = '\0';
 			if (llen > 21 && line[21] != ' ') { chain[0] = line[21]; chain[1] = '\0'; }
 			else if (llen > 20 && line[20] != ' ') { chain[0] = line[20]; chain[1] = '\0'; }
@@ -519,7 +621,7 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 				if (!hv_exists(want_chain, chain, (I32)strlen(chain))) { n_skipped++; continue; }
 			}
 
-			/* atom name, columns 13-16, kept untrimmed for the element rule */
+			//atom name, columns 13-16, kept untrimmed for the element rule
 			nm_rawlen = 0;
 			nm_raw = line;
 			if (llen > 12) {
@@ -528,7 +630,7 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 				nm_rawlen = to - 12 + 1;
 			}
 
-			/* element, columns 77-78, guessed from the name when absent */
+			//element, columns 77-78, guessed from the name when absent
 			ellen = fld(line, llen, 76, 77, &s);
 			if (ellen) {
 				STRLEN k;
@@ -539,11 +641,10 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 			}
 			if (!keep_h && ellen == 1 && (elbuf[0] == 'H' || elbuf[0] == 'D')) { n_skipped++; continue; }
 
-			/* --- kept ---------------------------------------------------
-			 * The residue boundary is settled first, before this atom has
-			 * been added to anything, so that closing the previous residue
-			 * is a matter of flushing what is already there.  Everything
-			 * the test needs is read from the record's own columns. */
+			/*kept.  The residue boundary is settled first, before this atom has
+			been added to anything, so that closing the previous residue is a
+			matter of flushing what is already there.  Everything the test needs
+			is read from the record's own columns.*/
 			{
 				IV rs = 0;
 				int changed;
@@ -574,7 +675,7 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 				}
 			}
 
-			/* --- the atom's own fields ---------------------------------- */
+			//the atom's own fields
 			{
 				const char *nm_s, *alt_s, *chg_s;
 				STRLEN nm_n, alt_n, chg_n;
@@ -592,11 +693,11 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 				alt_n = fld(line, llen, 16, 16, &alt_s);
 				chg_n = fld(line, llen, 78, 79, &chg_s);
 
-				/* The sums and extremes are gathered here rather than in Perl
-				 * because they have to touch every atom whether or not the
-				 * caller wanted per-atom hashes.  Doing them in the loop that
-				 * is already reading the numbers costs nothing; doing them
-				 * again in Perl costs more than the whole parse. */
+				/*The sums and extremes are gathered here rather than in Perl
+				because they have to touch every atom whether or not the caller
+				wanted per-atom hashes.  Doing them in the loop that is already
+				reading the numbers costs nothing; doing them again in Perl
+				costs more than the whole parse.*/
 				if (have_xyz) {
 					rsx += xv; rsy += yv; rsz += zv; rnc++;
 					if (!have_bbox) {
@@ -622,13 +723,12 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 				}
 				if (known && ri.type == RT_WATER) n_water_atom++;
 
-				/* Two shapes to hand back, and never both, because building
-				 * every atom twice -- once as columns here, once as a hash in
-				 * Perl afterwards -- was costing more than everything else in
-				 * the read put together.  The hash is what Structure::Info
-				 * wants, and it is built here where the fields already are;
-				 * the columns are what the low-level parse hands to anyone
-				 * calling it directly. */
+				/*Two shapes to hand back, and never both, because building every
+				atom twice -- once as columns here, once as a hash in Perl
+				afterwards -- was costing more than everything else in the read
+				put together.  The hash is what Chem::Structure::Parser wants, built here
+				where the fields already are; the columns are what the low-level
+				parse hands to anyone calling it directly.*/
 				if (build_atoms) {
 					HV *a = newHV();
 					(void)hv_stores(a, "name",   newSVpvn(nm_s, nm_n));
@@ -657,9 +757,9 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 				}
 			}
 
-			/* The residue's identity.  Perl reads these at the index a residue
-			 * starts on, once per residue rather than once per atom, but they
-			 * are emitted per atom because that is where they are read from. */
+			/*The residue's identity.  Perl reads these at the index a residue
+			starts on, once per residue rather than once per atom, but they are
+			emitted per atom because that is where they are read from.*/
 			av_push(col[C_RESNAME], newSVpvn(resname, resname_len));
 			av_push(col[C_CHAIN], newSVpvn(chain, strlen(chain)));
 			if (fld_iv(line, llen, 22, 25, &iv)) av_push(col[C_RESSEQ], newSViv(iv));
@@ -676,7 +776,7 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 		if (llen >= 6 && memcmp(line, "ANISOU", 6) == 0) {
 			n_anisou++;
 			if (!keep_anisou) continue;
-			/* fall through to meta */
+			//fall through to meta
 		}
 
 		if (llen >= 5 && memcmp(line, "MODEL", 5) == 0) {
@@ -702,8 +802,8 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 			continue;
 		}
 
-		/* everything else is a header/annotation record: keep the line whole
-		 * and let Perl take it apart by column */
+		/*everything else is a header/annotation record: keep the line whole and
+		let Perl take it apart by column*/
 		if (keep_meta) {
 			const char *s;
 			STRLEN n = fld(line, llen, 0, 5, &s);
@@ -781,14 +881,14 @@ static HV *parse_buf(pTHX_ const char *buf, STRLEN len, HV *opts)
 	return out;
 }
 
-/* slurp() -- read the whole file.  Chunked rather than stat-then-read so that
- * a named pipe or /dev/stdin works the same as a file on disk. */
-static char *slurp(pTHX_ const char *path, STRLEN *lenp)
+/*slurp() -- read the whole file.  Chunked rather than stat-then-read so that
+a named pipe or /dev/stdin works the same as a file on disk.*/
+static char *slurp(pTHX_ const char *CSP_RESTRICT path, STRLEN *CSP_RESTRICT lenp)
 {
 	FILE *fh = fopen(path, "rb");
 	char *buf;
 	STRLEN cap = 1 << 20, len = 0;
-	if (!fh) croak("Structure::Info: cannot read '%s': %s", path, Strerror(errno));
+	if (!fh) croak("Chem::Structure::Parser: cannot read '%s': %s", path, Strerror(errno));
 	Newx(buf, cap, char);
 	for (;;) {
 		size_t got;
@@ -804,14 +904,14 @@ static char *slurp(pTHX_ const char *path, STRLEN *lenp)
 		int e = errno;
 		Safefree(buf);
 		fclose(fh);
-		croak("Structure::Info: error reading '%s': %s", path, Strerror(e));
+		croak("Chem::Structure::Parser: error reading '%s': %s", path, Strerror(e));
 	}
 	fclose(fh);
 	*lenp = len;
 	return buf;
 }
 
-MODULE = Structure::Info		PACKAGE = Structure::Info
+MODULE = Chem::Structure::Parser		PACKAGE = Chem::Structure::Parser
 
 PROTOTYPES: DISABLE
 
@@ -825,10 +925,10 @@ _parse_file(path, opts = &PL_sv_undef)
 		HV *o = NULL, *res;
 		const char *p;
 	CODE:
-		if (!SvOK(path)) croak("Structure::Info: file name is undefined");
+		if (!SvOK(path)) croak("Chem::Structure::Parser: file name is undefined");
 		if (SvOK(opts)) {
 			if (!SvROK(opts) || SvTYPE(SvRV(opts)) != SVt_PVHV)
-				croak("Structure::Info: options must be a hash reference");
+				croak("Chem::Structure::Parser: options must be a hash reference");
 			o = (HV *)SvRV(opts);
 		}
 		p = SvPV_nolen(path);
@@ -849,10 +949,10 @@ _parse_string(text, opts = &PL_sv_undef)
 		const char *buf;
 		HV *o = NULL, *res;
 	CODE:
-		if (!SvOK(text)) croak("Structure::Info: PDB text is undefined");
+		if (!SvOK(text)) croak("Chem::Structure::Parser: PDB text is undefined");
 		if (SvOK(opts)) {
 			if (!SvROK(opts) || SvTYPE(SvRV(opts)) != SVt_PVHV)
-				croak("Structure::Info: options must be a hash reference");
+				croak("Chem::Structure::Parser: options must be a hash reference");
 			o = (HV *)SvRV(opts);
 		}
 		buf = SvPV_const(text, len);
@@ -860,6 +960,25 @@ _parse_string(text, opts = &PL_sv_undef)
 		RETVAL = newRV_noinc((SV *)res);
 	OUTPUT:
 		RETVAL
+
+void
+_str2nv_paths(text)
+	SV *text
+	PREINIT:
+		STRLEN n;
+		const char *s;
+		NV a = 0, b = 0;
+		int ok_a, ok_b;
+	PPCODE:
+		if (!SvOK(text)) croak("_str2nv_paths: string is undefined");
+		s = SvPV_const(text, n);
+		ok_a = str2nv_fixed(s, n, &a);
+		ok_b = str2nv_slow(s, n, &b);
+		EXTEND(SP, 4);
+		PUSHs(sv_2mortal(newSViv(ok_a)));
+		PUSHs(ok_a ? sv_2mortal(newSVnv(a)) : &PL_sv_undef);
+		PUSHs(sv_2mortal(newSViv(ok_b)));
+		PUSHs(ok_b ? sv_2mortal(newSVnv(b)) : &PL_sv_undef);
 
 SV *
 aa3to1(name)
@@ -874,6 +993,21 @@ aa3to1(name)
 		RETVAL = (res_lookup(s, n, &ri) && ri.type == RT_AA)
 		       ? newSVpvn(&ri.one, 1)
 		       : newSVpvn("", 0);
+	OUTPUT:
+		RETVAL
+
+SV *
+aa1to3(one)
+	SV *one
+	PREINIT:
+		STRLEN n;
+		const char *s;
+		const char *name;
+	CODE:
+		if (!SvOK(one)) croak("aa1to3: single-letter code is undefined");
+		s = SvPV_const(one, n);
+		name = aa1to3_lookup(s, n);
+		RETVAL = name ? newSVpvn(name, 3) : newSVpvn("", 0);
 	OUTPUT:
 		RETVAL
 

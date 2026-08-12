@@ -2,25 +2,24 @@
 # ABSTRACT: Read a molecular structure file into a hash of hashes, sequences and all, using XS for the coordinate section
 require 5.010;
 use strict;
-package Structure::Info;
+package Chem::Structure::Parser;
 our $VERSION = '0.01';
 require XSLoader;
 use autodie ':default';
 use warnings FATAL => 'all';
-use Carp 'croak';
 use Exporter 'import';
 use Scalar::Util 'reftype';
-XSLoader::load('Structure::Info', $VERSION);
+XSLoader::load('Chem::Structure::Parser', $VERSION);
 
 our @EXPORT_OK = qw(
 	structure_info structure_info_string pdb_info
 	structure_atoms structure_residues structure_ligands structure_sequences
 	chain_sequence structure_summary
-	aa3to1 res1 res_type formats h
+	aa3to1 aa1to3 res1 res_type formats h
 );
 our @EXPORT = @EXPORT_OK;
 
-# ===========================================================================
+#
 # Formats
 #
 # The module is named for structures, not for PDB, because the file format is
@@ -33,7 +32,7 @@ our @EXPORT = @EXPORT_OK;
 # Adding a format means writing a reader that returns that shape and adding
 # it here.  Nothing else in the module, and nothing in calling code, needs to
 # know that a second format exists.
-# ===========================================================================
+#
 my %READER = (
 	pdb => \&_read_pdb,
 );
@@ -46,13 +45,13 @@ my %NOT_YET = (
 	sdf   => 'MDL SDF/MOL (.sdf, .mol)',
 );
 
-# ===========================================================================
+# 
 # Options
 #
 # Anything not listed here is a typo, and a typo that is quietly ignored is a
 # silent wrong answer later on -- pass 'hydrogen' for 'hydrogens' and you get
 # a structure with the hydrogens still in it and no hint of why.
-# ===========================================================================
+# 
 my %DEFAULT = (
 	model     => 1,       # which MODEL to build chains from; 'all' for every one
 	altloc    => 'first', # 'first' or 'highest' occupancy, when an atom has alternates
@@ -93,20 +92,20 @@ my %ION = map { $_ => 1 } qw(
 # itself that is one, and a field of NULL gives up nothing.
 my $NUM = qr/[0-9]*\.?[0-9]+/;
 
-# ===========================================================================
+# 
 # Public entry points
-# ===========================================================================
+# 
 
 # structure_info($file, %opt) -- read a structure file into a hash of hashes.
 sub structure_info {
 	my ($file, %opt) = @_;
-	croak 'structure_info: no file name given' unless defined $file && length $file;
-	croak "structure_info: '$file' does not exist"  unless -e $file;
-	croak "structure_info: '$file' is a directory"  if -d $file;
+	die 'structure_info: no file name given' unless defined $file && length $file;
+	die "structure_info: '$file' does not exist"  unless -e $file;
+	die "structure_info: '$file' is a directory"  if -d $file;
 	my $o   = _options(\%opt, 'structure_info');
 	my $fmt = defined $o->{format} ? lc $o->{format} : _detect_format($file);
 	my $reader = $READER{$fmt}
-		or croak "structure_info: cannot read '$file': "
+		or die "structure_info: cannot read '$file': "
 		       . (exists $NOT_YET{$fmt}
 		          ? "$NOT_YET{$fmt} is not implemented yet; formats read today: " . join(', ', sort keys %READER)
 		          : "unrecognized format '$fmt'; formats read today: " . join(', ', sort keys %READER));
@@ -122,14 +121,14 @@ sub pdb_info {
 # structure_info_string($text, %opt) -- the same, from a string already in hand.
 sub structure_info_string {
 	my ($text, %opt) = @_;
-	croak 'structure_info_string: text is undefined' unless defined $text;
+	die 'structure_info_string: text is undefined' unless defined $text;
 	my $o = _options(\%opt, 'structure_info_string');
 	my $fmt = defined $o->{format} ? lc $o->{format} : _sniff_format($text);
 	# a string has no name to go on, and the caller has already said this is a
 	# structure, so text that looks like nothing in particular is read as PDB.
 	# Text that looks like something else still gets a straight answer.
 	$fmt = 'pdb' if $fmt eq 'unknown';
-	croak "structure_info_string: cannot read this text: "
+	die "structure_info_string: cannot read this text: "
 	    . (exists $NOT_YET{$fmt}
 	       ? "$NOT_YET{$fmt} is not implemented yet"
 	       : "no reader for format '$fmt'")
@@ -146,14 +145,14 @@ sub formats {
 		: { (map { $_ => 'supported' } keys %READER), (map { $_ => "not implemented: $NOT_YET{$_}" } keys %NOT_YET) };
 }
 
-# ===========================================================================
+# 
 # Views over a parsed structure
 #
 # These build what they return.  Nothing in the structure points back up at
 # its parent -- a residue does not hold its chain, an atom does not hold its
 # residue -- because a hash of hashes with parent links is a cycle, and a
 # cycle is a leak that no one notices until the tenth thousand file.
-# ===========================================================================
+# 
 
 # structure_atoms($info, $chain?) -- every atom as a flat array of hashes,
 # each one carrying the chain/residue it came from, in file order.
@@ -162,7 +161,7 @@ sub structure_atoms {
 	_check_info($info, 'structure_atoms');
 	my @out;
 	for my $cid (defined $chain ? ($chain) : @{ $info->{chain_order} }) {
-		my $c = $info->{chains}{$cid} or croak "structure_atoms: no chain '$cid'";
+		my $c = $info->{chains}{$cid} or die "structure_atoms: no chain '$cid'";
 		for my $rk (@{ $c->{residue_order} }) {
 			my $r = $c->{residues}{$rk};
 			for my $an (@{ $r->{atom_order} }) {
@@ -186,7 +185,7 @@ sub structure_residues {
 	_check_info($info, 'structure_residues');
 	my @out;
 	for my $cid (defined $chain ? ($chain) : @{ $info->{chain_order} }) {
-		my $c = $info->{chains}{$cid} or croak "structure_residues: no chain '$cid'";
+		my $c = $info->{chains}{$cid} or die "structure_residues: no chain '$cid'";
 		push @out, map { $c->{residues}{$_} } @{ $c->{residue_order} };
 	}
 	return \@out;
@@ -219,11 +218,11 @@ sub structure_ligands {
 sub structure_sequences {
 	my ($info, %opt) = @_;
 	if (ref $info) {
-		croak 'structure_sequences: options apply to reading a file, not to a structure already parsed: '
+		die 'structure_sequences: options apply to reading a file, not to a structure already parsed: '
 		    . join(', ', sort keys %opt) if %opt;
 	}
 	else {
-		croak 'structure_sequences: expected a file name or the hash reference from structure_info()'
+		die 'structure_sequences: expected a file name or the hash reference from structure_info()'
 			unless defined $info && length $info;
 		$info = structure_info($info, %opt);
 	}
@@ -238,10 +237,10 @@ sub structure_sequences {
 sub chain_sequence {
 	my ($info, $chain, $which) = @_;
 	_check_info($info, 'chain_sequence');
-	croak 'chain_sequence: no chain given' unless defined $chain;
-	my $c = $info->{chains}{$chain} or croak "chain_sequence: no chain '$chain'";
+	die 'chain_sequence: no chain given' unless defined $chain;
+	my $c = $info->{chains}{$chain} or die "chain_sequence: no chain '$chain'";
 	$which = 'observed' unless defined $which;
-	croak "chain_sequence: which must be 'observed' or 'seqres', not '$which'"
+	die "chain_sequence: which must be 'observed' or 'seqres', not '$which'"
 		unless $which eq 'observed' || $which eq 'seqres';
 	return $which eq 'seqres' ? $c->{seqres} : $c->{sequence};
 }
@@ -276,26 +275,26 @@ sub structure_summary {
 	return join("\n", @l) . "\n";
 }
 
-# ===========================================================================
+# 
 # Options and format detection
-# ===========================================================================
+# 
 
 sub _options {
 	my ($opt, $who) = @_;
 	for my $k (sort keys %$opt) {
-		croak "$who: unknown option '$k'; known options are: " . join(', ', sort keys %DEFAULT)
+		die "$who: unknown option '$k'; known options are: " . join(', ', sort keys %DEFAULT)
 			unless exists $DEFAULT{$k};
 	}
 	my %o = (%DEFAULT, %$opt);
-	croak "$who: altloc must be 'first' or 'highest', not '$o{altloc}'"
+	die "$who: altloc must be 'first' or 'highest', not '$o{altloc}'"
 		unless $o{altloc} eq 'first' || $o{altloc} eq 'highest';
 	if (defined $o{chains}) {
-		croak "$who: chains must be an array reference"
+		die "$who: chains must be an array reference"
 			unless (reftype($o{chains}) || '') eq 'ARRAY';
-		croak "$who: chains is empty" unless @{ $o{chains} };
+		die "$who: chains is empty" unless @{ $o{chains} };
 	}
 	if (defined $o{model} && $o{model} ne 'all') {
-		croak "$who: model must be a positive integer or 'all', not '$o{model}'"
+		die "$who: model must be a positive integer or 'all', not '$o{model}'"
 			unless $o{model} =~ /\A[0-9]+\z/;
 	}
 	return \%o;
@@ -353,9 +352,9 @@ sub _slurp_maybe_gzipped {
 	my ($file, $limit) = @_;
 	if ($file =~ /\.gz\z/i) {
 		eval { require IO::Uncompress::Gunzip; 1 }
-			or croak "Structure::Info: '$file' is gzipped but IO::Uncompress::Gunzip is not installed: $@";
+			or die "Chem::Structure::Parser: '$file' is gzipped but IO::Uncompress::Gunzip is not installed: $@";
 		my $z = IO::Uncompress::Gunzip->new($file)
-			or croak "Structure::Info: cannot gunzip '$file': "
+			or die "Chem::Structure::Parser: cannot gunzip '$file': "
 			       . do { no warnings 'once'; $IO::Uncompress::Gunzip::GunzipError };
 		my ($text, $buf) = ('', '');
 		while ($z->read($buf, 65536) > 0) {
@@ -378,9 +377,9 @@ sub _slurp_maybe_gzipped {
 	return $text;
 }
 
-# ===========================================================================
+# 
 # The PDB reader
-# ===========================================================================
+# 
 
 sub _read_pdb {
 	my ($file, $o) = @_;
@@ -463,7 +462,7 @@ sub _build_pdb {
 	return $info;
 }
 
-# --- coordinates -----------------------------------------------------------
+# --- coordinates
 #
 # The XS parse hands back one array per field plus the index of the first and
 # last atom of every residue, so this walks residues, not atoms, and only
@@ -764,13 +763,13 @@ sub _id_from {
 	return uc $base;
 }
 
-# ===========================================================================
+# 
 # Header records
 #
 # Every one of these is a fixed-column record too, but there are only a few
 # dozen lines of them in a file, they are irregular, and they are where a new
 # quirk turns up every few hundred structures.  That is Perl's job, not C's.
-# ===========================================================================
+# 
 sub _parse_meta {
 	my ($info, $meta) = @_;
 
@@ -1113,18 +1112,18 @@ sub _rejoin {
 
 sub _check_info {
 	my ($info, $who) = @_;
-	croak "$who: expected the hash reference from structure_info()"
+	die "$who: expected the hash reference from structure_info()"
 		unless defined $info && (reftype($info) || '') eq 'HASH' && exists $info->{chains};
 	return 1;
 }
 
-# ===========================================================================
+# 
 # Help
 #
 # h() prints a function's own documentation, in the spirit of R's ?function.
 # The text is this file's POD, read at run time, so the help and the shipped
 # documentation cannot drift apart.
-# ===========================================================================
+# 
 sub h {
 	my ($what) = @_;
 	my $name = _help_name($what);
@@ -1133,7 +1132,7 @@ sub h {
 		print STDOUT $sec->{$name};
 		return $name;
 	}
-	print STDOUT "Structure::Info $VERSION\n\nDocumented functions:\n";
+	print STDOUT "Chem::Structure::Parser $VERSION\n\nDocumented functions:\n";
 	print STDOUT "    $_\n" for sort keys %$sec;
 	print STDOUT "\nCall h('structure_info') for one of them.\n";
 	return undef;
@@ -1148,7 +1147,7 @@ sub _help_name {
 		my $gv = B::svref_2object($what)->GV;
 		return $gv->NAME;
 	}
-	my $n = "$what";      # a glob stringifies as *Structure::Info::res1
+	my $n = "$what";      # a glob stringifies as *Chem::Structure::Parser::res1
 	$n =~ s/\A\*//;
 	$n =~ s/\A.*:://;
 	return $n;
@@ -1180,11 +1179,11 @@ __END__
 
 =head1 NAME
 
-Structure::Info - read a molecular structure file into a hash of hashes
+Chem::Structure::Parser - read a molecular structure file into a hash of hashes
 
 =head1 SYNOPSIS
 
-    use Structure::Info;
+    use Chem::Structure::Parser;
 
     my $info = structure_info('1a22.ent.pdb');
 
@@ -1397,6 +1396,28 @@ The single-letter code of an amino acid, and the empty string for anything
 that is not one.  Modified residues map to the residue they were made from,
 because a sequence with an X every seventh position is no use to anyone.
 Leading and trailing blanks, and case, do not matter.
+
+=head2 aa1to3
+
+    aa1to3('A');      # 'ALA'
+    aa1to3('X');      # 'UNK'
+    aa1to3('B');      # 'ASX'   ASP or ASN, as the format spells it
+    aa1to3('*');      # ''      not a single-letter code
+
+L</aa3to1> backwards: the three-letter name a single-letter code stands for,
+and the empty string for anything that is not one of the twenty-six.  Blanks
+and case do not matter, since the letter usually comes out of a sequence
+string rather than out of a file.
+
+Every letter of the alphabet has a name, because the ambiguity codes have one
+of their own -- C<B> is ASX, C<Z> is GLX, C<J> is XLE, C<X> is UNK.  Going
+this way there is only ever one answer: L</aa3to1> maps sixty-odd names onto
+C<C>, and only CYS comes back.
+
+Amino acids only, as the name says.  C<aa1to3('A')> is ALA and not adenine,
+and C<aa1to3('T')> is THR and not thymine -- a caller who wants C<' DA'>
+already knows the chain is DNA, and a function that guessed from a bare
+letter would be wrong half the time.
 
 =head2 res1
 

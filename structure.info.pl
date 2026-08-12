@@ -10,7 +10,7 @@ require 5.010;
 use strict;
 use warnings FATAL => 'all';
 use Getopt::Long;
-use Structure::Info;
+use Chem::Structure::Parser;
 
 my %opt = (fasta => 0, tsv => 0, ligands => 0, dump => 0, seqres => 0, chain => undef);
 GetOptions(\%opt, 'fasta', 'tsv', 'ligands', 'dump', 'seqres', 'chain=s', 'help')

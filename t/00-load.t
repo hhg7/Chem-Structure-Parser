@@ -4,20 +4,20 @@ use strict;
 use warnings FATAL => 'all';
 use Test::More;
 
-BEGIN { use_ok('Structure::Info') or BAIL_OUT('Structure::Info will not load') }
+BEGIN { use_ok('Chem::Structure::Parser') or BAIL_OUT('Chem::Structure::Parser will not load') }
 
-ok(defined $Structure::Info::VERSION, "VERSION is set ($Structure::Info::VERSION)");
+ok(defined $Chem::Structure::Parser::VERSION, "VERSION is set ($Chem::Structure::Parser::VERSION)");
 
 # the XS half has to be there: without it every other test is testing nothing
-ok(defined &Structure::Info::_parse_file,   'XS _parse_file is bootstrapped');
-ok(defined &Structure::Info::_parse_string, 'XS _parse_string is bootstrapped');
+ok(defined &Chem::Structure::Parser::_parse_file,   'XS _parse_file is bootstrapped');
+ok(defined &Chem::Structure::Parser::_parse_string, 'XS _parse_string is bootstrapped');
 
 for my $f (qw(
 	structure_info structure_info_string pdb_info
 	structure_atoms structure_residues structure_ligands structure_sequences
-	chain_sequence structure_summary aa3to1 res1 res_type formats h
+	chain_sequence structure_summary aa3to1 aa1to3 res1 res_type formats h
 )) {
-	can_ok('Structure::Info', $f);
+	can_ok('Chem::Structure::Parser', $f);
 	ok(defined &{"main::$f"}, "$f is exported into the caller");
 }
 

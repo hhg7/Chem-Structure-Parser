@@ -6,7 +6,7 @@ use warnings FATAL => 'all';
 use Cwd 'abs_path';
 use File::Basename 'dirname';
 use Scalar::Util 'refaddr';
-use Structure::Info;
+use Chem::Structure::Parser;
 use Test::Exception;
 use Test::More;
 
@@ -135,13 +135,13 @@ sub capture_h {
 	like($out, qr/altloc/, 'h: including its options');
 	unlike($out, qr/=head/, 'h: without the POD markup around it');
 }
-for my $arg ('res_type', \&Structure::Info::res_type, *Structure::Info::res_type) {
+for my $arg ('res_type', \&Chem::Structure::Parser::res_type, *Chem::Structure::Parser::res_type) {
 	my ($got, $out) = capture_h($arg);
 	like($out, qr/nucleotide/, 'h: takes a name, a reference or a glob');
 }
 {
 	# a fully qualified name, which is what a glob stringifies to
-	my ($got, $out) = capture_h('Structure::Info::aa3to1');
+	my ($got, $out) = capture_h('Chem::Structure::Parser::aa3to1');
 	is($got, 'aa3to1', 'h: a package-qualified name is accepted');
 }
 {

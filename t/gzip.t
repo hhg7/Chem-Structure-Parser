@@ -8,7 +8,7 @@ use warnings FATAL => 'all';
 use Cwd 'abs_path';
 use File::Basename 'dirname';
 use File::Temp 'tempdir';
-use Structure::Info;
+use Chem::Structure::Parser;
 use Test::Exception;
 use Test::More;
 

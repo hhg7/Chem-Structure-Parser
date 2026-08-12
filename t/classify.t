@@ -8,7 +8,7 @@
 require 5.010;
 use strict;
 use warnings FATAL => 'all';
-use Structure::Info;
+use Chem::Structure::Parser;
 use Test::More;
 
 # a residue's worth of ATOM/HETATM records, in the right columns

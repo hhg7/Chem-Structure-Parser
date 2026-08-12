@@ -8,9 +8,9 @@ use Config;
 my $std = ($Config{gccversion} || $Config{cc} =~ /\b(?:g?cc|clang)\b/) ? ' -std=gnu99' : '';
 
 WriteMakefile(
-	NAME             => 'Structure::Info',
-	VERSION_FROM     => 'lib/Structure/Info.pm',
-	ABSTRACT_FROM    => 'lib/Structure/Info.pm',
+	NAME             => 'Chem::Structure::Parser',
+	VERSION_FROM     => 'lib/Chem/Structure/Parser.pm',
+	ABSTRACT_FROM    => 'lib/Chem/Structure/Parser.pm',
 	AUTHOR           => 'David E. Condon <dec986@gmail.com>',
 	LICENSE          => 'perl',
 	MIN_PERL_VERSION => '5.010',
@@ -31,16 +31,16 @@ WriteMakefile(
 	CCFLAGS => $Config{ccflags} . $std,
 	OBJECT  => '$(O_FILES)',
 	test    => { TESTS => 't/*.t' },
-	clean   => { FILES => 'Structure-Info-*' },
+	clean   => { FILES => 'Chem-Structure-Parser-*' },
 	META_MERGE => {
 		'meta-spec' => { version => 2 },
 		resources   => {
 			repository => {
 				type => 'git',
-				url  => 'https://github.com/hhg7/Structure-info.git',
-				web  => 'https://github.com/hhg7/Structure-info',
+				url  => 'https://github.com/hhg7/Chem-Structure-Parser.git',
+				web  => 'https://github.com/hhg7/Chem-Structure-Parser',
 			},
-			bugtracker => { web => 'https://github.com/hhg7/Structure-info/issues' },
+			bugtracker => { web => 'https://github.com/hhg7/Chem-Structure-Parser/issues' },
 		},
 	},
 );
