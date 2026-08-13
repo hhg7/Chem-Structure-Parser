@@ -95,10 +95,10 @@ static unsigned res_key(const char *CSP_RESTRICT s, STRLEN len)
 	return K3((unsigned char)b[0], (unsigned char)b[1], (unsigned char)b[2]);
 }
 
-/*res_lookup() -- classify a residue name.  1 when the name is known, 0 when
-it is not (a ligand, an ion, a sugar: anything the caller has to work out for
-itself from the atoms).*/
-static int res_lookup(const char *CSP_RESTRICT s, STRLEN len, res_info *CSP_RESTRICT out)
+/*res_lookup() -- classify a residue name.  True when the name is known, false
+when it is not (a ligand, an ion, a sugar: anything the caller has to work out
+for itself from the atoms).*/
+static bool res_lookup(const char *CSP_RESTRICT s, STRLEN len, res_info *CSP_RESTRICT out)
 {
 	char one;
 	unsigned char type = RT_AA;
@@ -286,9 +286,9 @@ static STRLEN fld(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLE
 /*str2iv() -- integers, exactly, without going through a double.  '*****'
 (what a serial number becomes once it overflows five columns) and anything
 else non-numeric report failure rather than a wrong number.*/
-static int str2iv(const char *CSP_RESTRICT s, STRLEN n, IV *CSP_RESTRICT out)
+static bool str2iv(const char *CSP_RESTRICT s, STRLEN n, IV *CSP_RESTRICT out)
 {
-	int neg = 0, seen = 0;
+	bool neg = 0, seen = 0;
 	IV v = 0;
 	STRLEN i = 0;
 	if (i < n && (s[i] == '+' || s[i] == '-')) { neg = (s[i] == '-'); i++; }
@@ -323,7 +323,7 @@ a hex float, inf/nan, a field with rubbish after the number.  strtod() on a
 stack copy, because the fields are adjacent in the record (x ends where y
 begins, with no separator when a coordinate is wide) and so strtod() cannot be
 pointed at the record buffer itself.*/
-static int str2nv_slow(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
+static bool str2nv_slow(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
 {
 	char buf[64], *end;
 	NV v;
@@ -369,11 +369,11 @@ static const NV str2nv_pow10[STR2NV_MAX_DIGITS + 1] = {
 	1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15
 };
 
-static int str2nv_fixed(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
+static bool str2nv_fixed(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
 {
 	NV m = 0;
 	STRLEN i = 0, nd = 0, frac = 0;
-	int neg = 0, dot = 0;
+	bool neg = 0, dot = 0;
 
 	if (n == 0) return 0;
 	if (s[0] == '+' || s[0] == '-') { neg = (s[0] == '-'); i = 1; }
@@ -396,7 +396,7 @@ static int str2nv_fixed(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT o
 }
 
 //str2nv() -- coordinates and the like
-static int str2nv(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
+static bool str2nv(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
 {
 	return str2nv_fixed(s, n, out) || str2nv_slow(s, n, out);
 }
@@ -409,7 +409,7 @@ question because on an older -Duselongdouble perl Perl_my_atof is a hand-rolled
 decimal accumulator rather than strtod().  The XSUB is at the foot of the file
 with the rest of them.*/
 
-static int fld_iv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLEN to,
+static bool fld_iv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLEN to,
                   IV *CSP_RESTRICT out)
 {
 	const char *s;
@@ -483,7 +483,7 @@ static IV opt_iv(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, IV dflt)
 	return v ? SvIV(v) : dflt;
 }
 
-static int opt_bool(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, int dflt)
+static bool opt_bool(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, bool dflt)
 {
 	SV *v = opt_get(aTHX_ o, k);
 	return v ? (SvTRUE(v) ? 1 : 0) : dflt;
@@ -511,14 +511,14 @@ with the counts they may as well be sums.*/
 static const char *const res_sum_name[NRSUM] = { "sx", "sy", "sz", "n_xyz", "sb", "n_b" };
 enum { R_SX, R_SY, R_SZ, R_NXYZ, R_SB, R_NB };
 
-static void flush_residue(pTHX_ AV **CSP_RESTRICT rs, NV sx, NV sy, NV sz, IV nc, NV sb, IV nb)
+static void flush_residue(pTHX_ AV **CSP_RESTRICT rs, NV sx, NV sy, NV sz, UV nc, NV sb, UV nb)
 {
 	av_push(rs[R_SX],   nc ? newSVnv(sx) : newSVsv(&PL_sv_undef));
 	av_push(rs[R_SY],   nc ? newSVnv(sy) : newSVsv(&PL_sv_undef));
 	av_push(rs[R_SZ],   nc ? newSVnv(sz) : newSVsv(&PL_sv_undef));
-	av_push(rs[R_NXYZ], newSViv(nc));
+	av_push(rs[R_NXYZ], newSVuv(nc));
 	av_push(rs[R_SB],   nb ? newSVnv(sb) : newSVsv(&PL_sv_undef));
-	av_push(rs[R_NB],   newSViv(nb));
+	av_push(rs[R_NB],   newSVuv(nb));
 }
 
 /*buf is the whole file, and restrict here is the one that earns the most: every
@@ -540,20 +540,26 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	AV *ter = newAV(), *model_nums = newAV();
 	HV *want_chain = NULL;
 	//whole-structure statistics over the atoms that were kept
-	IV n_hydrogen = 0, n_water_atom = 0, bn = 0;
+	UV n_hydrogen = 0, n_water_atom = 0, bn = 0;
 	NV bmin = 0, bmax = 0, bsum = 0;
 	NV xmin = 0, ymin = 0, zmin = 0, xmax = 0, ymax = 0, zmax = 0;
 	bool have_bbox = 0, have_res = 0;
 	//the residue being accumulated
 	NV rsx = 0, rsy = 0, rsz = 0, rsb = 0;
-	IV rnc = 0, rnb = 0;
-	IV want_model, n_models = 0, n_anisou = 0, n_skipped = 0, n_atom = 0;
-	IV n_atom_rec = 0, n_het_rec = 0, cur_model = 1, lineno = 0;
+	UV rnc = 0, rnb = 0;
+	/*counts of what was read, all of them only ever counted up.  The model and
+	residue numbers next to them stay signed: those are read out of the file's
+	own columns, where a negative number is legal (residue numbering routinely
+	starts before 1) or at worst is damage, and either way is better carried as
+	the negative it was written as than wrapped to a huge unsigned one.*/
+	UV n_models = 0, n_anisou = 0, n_skipped = 0, n_atom = 0;
+	UV n_atom_rec = 0, n_het_rec = 0, lineno = 0;
+	IV want_model, cur_model = 1;
 	bool keep_h, keep_water, keep_het, keep_meta, keep_anisou, keep_lineno, build_atoms;
 	//previous kept atom's residue identity, for boundary detection
 	char p_chain[8], p_icode[4], p_resname[8];
 	IV p_resseq = 0, p_model = 0;
-	int p_het = 0;
+	bool p_het = 0;
 	STRLEN pos = 0;
 
 	/*a negative model number means every model.  Zero cannot be the sentinel:
@@ -592,9 +598,9 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 			STRLEN nm_rawlen, n;
 			char elbuf[4];
 			STRLEN ellen;
-			int het = (line[0] == 'H');
+			bool het = (line[0] == 'H');
 			res_info ri;
-			int known;
+			bool known;
 			IV iv;
 			char chain[4], icode[2], resname[8];
 			STRLEN resname_len;
@@ -646,7 +652,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 			is read from the record's own columns.*/
 			{
 				IV rs = 0;
-				int changed;
+				bool changed;
 				fld_iv(line, llen, 22, 25, &rs);
 				icode[0] = (llen > 26 && line[26] != ' ') ? line[26] : '\0';
 				icode[1] = '\0';
@@ -659,11 +665,11 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				        || strcmp(p_resname, resname) != 0;
 				if (changed) {
 					if (have_res) {
-						av_push(res_last, newSViv(n_atom - 1));
+						av_push(res_last, newSVuv(n_atom - 1));
 						flush_residue(aTHX_ res_sum, rsx, rsy, rsz, rnc, rsb, rnb);
 					}
 					rsx = rsy = rsz = rsb = 0; rnc = rnb = 0;
-					av_push(res_first, newSViv(n_atom));
+					av_push(res_first, newSVuv(n_atom));
 					have_res = 1;
 					p_resseq = rs;
 					p_model  = cur_model;
@@ -766,7 +772,7 @@ emitted per atom because that is where they are read from.*/
 			av_push(col[C_ICODE], newSVpvn(icode, icode[0] ? 1 : 0));
 			av_push(col[C_HET], newSViv(het));
 			av_push(col[C_MODEL], newSViv(cur_model));
-			if (keep_lineno) av_push(col[C_LINENO], newSViv(lineno));
+			if (keep_lineno) av_push(col[C_LINENO], newSVuv(lineno));
 
 			n_atom++;
 			continue;
@@ -781,7 +787,7 @@ emitted per atom because that is where they are read from.*/
 		if (llen >= 5 && memcmp(line, "MODEL", 5) == 0) {
 			IV m;
 			n_models++;
-			cur_model = fld_iv(line, llen, 10, 13, &m) ? m : n_models;
+			cur_model = fld_iv(line, llen, 10, 13, &m) ? m : (IV)n_models;
 			av_push(model_nums, newSViv(cur_model));
 			continue;
 		}
@@ -820,7 +826,7 @@ emitted per atom because that is where they are read from.*/
 		}
 	}
 	if (have_res) {
-		av_push(res_last, newSViv(n_atom - 1));
+		av_push(res_last, newSVuv(n_atom - 1));
 		flush_residue(aTHX_ res_sum, rsx, rsy, rsz, rnc, rsb, rnb);
 	}
 
@@ -829,14 +835,14 @@ emitted per atom because that is where they are read from.*/
 		(void)hv_store(out, res_sum_name[i], (I32)strlen(res_sum_name[i]),
 		               newRV_noinc((SV *)res_sum[i]), 0);
 	(void)hv_stores(out, "elements",     newRV_noinc((SV *)elements));
-	(void)hv_stores(out, "n_hydrogens",  newSViv(n_hydrogen));
-	(void)hv_stores(out, "n_water_atoms", newSViv(n_water_atom));
+	(void)hv_stores(out, "n_hydrogens",  newSVuv(n_hydrogen));
+	(void)hv_stores(out, "n_water_atoms", newSVuv(n_water_atom));
 	if (bn) {
 		HV *b = newHV();
 		(void)hv_stores(b, "min",  newSVnv(bmin));
 		(void)hv_stores(b, "max",  newSVnv(bmax));
 		(void)hv_stores(b, "mean", newSVnv(bsum / (NV)bn));
-		(void)hv_stores(b, "n",    newSViv(bn));
+		(void)hv_stores(b, "n",    newSVuv(bn));
 		(void)hv_stores(out, "bfactor_stats", newRV_noinc((SV *)b));
 	} else {
 		(void)hv_stores(out, "bfactor_stats", newSVsv(&PL_sv_undef));
@@ -869,14 +875,14 @@ emitted per atom because that is where they are read from.*/
 	(void)hv_stores(out, "ter",          newRV_noinc((SV *)ter));
 	(void)hv_stores(out, "meta",         newRV_noinc((SV *)meta));
 	(void)hv_stores(out, "model_numbers", newRV_noinc((SV *)model_nums));
-	(void)hv_stores(out, "n_atoms",      newSViv(n_atom));
-	(void)hv_stores(out, "n_residues",   newSViv(av_len(res_first) + 1));
-	(void)hv_stores(out, "n_models",     newSViv(n_models ? n_models : 1));
-	(void)hv_stores(out, "n_anisou",     newSViv(n_anisou));
-	(void)hv_stores(out, "n_skipped",    newSViv(n_skipped));
-	(void)hv_stores(out, "n_atom_records",   newSViv(n_atom_rec));
-	(void)hv_stores(out, "n_hetatm_records", newSViv(n_het_rec));
-	(void)hv_stores(out, "n_lines",      newSViv(lineno));
+	(void)hv_stores(out, "n_atoms",      newSVuv(n_atom));
+	(void)hv_stores(out, "n_residues",   newSVuv((UV)(av_len(res_first) + 1)));
+	(void)hv_stores(out, "n_models",     newSVuv(n_models ? n_models : 1));
+	(void)hv_stores(out, "n_anisou",     newSVuv(n_anisou));
+	(void)hv_stores(out, "n_skipped",    newSVuv(n_skipped));
+	(void)hv_stores(out, "n_atom_records",   newSVuv(n_atom_rec));
+	(void)hv_stores(out, "n_hetatm_records", newSVuv(n_het_rec));
+	(void)hv_stores(out, "n_lines",      newSVuv(lineno));
 	(void)hv_stores(out, "format",       newSVpvs("pdb"));
 	return out;
 }
@@ -914,13 +920,13 @@ typedef struct {
 typedef struct {
 	const char *s;
 	STRLEN n;
-	int kind;
+	unsigned kind;      //CT_*
 	/*a quoted value is text and nothing else: '.' in quotes is a full stop, and
 	only a bare '.' is the null the format means*/
-	int quoted;
+	bool quoted;
 } cif_tok;
 
-static int cif_iskw(const char *CSP_RESTRICT s, STRLEN n, const char *CSP_RESTRICT kw,
+static bool cif_iskw(const char *CSP_RESTRICT s, STRLEN n, const char *CSP_RESTRICT kw,
                     STRLEN kwn)
 {
 	STRLEN i;
@@ -930,13 +936,13 @@ static int cif_iskw(const char *CSP_RESTRICT s, STRLEN n, const char *CSP_RESTRI
 	return 1;
 }
 
-static int cif_space(char c)
+static bool cif_space(char c)
 {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
 //a bare '.' (not applicable) or '?' (unknown): the field was not filled in
-static int cif_null(const cif_tok *CSP_RESTRICT t)
+static bool cif_null(const cif_tok *CSP_RESTRICT t)
 {
 	return !t->quoted && t->n == 1 && (t->s[0] == '.' || t->s[0] == '?');
 }
@@ -1102,18 +1108,19 @@ typedef struct {
 	AV **res_sum;
 	AV *res_first, *res_last, *atom_hv, *model_nums;
 	HV *elements, *want_chain;
-	IV n_hydrogen, n_water_atom, bn;
+	UV n_hydrogen, n_water_atom, bn;
 	NV bmin, bmax, bsum;
 	NV xmin, ymin, zmin, xmax, ymax, zmax;
 	bool have_bbox;
 	NV rsx, rsy, rsz, rsb;
-	IV rnc, rnb;
-	IV want_model, n_models, n_anisou, n_skipped, n_atom, n_atom_rec, n_het_rec;
-	IV cur_model;
+	UV rnc, rnb;
+	//counted up only; the numbers read out of the file stay signed, as in parse_buf
+	UV n_models, n_anisou, n_skipped, n_atom, n_atom_rec, n_het_rec;
+	IV want_model, cur_model;
 	bool have_res, seen_model, keep_h, keep_water, keep_het, keep_anisou, build_atoms;
 	char p_chain[8], p_icode[4], p_resname[8];
 	IV p_resseq, p_model;
-	int p_het;
+	bool p_het;
 } cif_state;
 
 /*one row of _atom_site.  v[] holds a pointer and a length per known column, or
@@ -1132,7 +1139,7 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 	const char *restrict nm_s, *restrict alt_s;
 	STRLEN nm_n, alt_n;
 	res_info ri;
-	int known, het, changed;
+	bool known, het, changed;
 	IV rs = 0, serial = 0, model = 1;
 	bool have_rs, have_serial, have_occ, have_xyz, have_b;
 	NV xv = 0, yv = 0, zv = 0, ov = 0, bv = 0;
@@ -1219,12 +1226,12 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 	        || strcmp(st->p_resname, resname) != 0;
 	if (changed) {
 		if (st->have_res) {
-			av_push(st->res_last, newSViv(st->n_atom - 1));
+			av_push(st->res_last, newSVuv(st->n_atom - 1));
 			flush_residue(aTHX_ st->res_sum, st->rsx, st->rsy, st->rsz, st->rnc, st->rsb, st->rnb);
 		}
 		st->rsx = st->rsy = st->rsz = st->rsb = 0;
 		st->rnc = st->rnb = 0;
-		av_push(st->res_first, newSViv(st->n_atom));
+		av_push(st->res_first, newSVuv(st->n_atom));
 		st->have_res = 1;
 		st->p_resseq = rs;
 		st->p_model  = st->cur_model;
@@ -1357,8 +1364,9 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	cif_state st;
 	cif_lex lx;
 	cif_tok tk;
-	int i, keep_meta;
-	IV lineno = 0;
+	unsigned i;
+	bool keep_meta;
+	UV lineno = 0;
 	SV *block = NULL;
 	const char *v[A_NFIELD];
 	STRLEN vn[A_NFIELD];
@@ -1419,8 +1427,8 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 		if (tk.kind == CT_LOOP) {
 			const char **restrict tags = NULL;
 			STRLEN *restrict tagn = NULL;
-			int *restrict fld_of = NULL;
-			int ntags = 0, cap = 16;
+			int *restrict fld_of = NULL;   //a column this reader ignores is -1
+			unsigned ntags = 0, cap = 16;
 			bool is_atom = 0, is_aniso = 0, keep_loop = 0;
 			const char *restrict cat = NULL;
 			STRLEN catn = 0;
@@ -1467,7 +1475,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 
 			for (;;) {
 				const char *restrict save = lx.p;
-				int col_i;
+				unsigned col_i;
 				HV *row = NULL;
 				cif_next(&lx, &tk);
 				if (tk.kind != CT_VALUE) { lx.p = save; break; }
@@ -1526,7 +1534,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	if (have_single) cif_atom_row(aTHX_ &st, sv_, svn_);
 
 	if (st.have_res) {
-		av_push(st.res_last, newSViv(st.n_atom - 1));
+		av_push(st.res_last, newSVuv(st.n_atom - 1));
 		flush_residue(aTHX_ res_sum, st.rsx, st.rsy, st.rsz, st.rnc, st.rsb, st.rnb);
 	}
 
@@ -1535,14 +1543,14 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 		(void)hv_store(out, res_sum_name[i], (I32)strlen(res_sum_name[i]),
 		               newRV_noinc((SV *)res_sum[i]), 0);
 	(void)hv_stores(out, "elements",      newRV_noinc((SV *)st.elements));
-	(void)hv_stores(out, "n_hydrogens",   newSViv(st.n_hydrogen));
-	(void)hv_stores(out, "n_water_atoms", newSViv(st.n_water_atom));
+	(void)hv_stores(out, "n_hydrogens",   newSVuv(st.n_hydrogen));
+	(void)hv_stores(out, "n_water_atoms", newSVuv(st.n_water_atom));
 	if (st.bn) {
 		HV *b = newHV();
 		(void)hv_stores(b, "min",  newSVnv(st.bmin));
 		(void)hv_stores(b, "max",  newSVnv(st.bmax));
 		(void)hv_stores(b, "mean", newSVnv(st.bsum / (NV)st.bn));
-		(void)hv_stores(b, "n",    newSViv(st.bn));
+		(void)hv_stores(b, "n",    newSVuv(st.bn));
 		(void)hv_stores(out, "bfactor_stats", newRV_noinc((SV *)b));
 	} else {
 		(void)hv_stores(out, "bfactor_stats", newSVsv(&PL_sv_undef));
@@ -1581,14 +1589,14 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	(void)hv_stores(out, "cif_loops",     newRV_noinc((SV *)loops));
 	(void)hv_stores(out, "data_block",    block ? block : newSVsv(&PL_sv_undef));
 	(void)hv_stores(out, "model_numbers", newRV_noinc((SV *)st.model_nums));
-	(void)hv_stores(out, "n_atoms",       newSViv(st.n_atom));
-	(void)hv_stores(out, "n_residues",    newSViv(av_len(st.res_first) + 1));
-	(void)hv_stores(out, "n_models",      newSViv(st.n_models ? st.n_models : 1));
-	(void)hv_stores(out, "n_anisou",      newSViv(st.n_anisou));
-	(void)hv_stores(out, "n_skipped",     newSViv(st.n_skipped));
-	(void)hv_stores(out, "n_atom_records",   newSViv(st.n_atom_rec));
-	(void)hv_stores(out, "n_hetatm_records", newSViv(st.n_het_rec));
-	(void)hv_stores(out, "n_lines",       newSViv(lineno));
+	(void)hv_stores(out, "n_atoms",       newSVuv(st.n_atom));
+	(void)hv_stores(out, "n_residues",    newSVuv((UV)(av_len(st.res_first) + 1)));
+	(void)hv_stores(out, "n_models",      newSVuv(st.n_models ? st.n_models : 1));
+	(void)hv_stores(out, "n_anisou",      newSVuv(st.n_anisou));
+	(void)hv_stores(out, "n_skipped",     newSVuv(st.n_skipped));
+	(void)hv_stores(out, "n_atom_records",   newSVuv(st.n_atom_rec));
+	(void)hv_stores(out, "n_hetatm_records", newSVuv(st.n_het_rec));
+	(void)hv_stores(out, "n_lines",       newSVuv(lineno));
 	(void)hv_stores(out, "format",        newSVpvs("mmcif"));
 	return out;
 }
@@ -1724,7 +1732,7 @@ _str2nv_paths(text)
 		STRLEN n;
 		const char *restrict s;
 		NV a = 0, b = 0;
-		int ok_a, ok_b;
+		bool ok_a, ok_b;
 	PPCODE:
 		if (!SvOK(text)) croak("_str2nv_paths: string is undefined");
 		s = SvPV_const(text, n);
