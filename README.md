@@ -382,12 +382,30 @@ and not a 999-residue hole. A chain can only be missing as many residues as
 the span from its first polymer residue to its last leaves room for, so a jump
 wider than that is taken for a change of numbering scheme and not counted.
 
+A scheme that skips a few numbers on purpose is not caught, and cannot be:
+a protein numbered by homology to a reference one — chymotrypsin numbering,
+and the several conventions like it — leaves unused the numbers its reference
+does not need, and the coordinates do not say which of those is a residue that
+went unmodelled. 1ahx has all 396 of its SEQRES residues modelled and still
+skips nine numbers, which both fields report. About one chain in twenty-five
+is like this. Where a file has SEQRES and the two disagree, `n_missing` is the
+one to trust: it counts residues, where `gaps` and `missing_residues` count
+numbers.
+
 ### How residues are keyed
 
 By residue number with the insertion code appended, so `100`, `100A` and
 `100B` are three separate keys and nothing is silently overwritten. Waters and
 ligands are in `residues` alongside the polymer, which is why chain A above
 has 206 residues to its 191-long SEQRES.
+
+The name is not part of a residue's identity. One position is sometimes
+modelled in two chemical states at once, written as complementary altloc
+groups — 3zeu has ten methionines that are MSE in altlocs A and B and MET in
+C and D, a selenomethionine that only went halfway in — and those are one
+residue, not two. It takes the name written first, counts the records of both
+states, and keeps the atoms that tell them apart, so an MSE/MET like that has
+both an SE and an SD, each carrying the conformers of its own state.
 
 ### Nothing points back up
 

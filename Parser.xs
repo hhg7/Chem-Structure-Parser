@@ -417,7 +417,7 @@ static int fld_iv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLE
 	return n ? str2iv(s, n, out) : 0;
 }
 
-static int fld_nv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLEN to,
+static bool fld_nv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLEN to,
                   NV *CSP_RESTRICT out)
 {
 	const char *s;
@@ -543,14 +543,13 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	IV n_hydrogen = 0, n_water_atom = 0, bn = 0;
 	NV bmin = 0, bmax = 0, bsum = 0;
 	NV xmin = 0, ymin = 0, zmin = 0, xmax = 0, ymax = 0, zmax = 0;
-	int have_bbox = 0;
+	bool have_bbox = 0, have_res = 0;
 	//the residue being accumulated
 	NV rsx = 0, rsy = 0, rsz = 0, rsb = 0;
 	IV rnc = 0, rnb = 0;
 	IV want_model, n_models = 0, n_anisou = 0, n_skipped = 0, n_atom = 0;
 	IV n_atom_rec = 0, n_het_rec = 0, cur_model = 1, lineno = 0;
-	int keep_h, keep_water, keep_het, keep_meta, keep_anisou, keep_lineno, build_atoms;
-	int i, have_res = 0;
+	bool keep_h, keep_water, keep_het, keep_meta, keep_anisou, keep_lineno, build_atoms;
 	//previous kept atom's residue identity, for boundary detection
 	char p_chain[8], p_icode[4], p_resname[8];
 	IV p_resseq = 0, p_model = 0;
@@ -574,11 +573,11 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	}
 	p_chain[0] = p_icode[0] = p_resname[0] = '\0';
 
-	for (i = 0; i < NCOL; i++)  col[i] = newAV();
-	for (i = 0; i < NRSUM; i++) res_sum[i] = newAV();
+	for (unsigned i = 0; i < NCOL; i++)  col[i] = newAV();
+	for (unsigned i = 0; i < NRSUM; i++) res_sum[i] = newAV();
 
 	while (pos < len) {
-		const char *line = buf + pos;
+		const char *restrict line = buf + pos;
 		const char *nl = (const char *)memchr(line, '\n', len - pos);
 		STRLEN llen = nl ? (STRLEN)(nl - line) : (len - pos);
 		pos += llen + (nl ? 1 : 0);
@@ -680,12 +679,12 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				const char *nm_s, *alt_s, *chg_s;
 				STRLEN nm_n, alt_n, chg_n;
 				IV serial = 0;
-				int have_serial, have_occ;
+				bool have_serial, have_occ;
 				NV xv, yv, zv, bv, ov;
-				int have_xyz = fld_nv(line, llen, 30, 37, &xv)
+				bool have_xyz = fld_nv(line, llen, 30, 37, &xv)
 				             & fld_nv(line, llen, 38, 45, &yv)
 				             & fld_nv(line, llen, 46, 53, &zv);
-				int have_b = fld_nv(line, llen, 60, 65, &bv);
+				bool have_b = fld_nv(line, llen, 60, 65, &bv);
 
 				have_occ    = fld_nv(line, llen, 54, 59, &ov);
 				have_serial = fld_iv(line, llen, 6, 10, &serial);
@@ -723,12 +722,12 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				}
 				if (known && ri.type == RT_WATER) n_water_atom++;
 
-				/*Two shapes to hand back, and never both, because building every
-				atom twice -- once as columns here, once as a hash in Perl
-				afterwards -- was costing more than everything else in the read
-				put together.  The hash is what Chem::Structure::Parser wants, built here
-				where the fields already are; the columns are what the low-level
-				parse hands to anyone calling it directly.*/
+/*Two shapes to hand back, and never both, because building every
+atom twice -- once as columns here, once as a hash in Perl
+afterwards -- was costing more than everything else in the read
+put together.  The hash is what Chem::Structure::Parser wants, built here
+where the fields already are; the columns are what the low-level
+parse hands to anyone calling it directly.*/
 				if (build_atoms) {
 					HV *a = newHV();
 					(void)hv_stores(a, "name",   newSVpvn(nm_s, nm_n));
@@ -757,9 +756,9 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				}
 			}
 
-			/*The residue's identity.  Perl reads these at the index a residue
-			starts on, once per residue rather than once per atom, but they are
-			emitted per atom because that is where they are read from.*/
+/*The residue's identity.  Perl reads these at the index a residue
+starts on, once per residue rather than once per atom, but they are
+emitted per atom because that is where they are read from.*/
 			av_push(col[C_RESNAME], newSVpvn(resname, resname_len));
 			av_push(col[C_CHAIN], newSVpvn(chain, strlen(chain)));
 			if (fld_iv(line, llen, 22, 25, &iv)) av_push(col[C_RESSEQ], newSViv(iv));
@@ -826,7 +825,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	}
 
 	(void)hv_stores(out, "atoms", newRV_noinc((SV *)atom_hv));
-	for (i = 0; i < NRSUM; i++)
+	for (unsigned i = 0; i < NRSUM; i++)
 		(void)hv_store(out, res_sum_name[i], (I32)strlen(res_sum_name[i]),
 		               newRV_noinc((SV *)res_sum[i]), 0);
 	(void)hv_stores(out, "elements",     newRV_noinc((SV *)elements));
@@ -861,7 +860,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 		(void)hv_stores(out, "center", newSVsv(&PL_sv_undef));
 	}
 
-	for (i = 0; i < NCOL; i++) {
+	for (unsigned i = 0; i < NCOL; i++) {
 		if (i == C_LINENO && !keep_lineno) { SvREFCNT_dec((SV *)col[i]); continue; }
 		(void)hv_store(out, col_name[i], (I32)strlen(col_name[i]), newRV_noinc((SV *)col[i]), 0);
 	}
@@ -964,7 +963,7 @@ static void cif_next(cif_lex *CSP_RESTRICT lx, cif_tok *CSP_RESTRICT t)
 	if (*p == ';' && (p == lx->buf || p[-1] == '\n')) {
 		const char *s = p + 1, *q = s;
 		for (;;) {
-			const char *nl = (const char *)memchr(q, '\n', (STRLEN)(end - q));
+			const char *restrict nl = (const char *)memchr(q, '\n', (STRLEN)(end - q));
 			if (!nl) { q = end; lx->p = end; break; }
 			if (nl + 1 < end && nl[1] == ';') { q = nl; lx->p = nl + 2; break; }
 			if (nl + 1 >= end) { q = nl; lx->p = end; break; }
@@ -982,7 +981,7 @@ static void cif_next(cif_lex *CSP_RESTRICT lx, cif_tok *CSP_RESTRICT t)
 		Anything else is a quote inside the value, which is how a CIF writes
 		O5' without escaping it.*/
 		char qc = *p;
-		const char *s = p + 1, *q = s;
+		const char *restrict s = p + 1, *q = s;
 		for (;;) {
 			while (q < end && *q != qc) q++;
 			if (q >= end) break;
@@ -1130,7 +1129,7 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 {
 	char resname[8], chain[8], icode[4], elbuf[4], chgbuf[4];
 	STRLEN resname_len, chain_len, ellen, chg_n;
-	const char *restrict nm_s, *alt_s;
+	const char *restrict nm_s, *restrict alt_s;
 	STRLEN nm_n, alt_n;
 	res_info ri;
 	int known, het, changed;
@@ -1315,7 +1314,7 @@ static SV *cif_sv(pTHX_ const cif_tok *CSP_RESTRICT t)
 static SV *cif_key(pTHX_ const char *CSP_RESTRICT s, STRLEN n)
 {
 	SV *sv = newSVpvn(s, n);
-	char *p = SvPVX(sv);
+	char *restrict p = SvPVX(sv);
 	STRLEN i;
 	for (i = 0; i < n; i++) p[i] = (char)tolower((unsigned char)p[i]);
 	return sv;

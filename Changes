@@ -17,7 +17,12 @@ Revision history for Chem-Structure-Parser
     - new: cif_info(), the mmCIF counterpart of pdb_info().
     - new: $info->{chains}{$chain}{missing_residues}, the residue numbers the
       chain's gaps step over, in ascending order.  Every chain has the list;
-      a chain with no gaps has it empty.
+      a chain with no gaps has it empty.  It counts numbers rather than
+      residues, so a chain numbered by homology to a reference protein --
+      chymotrypsin numbering and the conventions like it, about one chain in
+      twenty-five -- reports the numbers its scheme skips on purpose along
+      with the ones that went unmodelled.  n_missing is the count to trust
+      when a file has SEQRES and the two disagree.
     - gaps no longer reads a change of numbering scheme as a gap.  An antibody
       numbered by the Kabat scheme runs 27, 1027, 2027, 28, where the
       thousands are insertions after 27 and not a 999-residue hole, and 1a4k

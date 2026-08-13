@@ -1825,7 +1825,15 @@ A chain:
     residues      { '54' => { ... } }
 
 A residue, keyed by residue number with its insertion code appended, so that
-C<100>, C<100A> and C<100B> are three separate keys:
+C<100>, C<100A> and C<100B> are three separate keys.  A number and an
+insertion code are the whole of a residue's identity, and the name is not part
+of it: one position is sometimes modelled in two chemical states at once, as
+complementary altloc groups, and those are one residue rather than two.  3zeu
+writes ten of its methionines as MSE in altlocs A and B and MET in C and D, a
+selenomethionine that only went halfway in.  The residue takes the name
+written first, counts the records of both states, and keeps the atoms that
+tell them apart -- an MSE/MET like that has both an SE and an SD, each with
+the conformers of its own state.
 
     resname   'LEU'          number 54       icode ''
     one       'L'            the single-letter code, '' when there is none
@@ -1963,6 +1971,19 @@ the span from its first polymer residue to its last leaves room for, so a jump
 wider than that is taken for a change of numbering scheme and not counted --
 otherwise 1a4k reads as a 214-residue light chain missing five thousand
 residues.
+
+What is left after that is a numbering scheme that skips a few numbers on
+purpose.  A protein numbered by homology to a reference one -- chymotrypsin
+numbering, and the several conventions like it -- leaves the numbers its
+reference does not need unused, and nothing in the coordinates tells those
+apart from a residue that went unmodelled: 1ahx has all 396 of its SEQRES
+residues modelled and still skips nine numbers, which C<gaps> and
+C<missing_residues> both report.  Roughly one chain in twenty-five is like
+this.  C<n_missing> is the number to trust when a file has SEQRES and the two
+disagree, since it counts residues rather than numbers; C<missing_residues>
+answers the narrower question of which numbers the coordinates skip, and
+answers it the same way whether the chain was read from a PDB file or an
+mmCIF one and whether or not the headers were parsed.
 
 =head2 structure_summary
 

@@ -201,6 +201,44 @@ is(scalar @{ $info->{chains}{A}{residues}{2}{atom_order} }, 5,
 	'but has five distinct atom names');
 
 #--------
+# Microheterogeneity: one position modelled in two chemical states at once,
+# written as complementary altloc groups.  A selenomethionine that only went
+# halfway in is both MSE and MET at the same number -- 3zeu has ten of them,
+# MSE in altlocs A and B and MET in C and D -- and 2ftm, 5nai, 5za2 and 6e4z
+# do the same with IAS/ASP, CSD/CYS, SEP/SER and NEP/HIP.  A residue is a
+# number and an insertion code, so this is one residue and not two: counting
+# it twice would put a second M in the sequence of a protein that has one.
+# The two states stay apart on the atoms that tell them apart.
+#--------
+{
+	my $n = 0;
+	my $atom = sub {
+		my ($name, $alt, $resname, $elem, $occ) = @_;
+		$n++;
+		return sprintf('%-6s%5d %-4s%1s%-3s %s%4d%-1s   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s',
+			($resname eq 'MSE' ? 'HETATM' : 'ATOM'), $n, " $name", $alt, $resname,
+			'A', 41, ' ', $n, 0, 0, $occ, 0, $elem);
+	};
+	my $s = structure_info_string(join "\n",
+		(map { $atom->($_->[0], 'A', 'MSE', $_->[1], 0.30) }
+			[ N => 'N' ], [ CA => 'C' ], [ C => 'C' ], [ O => 'O' ], [ SE => 'SE' ]),
+		(map { $atom->($_->[0], 'B', 'MET', $_->[1], 0.70) }
+			[ N => 'N' ], [ CA => 'C' ], [ C => 'C' ], [ O => 'O' ], [ SD => 'S' ]),
+		'END', '');
+
+	is_deeply([ @{ $s->{chains}{A}{residue_order} } ], [ '41' ],
+		'two chemical states at one number are one residue, not two');
+	is($s->{chains}{A}{sequence}, 'M', 'and contribute one letter to the sequence');
+	my $r = $s->{chains}{A}{residues}{41};
+	is($r->{resname}, 'MSE', 'the residue takes the name written first');
+	is($r->{n_atoms}, 10,    'every record of both states is counted');
+	is_deeply([ map { $_->{altloc} } @{ $r->{atoms}{N}{altlocs} } ], [ 'A', 'B' ],
+		'a backbone atom carries a conformer from each state');
+	is_deeply([ sort @{ $r->{atom_order} } ], [ qw(C CA N O SD SE) ],
+		'and the atoms unique to each state are both kept');
+}
+
+#--------
 # whole-structure statistics
 #--------
 is($info->{stats}{n_hetatm}, 13, 'HETATM records are counted: MSE, NAG, ZN and two waters');

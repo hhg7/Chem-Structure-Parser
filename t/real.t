@@ -51,6 +51,18 @@ diag(sprintf('reading %d of %d structures in %s', scalar @files, scalar @all, $D
 # else.  The protein sequences are built from amino acids alone, which tests
 # the reading and the single-letter codes without going near the ambiguity
 # over whether a lone GUA is a nucleotide or a free base.
+#
+# A residue is a chain, a number and an insertion code, which is how the
+# module keys them, and the name is carried along rather than being part of
+# the identity.  It cannot be part of it: one position is sometimes modelled
+# in two chemical states at once, as complementary altloc groups, and both
+# are the same residue.  3zeu has ten methionines each written as MSE in
+# altlocs A and B and MET in C and D, a selenomethionine that only went
+# halfway in; 2ftm has an aspartate at A115 that is IAS in altloc A and ASP
+# in B, 5nai a CSD/CYS at A198, 5za2 a SEP/SER at B64 and 6e4z a NEP/HIP at
+# H58.  Counting those twice would put a second M in the sequence of a
+# protein that has one.  The name still has to agree, because it is in the
+# string being compared -- only the counting is by position.
 sub reference_read {
 	my ($file) = @_;
 	open my $fh, '<', $file or die "$file: $!";
@@ -64,7 +76,7 @@ sub reference_read {
 		my $num     = substr($l, 22, 4);
 		my $icode   = substr($l, 26, 1);
 		for ($chain, $resname, $num, $icode) { s/\A\s+//; s/\s+\z// }
-		my $key = "$chain|$num|$icode|$resname";
+		my $key = "$chain|$num|$icode";
 		next if $seen{$key}++;
 		push @{ $res{$chain} }, "$num|$icode|$resname";
 		$seq{$chain} .= aa3to1($resname) if res_type($resname) eq 'amino_acid';
