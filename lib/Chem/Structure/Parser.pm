@@ -699,18 +699,46 @@ sub _finish_chains {
 			$c->{last}         = @poly ? $poly[-1]{key} : undef;
 
 			# gaps: unmodelled stretches, which is where a sequence read off
-			# the coordinates quietly differs from the one in SEQRES
-			my @gaps;
+			# the coordinates quietly differs from the one in SEQRES.
+			# missing_residues is the same fact one number at a time: every
+			# residue number the polymer skips over, so a caller can ask "is
+			# 47 modelled?" without walking the gap list.
+			#
+			# A jump in the numbering only means missing residues if the chain
+			# has that many to be missing, and the numbering says how many it
+			# has: a chain running from its first polymer residue to its last
+			# covers so many numbers, and the ones it does not use are the
+			# missing ones.  That total is the budget.  A jump wider than the
+			# whole budget is not a gap but a change of numbering scheme -- an
+			# antibody numbered by the Kabat scheme runs 27, 1027, 2027, 28,
+			# where the thousands are insertions after 27, and read literally
+			# that makes 1a4k a 214-residue light chain missing five thousand
+			# residues.  Insertion codes share a number, so it is the distinct
+			# numbers that are counted here and not the residues: without
+			# that, thrombin's 149A..149E spend budget that its real gap at
+			# 217..219 then has none of.  The budget is read off the
+			# coordinates alone, so a chain answers the same whether it was
+			# read from a PDB file or an mmCIF one and whether or not the
+			# headers were parsed.
+			my (@gaps, @missing, %numbered);
+			my @nums = grep { defined } map { $_->{number} } @poly;
+			$numbered{$_} = 1 for @nums;
+			my $budget = @nums ? $nums[-1] - $nums[0] + 1 - keys %numbered : 0;
 			for my $i (1 .. $#poly) {
 				my ($a, $b) = @poly[ $i - 1, $i ];
 				next unless defined $a->{number} && defined $b->{number};
-				next if $b->{number} == $a->{number} + 1;
-				next if $b->{number} == $a->{number}; # insertion code, not a gap
-				push @gaps, { after => $a->{key}, before => $b->{key},
-				              missing => $b->{number} - $a->{number} - 1 };
+				my $n = $b->{number} - $a->{number} - 1;
+				next if $n < 1 || $n > $budget;
+				push @gaps, { after => $a->{key}, before => $b->{key}, missing => $n };
+				push @missing, ($a->{number} + 1) .. ($b->{number} - 1);
 			}
-			$c->{gaps}   = \@gaps;
-			$c->{n_gaps} = scalar @gaps;
+			# a residue numbered out of line with the rest can leave the list
+			# out of order, and ascending is the whole use of it
+			@missing = sort { $a <=> $b } @missing
+				if grep { $missing[$_] < $missing[ $_ - 1 ] } 1 .. $#missing;
+			$c->{gaps}             = \@gaps;
+			$c->{n_gaps}           = scalar @gaps;
+			$c->{missing_residues} = \@missing;
 		}
 	}
 	return $info;
@@ -1788,6 +1816,7 @@ A chain:
     n_missing     seqres length less the residues actually modelled
     gaps          [ { after, before, missing } ]   unmodelled stretches
     n_gaps
+    missing_residues [ 4, 5, 12 ]  every residue number the gaps skip over
     first last    the first and last polymer residue keys
     molecule      from COMPND, e.g. 'GROWTH HORMONE'
     organism      from SOURCE
@@ -1919,7 +1948,21 @@ for them to change.
 
 One chain's sequence: C<observed> is the residues with coordinates, C<seqres>
 is what SEQRES says was in the crystal.  The two differ wherever the ends or
-a loop went unmodelled, which is exactly the difference C<gaps> counts.
+a loop went unmodelled, which is exactly the difference C<gaps> counts, and
+which C<missing_residues> lists one residue number at a time.
+
+Both are read off the coordinates, so they see the loops a chain skips over
+and not the residues that fell off either end: a terminus that went unmodelled
+leaves no numbering behind to notice it by.  C<n_missing>, which is the SEQRES
+length less the residues actually modelled, counts those as well.
+
+Numbering is not always sequential, either.  An antibody numbered by the Kabat
+scheme runs 27, 1027, 2027, 28, where the thousands are insertions after 27
+and not a 999-residue hole.  A chain can only be missing as many residues as
+the span from its first polymer residue to its last leaves room for, so a jump
+wider than that is taken for a change of numbering scheme and not counted --
+otherwise 1a4k reads as a 214-residue light chain missing five thousand
+residues.
 
 =head2 structure_summary
 

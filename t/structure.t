@@ -68,6 +68,51 @@ is($info->{chains}{A}{n_gaps}, 1, 'chain A has one gap');
 is_deeply($info->{chains}{A}{gaps}, [ { after => '3', before => '6', missing => 2 } ],
 	'the gap names the residues either side of it and how many are missing');
 is($info->{chains}{B}{n_gaps}, 0, 'chain B is continuous');
+is_deeply($info->{chains}{A}{missing_residues}, [ 4, 5 ],
+	'missing_residues: the gap spelled out one residue number at a time');
+is_deeply($info->{chains}{B}{missing_residues}, [],
+	'missing_residues: a chain with no gaps still has the list, empty');
+
+#--------
+# Numbering that is not sequential.  An antibody numbered by the Kabat scheme
+# runs 27, 1027, 2027, 28: the thousands are insertions after 27, not a
+# 999-residue hole, and reading them literally makes 1a4k a 214-residue light
+# chain missing five thousand residues.  Insertion codes are the other half of
+# it -- a chain that spends its numbering on 149A..149E has less room for
+# missing residues than its residue count suggests, and must still see the
+# real gap further along.
+#--------
+{
+	my $n = 0;
+	my $ca = sub {
+		my ($resname, $chain, $resseq, $icode) = @_;
+		$n++;
+		return sprintf('ATOM  %5d  CA  %-3s %s%4d%-1s   %8.3f%8.3f%8.3f  1.00  0.00           C',
+			$n, $resname, $chain, $resseq, $icode // ' ', $n, 0, 0);
+	};
+
+	my $kabat = structure_info_string(join "\n",
+		(map { $ca->('ALA', 'A', $_) } 25, 26, 27),
+		(map { $ca->('GLY', 'A', $_) } 1027, 2027),      # insertions after 27
+		(map { $ca->('SER', 'A', $_) } 28, 29, 30),
+		'END', '');
+	is($kabat->{chains}{A}{n_gaps}, 0,
+		'a jump wider than the chain is a numbering scheme, not a gap');
+	is_deeply($kabat->{chains}{A}{missing_residues}, [],
+		'and so it contributes no missing residues');
+
+	my $icodes = structure_info_string(join "\n",
+		(map { $ca->('ALA', 'H', $_) } 146, 147, 148, 149),
+		(map { $ca->('GLY', 'H', 149, $_) } 'A' .. 'E'), # 149A..149E
+		(map { $ca->('SER', 'H', $_) } 150, 151, 152),
+		(map { $ca->('SER', 'H', $_) } 155, 156),        # the real gap: 153, 154
+		'END', '');
+	is_deeply($icodes->{chains}{H}{missing_residues}, [ 153, 154 ],
+		'insertion codes share a number, so the gap past them is still found');
+	is_deeply($icodes->{chains}{H}{gaps},
+		[ { after => '152', before => '155', missing => 2 } ],
+		'and it is the one gap the chain has');
+}
 
 #--------
 # counts

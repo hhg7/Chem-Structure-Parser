@@ -301,6 +301,9 @@ $info
     │   ├── gaps            [ { after 129, before 136, missing 6 },
     │   │                     { after 148, before 154, missing 5 } ]
     │   ├── n_gaps          2
+    │   ├── missing_residues
+    │   │                   [ 130, 131, 132, 133, 134, 135,
+    │   │                     149, 150, 151, 152, 153 ]
     │   ├── first           1           the first and last polymer residue keys
     │   ├── last            191
     │   ├── residue_types   { amino_acid 180, water 26 }
@@ -366,6 +369,18 @@ raw record counts, so nothing in the file is lost.
 sequence": what was modelled, and what was in the crystal. They differ
 wherever a terminus or a loop went unmodelled, which is what `gaps` counts and
 `n_missing` totals — eleven residues of chain A above, in two stretches.
+`missing_residues` is the same eleven one number at a time, in ascending
+order, for asking whether a particular residue was modelled without walking
+the gap list.
+
+Both are read off the numbering, so they see the loops a chain skips over and
+not the residues that fell off either end — a terminus that went unmodelled
+leaves no numbering behind to notice it by, and only `n_missing` counts those.
+Numbering is not always sequential, either: an antibody numbered by the Kabat
+scheme runs 27, 1027, 2027, 28, where the thousands are insertions after 27
+and not a 999-residue hole. A chain can only be missing as many residues as
+the span from its first polymer residue to its last leaves room for, so a jump
+wider than that is taken for a change of numbering scheme and not counted.
 
 ### How residues are keyed
 

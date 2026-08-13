@@ -15,4 +15,17 @@ Revision history for Chem-Structure-Parser
       charge of -1 reads back as '1-', and a charge of 0 stays '0', which is
       not the same answer as a blank charge field).
     - new: cif_info(), the mmCIF counterpart of pdb_info().
+    - new: $info->{chains}{$chain}{missing_residues}, the residue numbers the
+      chain's gaps step over, in ascending order.  Every chain has the list;
+      a chain with no gaps has it empty.
+    - gaps no longer reads a change of numbering scheme as a gap.  An antibody
+      numbered by the Kabat scheme runs 27, 1027, 2027, 28, where the
+      thousands are insertions after 27 and not a 999-residue hole, and 1a4k
+      was reading as a 214-residue light chain missing five thousand
+      residues.  A chain can only be missing as many residues as the span
+      from its first polymer residue to its last leaves room for, counting
+      insertion codes as the one number they share, and a jump wider than
+      that is no longer counted.  Nothing is read from SEQRES to decide it,
+      so a chain answers the same whether it came from a PDB file or an
+      mmCIF one and whether or not the headers were parsed.
     - formats() now reports mmcif as supported.

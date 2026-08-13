@@ -1106,13 +1106,12 @@ typedef struct {
 	IV n_hydrogen, n_water_atom, bn;
 	NV bmin, bmax, bsum;
 	NV xmin, ymin, zmin, xmax, ymax, zmax;
-	int have_bbox;
+	bool have_bbox;
 	NV rsx, rsy, rsz, rsb;
 	IV rnc, rnb;
 	IV want_model, n_models, n_anisou, n_skipped, n_atom, n_atom_rec, n_het_rec;
 	IV cur_model;
-	int keep_h, keep_water, keep_het, keep_anisou, build_atoms;
-	int have_res, seen_model;
+	bool have_res, seen_model, keep_h, keep_water, keep_het, keep_anisou, build_atoms;
 	char p_chain[8], p_icode[4], p_resname[8];
 	IV p_resseq, p_model;
 	int p_het;
@@ -1131,12 +1130,12 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 {
 	char resname[8], chain[8], icode[4], elbuf[4], chgbuf[4];
 	STRLEN resname_len, chain_len, ellen, chg_n;
-	const char *nm_s, *alt_s;
+	const char *restrict nm_s, *alt_s;
 	STRLEN nm_n, alt_n;
 	res_info ri;
 	int known, het, changed;
 	IV rs = 0, serial = 0, model = 1;
-	int have_rs, have_serial, have_occ, have_xyz, have_b;
+	bool have_rs, have_serial, have_occ, have_xyz, have_b;
 	NV xv = 0, yv = 0, zv = 0, ov = 0, bv = 0;
 
 	//which model this row belongs to, counted before anything can skip the row
@@ -1367,7 +1366,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	//an _atom_site table written as plain tags rather than as a loop_
 	const char *sv_[A_NFIELD];
 	STRLEN svn_[A_NFIELD];
-	int have_single = 0;
+	bool have_single = 0;
 
 	Zero(&st, 1, cif_state);
 	for (i = 0; i < NCOL; i++)  col[i] = newAV();
@@ -1395,9 +1394,9 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	}
 
 	{	//lines are not what this format is made of, but callers still count them
-		const char *p = buf, *e = buf + len;
+		const char *restrict p = buf, *restrict e = buf + len;
 		while (p < e) {
-			const char *nl = (const char *)memchr(p, '\n', (STRLEN)(e - p));
+			const char *restrict nl = (const char *)memchr(p, '\n', (STRLEN)(e - p));
 			lineno++;
 			if (!nl) break;
 			p = nl + 1;
@@ -1419,18 +1418,19 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 		if (tk.kind == CT_STOP || tk.kind == CT_SAVE) continue;
 
 		if (tk.kind == CT_LOOP) {
-			const char **tags = NULL;
-			STRLEN *tagn = NULL;
-			int *fld_of = NULL;
-			int ntags = 0, cap = 16, is_atom = 0, is_aniso = 0, keep_loop = 0;
-			const char *cat = NULL;
+			const char **restrict tags = NULL;
+			STRLEN *restrict tagn = NULL;
+			int *restrict fld_of = NULL;
+			int ntags = 0, cap = 16;
+			bool is_atom = 0, is_aniso = 0, keep_loop = 0;
+			const char *restrict cat = NULL;
 			STRLEN catn = 0;
 			AV *rows = NULL;
 
 			Newx(tags, cap, const char *);
 			Newx(tagn, cap, STRLEN);
 			for (;;) {
-				const char *save = lx.p;
+				const char *restrict save = lx.p;
 				cif_next(&lx, &tk);
 				if (tk.kind != CT_TAG) { lx.p = save; break; }
 				if (ntags == cap) {
@@ -1467,7 +1467,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 			}
 
 			for (;;) {
-				const char *save = lx.p;
+				const char *restrict save = lx.p;
 				int col_i;
 				HV *row = NULL;
 				cif_next(&lx, &tk);
@@ -1789,9 +1789,9 @@ res_type(name)
 	SV *name
 	PREINIT:
 		STRLEN n;
-		const char *s;
+		const char *restrict s;
 		res_info ri;
-		const char *t;
+		const char *restrict t;
 	CODE:
 		if (!SvOK(name)) croak("res_type: residue name is undefined");
 		s = SvPV_const(name, n);
