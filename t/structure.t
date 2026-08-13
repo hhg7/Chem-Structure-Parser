@@ -242,6 +242,12 @@ is(scalar @{ $info->{chains}{A}{residues}{2}{atom_order} }, 5,
 # whole-structure statistics
 #--------
 is($info->{stats}{n_hetatm}, 13, 'HETATM records are counted: MSE, NAG, ZN and two waters');
+is($info->{stats}{total_atoms}, 66, 'total_atoms is every coordinate record the file has');
+is($info->{stats}{total_atoms}, $info->{stats}{n_atoms},
+	'and equals n_atoms when nothing was filtered out');
+is($info->{stats}{total_atoms},
+	$info->{stats}{n_atom_records} + $info->{stats}{n_hetatm_records},
+	'it is the two record counts added up');
 is($info->{stats}{n_water_atoms}, 2, 'water atoms are counted');
 is($info->{stats}{n_hydrogens},   1, 'so are hydrogens');
 is($info->{stats}{elements}{S},   2, 'elements are tallied');

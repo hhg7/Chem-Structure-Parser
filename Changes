@@ -34,3 +34,10 @@ Revision history for Chem-Structure-Parser
       so a chain answers the same whether it came from a PDB file or an
       mmCIF one and whether or not the headers were parsed.
     - formats() now reports mmcif as supported.
+    - new: $info->{stats}{total_atoms}, every ATOM and HETATM record the file
+      has, every model and before the model selection or the hydrogens,
+      waters, hetatm and chains options threw anything away.  n_atoms is what
+      came back and this is what there was, so total_atoms == n_atoms +
+      n_skipped whatever the options were set to, and a structure read out of
+      a 64-model ensemble can say that its 6,432 atoms are one model of
+      411,648 rather than the whole file.  Both readers count it the same way.

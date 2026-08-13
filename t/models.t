@@ -24,6 +24,9 @@ my $file = "$data/nmr.pdb";
 	is($i->{model}, 1, 'but the chains are built from the first');
 	is($i->{stats}{n_atoms}, 12, 'only one model of atoms was kept');
 	is($i->{stats}{n_atom_records}, 36, 'though the file has three models of them');
+	is($i->{stats}{total_atoms}, 36, 'total_atoms counts every model, not the selected one');
+	is($i->{stats}{total_atoms}, $i->{stats}{n_atoms} + $i->{stats}{n_skipped},
+		'and the ones it did not keep are the ones it skipped');
 	is($i->{chains}{A}{sequence}, 'GSW', 'the sequence is read once, not three times');
 	ok(!exists $i->{models}, 'and there is no per-model breakdown unless it is asked for');
 }

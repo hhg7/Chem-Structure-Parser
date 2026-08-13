@@ -471,6 +471,15 @@ sub _build_structure {
 		stats    => {
 			n_atoms          => $p->{n_atoms},
 			n_hetatm         => 0,
+			# Every ATOM/HETATM record the file has, which is not what n_atoms
+			# counts: that one is what came back, after the model selection and
+			# the hydrogens, waters, hetatm and chains options have had their
+			# say, and this one is what was there to be filtered.  The two are
+			# equal for a single-model file read with the defaults and are not
+			# for anything else -- an NMR ensemble read at its default model => 1
+			# returns a twentieth of its atoms and is not a twentieth of a file.
+			# total_atoms == n_atoms + n_skipped, always, in both formats.
+			total_atoms      => $p->{n_atom_records} + $p->{n_hetatm_records},
 			n_hydrogens      => $p->{n_hydrogens},
 			n_water_atoms    => $p->{n_water_atoms},
 			n_atom_records   => $p->{n_atom_records},
@@ -1803,8 +1812,21 @@ it in.
     models      every model, when called with model => 'all'
     chains      { A => { ... } }
     chain_order [ 'A', 'B' ]                the order they appear in the file
-    stats       { n_atoms, n_hetatm, n_hydrogens, elements => { C => 1234 },
-                  bfactor => { min, max, mean }, bbox, center }
+    stats       { n_atoms, total_atoms, n_hetatm, n_hydrogens, n_water_atoms,
+                  n_atom_records, n_hetatm_records, n_anisou, n_skipped,
+                  n_lines, elements => { C => 1234 },
+                  bfactor => { min, max, mean, n }, bbox, center }
+
+The two atom counts in C<stats> answer different questions.  C<n_atoms> is how
+many atoms came back: the model that was selected, less whatever the
+C<hydrogens>, C<waters>, C<hetatm> and C<chains> options threw away.
+C<total_atoms> is how many ATOM and HETATM records the file has, every model
+and before any of that filtering, so C<total_atoms == n_atoms + n_skipped>
+always holds and the two are equal only when nothing was skipped.  Read an NMR
+ensemble with the default C<model =E<gt> 1> and C<n_atoms> is one model's
+worth while C<total_atoms> is the file's.  C<n_hetatm> is not a third count
+alongside them but a part of C<n_atoms>: the atoms of those residues that were
+written as HETATM.
 
 A chain:
 

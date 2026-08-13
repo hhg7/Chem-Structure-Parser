@@ -22,6 +22,8 @@ my $full = structure_info($file);
 	my $i = structure_info($file, hydrogens => 0);
 	is($i->{stats}{n_hydrogens}, 0, 'hydrogens => 0 removes the hydrogens');
 	is($i->{stats}{n_atoms}, $full->{stats}{n_atoms} - 1, 'and only the hydrogens');
+	is($i->{stats}{total_atoms}, $full->{stats}{total_atoms},
+		'total_atoms counts what the file has, so an option cannot change it');
 	ok(!exists $i->{chains}{A}{residues}{9}{atoms}{HB2}, 'the hydrogen is gone from its residue');
 	ok( exists $i->{chains}{A}{residues}{9}{atoms}{CB},  'and the carbon beside it is not');
 	is($i->{chains}{A}{sequence}, $full->{chains}{A}{sequence}, 'the sequence is unchanged');
@@ -116,6 +118,29 @@ my $full = structure_info($file);
 	ok(!exists $off->{records}{ANISOU}, 'and not kept');
 	is($on->{records}{ANISOU}, 1, 'anisou => 1 keeps them');
 	is($off->{stats}{n_atoms}, 1, 'an ANISOU record is not mistaken for an atom');
+}
+
+#--------
+# total_atoms is the count every option above is measured against, so it holds
+# whatever they are set to: what the file has is what was kept plus what was
+# skipped, in both formats.
+#--------
+{
+	my @sets = ({}, { hydrogens => 0 }, { waters => 0 }, { hetatm => 0 },
+	            { chains => ['A'] }, { model => 'all' }, { model => 3 },
+	            { hydrogens => 0, waters => 0, hetatm => 0 });
+	for my $stem (qw(mini.pdb mini.cif nmr.pdb nmr.cif)) {
+		for my $o (@sets) {
+			my $s = structure_info("$data/$stem", %$o)->{stats};
+			# spelled out rather than interpolated: an arrayref option would
+			# otherwise put a different address in the test name every run
+			my $how = join ', ', map {
+				"$_ => " . (ref $o->{$_} eq 'ARRAY' ? '[' . join(',', @{ $o->{$_} }) . ']' : $o->{$_})
+			} sort keys %$o;
+			is($s->{total_atoms}, $s->{n_atoms} + $s->{n_skipped},
+				"$stem: kept plus skipped is the whole file" . ($how ? " ($how)" : ''));
+		}
+	}
 }
 
 #--------

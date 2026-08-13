@@ -269,8 +269,9 @@ $info
 ├── model           1                       which one the chains below are
 ├── models                                  there only with model => 'all'
 ├── stats
-│   ├── n_atoms         3113
-│   ├── n_hetatm        69
+│   ├── n_atoms         3113    atoms kept: this model, less what was filtered
+│   ├── total_atoms     3113    atoms the file has, every model, unfiltered
+│   ├── n_hetatm        69      of n_atoms, the ones written as HETATM
 │   ├── n_hydrogens     0
 │   ├── n_water_atoms   69
 │   ├── n_lines         3605
@@ -446,6 +447,13 @@ v2020 is 2wy2: 33 MB, 64 models, 411,648 atom records.
 
 Filtering happens in the C, before a hydrogen or a water has become a Perl
 value, so `hydrogens => 0` is cheaper than reading them and throwing them away.
+
+What was filtered is still counted, so a structure knows how much of its file
+it is. `stats.n_atoms` is what came back and `stats.total_atoms` is what the
+file has -- every ATOM and HETATM record, every model, before any option had a
+say -- and `total_atoms == n_atoms + n_skipped` however the options were set.
+2wy2 above, read with the default `model => 1`, gives `n_atoms` 6,432 and
+`total_atoms` 411,648.
 
 ## pdb_info
 
