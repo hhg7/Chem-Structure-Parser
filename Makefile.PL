@@ -7,6 +7,24 @@ use Config;
 # only when the compiler is one that understands the flag.
 my $std = ($Config{gccversion} || $Config{cc} =~ /\b(?:g?cc|clang)\b/) ? ' -std=gnu99' : '';
 
+# MakeMaker's directory scan classifies .pm, .pl and .pod alike, so every
+# author-only helper in the distribution root -- test.all.perls.pl,
+# structure.info.pl, benchmark.pl -- landed in TO_INST_PM next to
+# lib/Chem/Structure/Parser.pm and was copied into $(INST_LIB)/Chem/Structure/
+# by `make install`.  They are not part of the module (and PruneFiles keeps them
+# out of the release), so drop them here: libscan is the documented hook for
+# rejecting a file the scan picked up.  Only root-level names are filtered;
+# anything with a directory in its path falls through to the default, which
+# keeps its README.pod and version-control filtering.
+{
+	package MY;
+	sub libscan {
+		my ($self, $path) = @_;
+		return '' if $path =~ /\.pl\z/ && $path !~ m{/};
+		return $self->SUPER::libscan($path);
+	}
+}
+
 WriteMakefile(
 	NAME             => 'Chem::Structure::Parser',
 	VERSION_FROM     => 'lib/Chem/Structure/Parser.pm',

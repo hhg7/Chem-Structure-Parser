@@ -25,7 +25,8 @@
 # non-core prerequisites.
 #
 # -P 1 is the old behaviour: one perl at a time, in the distribution root, which
-# is then left built and installed against the last (newest) perl.
+# is then left built and installed against the perl that runs last -- the
+# newest plain one, see the run order below.
 
 use 5.044;
 no source::encoding;
@@ -87,13 +88,19 @@ sub usage {
 usage: $0 [options]
 
 Builds and tests the distribution in the current directory against each
-perl installed under $PERLBREW_ROOT (oldest first).
+perl installed under $PERLBREW_ROOT.
+
+Run order: the quadmath builds first, since their test suite is the slowest and
+must not sit in the queue behind faster perls; then the rest oldest first; then
+the newest plain perl (double NV, no ithreads) last, so a serial run leaves the
+tree built and installed against the reference build rather than an outlier.
 
 options:
   -p, --perl VERSION   only this perl (repeatable); accepts "5.10.1",
                        "perl-5.10.1" or an exact directory name such as
                        "5.44.0-quadmath".  default: every installed perl
-  -l, --list           list the perls that would be tested, then exit
+  -l, --list           list the perls that would be tested, in run order, with
+                       each one's NV width and threading, then exit
       --no-install     skip "make install" (build + test only)
       --no-clean       skip cleaning before each version
       --deps           cpanm any missing prerequisite for that perl first
@@ -108,9 +115,9 @@ options:
                        tree under --log-dir/work (the distribution root is left
                        untouched).  bare -P, or -P 0, uses one child per perl,
                        capped at the CPU count; -P 1 builds serially in the
-                       distribution root and leaves it built against the last
-                       perl.  note that -P and -j multiply: the defaults can run
-                       16 compilers.  default: $par
+                       distribution root and leaves it built against the newest
+                       plain perl.  note that -P and -j multiply: the defaults
+                       can run 16 compilers.  default: $par
       --keep-work      keep the private build trees of perls that passed
                        (failed ones are always kept for inspection)
       --optimize STR   OPTIMIZE= passed to Makefile.PL (default: $optimize)
@@ -134,8 +141,7 @@ my @installed = grep { -x File::Spec->catfile($perls_dir, $_, 'bin', 'perl') }
                 grep { !/^\.\.?$/ } readdir $dh;
 closedir $dh;
 
-# numeric sort so the oldest perl is exercised first and the tree is left
-# built against the newest one.
+# numeric sort, oldest first, which is the order the run order below starts from.
 sub vkey {
     my $v = shift;
     $v =~ s/^perl-//;
@@ -162,8 +168,65 @@ if (@only) {
 }
 die "$0: no perls found in $perls_dir\n" unless @targets;
 
+# ------------------------------------------------------------------ run order --
+
+# What each perl actually is.  The NV width and the threading model decide the
+# order below, and the answer has to come from the interpreter: "5.44.0-quadmath"
+# is a local naming habit rather than a promise, and a threaded or long-double
+# build usually says nothing at all in its directory name.  A perl that will not
+# answer is described as unknown, never as plain, so a broken interpreter cannot
+# become the reference build the tree is left standing on.
+my %facts;
+sub facts {
+    my $version = shift;
+    return $facts{$version} if $facts{$version};
+    my $perl = File::Spec->catfile($perls_dir, $version, 'bin', 'perl');
+    my %f = (nv => '?', threads => 0, known => 0);
+    if (open my $fh, '-|', $perl, '-MConfig', '-e',
+            'print "$Config{nvtype}\t", ($Config{useithreads} ? 1 : 0)') {
+        my $line = <$fh>;
+        close $fh;
+        if (defined $line && $line =~ /^(\S[^\t]*)\t([01])/) {
+            %f = (nv => $1, threads => $2, known => 1);
+        }
+    }
+    $f{quadmath} = $f{nv} eq '__float128';
+    # plain: the double-NV, unthreaded build every other configuration is a
+    # variation on.  Unknown does not qualify.
+    $f{plain} = $f{known} && $f{nv} eq 'double' && !$f{threads};
+    return $facts{$version} = \%f;
+}
+
+sub nv_label {
+    my $f = shift;
+    my %short = ('double' => 'double', 'long double' => 'long-double',
+                 '__float128' => 'quadmath');
+    return ($short{ $f->{nv} } || $f->{nv}) . ($f->{threads} ? '-thr' : '');
+}
+
+# Run order, given @targets oldest first:
+#
+#   1. the quadmath builds, because their test suite is far and away the
+#      slowest (minutes against seconds here), and the whole matrix is only as
+#      fast as the slowest perl that had to wait for a free slot;
+#   2. everything else, still oldest first;
+#   3. the newest plain perl last, because a serial run leaves the distribution
+#      root built and installed against whichever perl went last, and that
+#      should be the ordinary reference build rather than a long-double,
+#      threaded or quadmath outlier.
+sub order_targets {
+    my @t = @_;
+    my (@quad, @rest);
+    push @{ facts($_)->{quadmath} ? \@quad : \@rest }, $_ for @t;
+    my ($plain) = grep { facts($_)->{plain} } reverse @rest;   # newest first
+    @rest = grep { $_ ne $plain } @rest if defined $plain;
+    return (@quad, @rest, defined $plain ? $plain : ());
+}
+@targets = order_targets(@targets);
+
 if ($list) {
-    printf "%-20s %s\n", $_, File::Spec->catfile($perls_dir, $_, 'bin', 'perl') for @targets;
+    printf "%-20s %-16s %s\n", $_, nv_label(facts($_)),
+        File::Spec->catfile($perls_dir, $_, 'bin', 'perl') for @targets;
     exit 0;
 }
 
@@ -657,7 +720,8 @@ printf "%d/%d perl(s) passed%s in %.1fs.  Logs in %s\n",
     ($not_run ? " ($not_run not run)" : ''),
     time - $t_all, $log_dir;
 # every perl installed into its own site_perl, but nothing built here: say so,
-# because after a serial run the root held a tree built against the last perl.
+# because after a serial run the root held a tree built against the newest plain
+# perl.
 print "-- built in private trees; this directory is unbuilt (-P 1 to build here)\n"
     if $in_parallel;
 
