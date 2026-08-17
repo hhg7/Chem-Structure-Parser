@@ -14,14 +14,32 @@
 # This is an XS distribution, so a stale Parser.o or Parser.c compiled against a
 # different perl will happily link and then crash: the cleaning here removes
 # the XS products explicitly rather than trusting a Makefile to still exist.
+#
+# By default four perls are built at once with a four-job make each (-P 4 -j 4).
+# They cannot share the distribution root for exactly the reason above -- one
+# Makefile, one Parser.c, one blib -- so each parallel child builds in a private
+# copy of the tree under the log directory and reports its result back to the
+# parent, which leaves the distribution root untouched.  Nothing forces
+# Parallel::ForkManager here: the fork/throttle/reap loop is a dozen lines and
+# the script already forks in run_cmd, so this keeps the dev tooling free of
+# non-core prerequisites.
+#
+# -P 1 is the old behaviour: one perl at a time, in the distribution root, which
+# is then left built and installed against the last (newest) perl.
 
 use 5.044;
 no source::encoding;
 use warnings FATAL => 'all';
 use Getopt::Long 'GetOptions';
+# -P (parallel perls) and -p (pick a perl) are different options, so the
+# default case-folding of single-letter aliases has to go.
+Getopt::Long::Configure('no_ignore_case');
 use File::Spec;
+use File::Copy 'copy';
+use File::Path 'remove_tree';
 use IO::Handle;
 use Cwd 'getcwd';
+use Data::Dumper;
 use POSIX 'strftime';
 use Time::HiRes 'time';
 
@@ -32,11 +50,18 @@ my $PERLBREW_ROOT = $ENV{PERLBREW_ROOT} || File::Spec->catdir($ENV{HOME}, 'perl5
 my @XS_PRODUCTS = qw(Parser.c Parser.o Parser.bs Parser.so Parser.def);
 
 my ($help, $list, $install, $deps, $clean, $stop, $quiet, $jobs, $log_dir, $optimize, $skip_old, @only);
+my ($par, $keep_work);
 $install  = 1; # make install, as compile.sh does
 $clean    = 1;
 $skip_old = 1; # perls older than MIN_PERL_VERSION cannot pass; do not pretend
 $optimize = '-O2 -Wall -Wextra'; # same as compile.sh
 $log_dir  = File::Spec->catdir('.build', 'multiperl');
+# Defaults are "./test.all.perls.pl -P 4 -j 4": four perls at once, four make
+# jobs and four test jobs each.  That is up to 16 compilers, which is the point
+# -- the sweep drops from ~2 minutes to ~25 seconds.  -P 1 restores the old
+# serial build in the distribution root; -j 0 the old single-job make.
+$par      = 4;
+$jobs     = 4;
 
 GetOptions(
     'perl|p=s@'     => \@only,
@@ -46,6 +71,8 @@ GetOptions(
     'stop-on-fail!' => \$stop,
     'skip-old!'     => \$skip_old,
     'jobs|j=i'      => \$jobs,
+    'parallel|P:i'  => \$par,
+    'keep-work!'    => \$keep_work,
     'optimize=s'    => \$optimize,
     'log-dir=s'     => \$log_dir,
     'quiet|q'       => \$quiet,
@@ -73,11 +100,23 @@ options:
                        (PREREQ_PM, TEST_REQUIRES, and the modules the test
                        suite loads optionally, e.g. Test::LeakTrace)
       --no-skip-old    attempt perls older than MIN_PERL_VERSION anyway
-      --stop-on-fail   abort at the first version that fails
-  -j, --jobs N         parallel make, and HARNESS_OPTIONS=j<N> for the tests
+      --stop-on-fail   abort at the first version that fails (in parallel mode:
+                       launch no more perls; the running ones finish)
+  -j, --jobs N         parallel make, and HARNESS_OPTIONS=j<N> for the tests.
+                       default: $jobs; -j 0 for a single-job make
+  -P, --parallel [N]   build/test N perls at once, each in a private copy of the
+                       tree under --log-dir/work (the distribution root is left
+                       untouched).  bare -P, or -P 0, uses one child per perl,
+                       capped at the CPU count; -P 1 builds serially in the
+                       distribution root and leaves it built against the last
+                       perl.  note that -P and -j multiply: the defaults can run
+                       16 compilers.  default: $par
+      --keep-work      keep the private build trees of perls that passed
+                       (failed ones are always kept for inspection)
       --optimize STR   OPTIMIZE= passed to Makefile.PL (default: $optimize)
       --log-dir DIR    where per-version logs go (default: $log_dir)
-  -q, --quiet          only write logs; do not echo build output
+  -q, --quiet          only write logs; do not echo build output.  implied for
+                       -P > 1, where interleaved output would be unreadable
   -h, --help           this message
 
 exit status: 0 if every perl built, tested and installed cleanly, else 1.
@@ -137,9 +176,11 @@ die "$0: no Parser.xs in " . getcwd() . " - is this the Chem-Structure-Parser tr
 
 sub mkdirp {
     my @parts = File::Spec->splitdir(shift);
-    my $path = '';
+    my $path;   # undef, not '': splitdir gives an absolute path a leading ''
+                # and catdir('', 'home') is '/home', where 'home' would be a
+                # directory of that name in the cwd.
     for my $p (@parts) {
-        $path = length($path) ? File::Spec->catdir($path, $p) : $p;
+        $path = defined $path ? File::Spec->catdir($path, $p) : $p;
         next if !length($path) || -d $path;
         mkdir $path or die "$0: mkdir $path: $!\n";
     }
@@ -147,6 +188,29 @@ sub mkdirp {
 
 mkdirp($log_dir);
 my $stamp = strftime '%Y%m%d-%H%M%S', localtime;
+
+# ------------------------------------------------------------- parallelism --
+
+sub cpu_count {
+    open my $fh, '<', '/proc/cpuinfo' or return 4;
+    my $n = grep { /^processor\s*:/ } <$fh>;
+    close $fh;
+    return $n || 4;
+}
+
+# bare -P (or -P 0) means "all of them", within reason: more compilers than
+# cores only makes every perl slower.
+$par = 0 if $par < 0;
+$par ||= @targets < cpu_count() ? scalar @targets : cpu_count();
+$par = @targets if $par > @targets;
+
+my $work_root    = File::Spec->catdir($log_dir, 'work');
+my $in_parallel  = 0; # set once the dispatch below knows there is more than one
+if ($par > 1) {
+    # children chdir into their own tree, so the log paths must not be relative
+    $log_dir   = File::Spec->rel2abs($log_dir);
+    $work_root = File::Spec->rel2abs($work_root);
+}
 
 # ------------------------------------------------------------- child runner --
 
@@ -240,31 +304,29 @@ my @prereqs  = (prereqs(), optional_test_deps());
 my $min_perl = min_perl_version();
 my $min_key  = defined $min_perl ? vkey($min_perl) : undef;
 
-# --------------------------------------------------------------- main loop --
+# ------------------------------------------------------------ build one perl --
 
-my (@results, @skipped);
-my $t_all = time;
-
-for my $version (@targets) {
+# Build, test and install the distribution in the current directory with one
+# perl.  Returns the result hashref; prints its own progress unless $silent
+# (parallel children are silent and the parent reports for them).
+sub build_one {
+    my ($version, $silent) = @_;
     my $root = File::Spec->catdir($perls_dir, $version);
     my $bin  = File::Spec->catdir($root, 'bin');
     my $perl = File::Spec->catfile($bin, 'perl');
-
-    if ($skip_old && defined $min_key && vkey($version) lt $min_key) {
-        printf "-- %s: SKIP (older than MIN_PERL_VERSION %s)\n", $version, $min_perl;
-        push @skipped, { version => $version, why => "< $min_perl" };
-        next;
-    }
 
     my $log = File::Spec->catfile($log_dir, "$version.$stamp.log");
     open my $logfh, '>', $log or die "$0: cannot write $log: $!\n";
     $logfh->autoflush(1);
     STDOUT->autoflush(1);
 
-    print "\n", '=' x 72, "\n";
-    printf "== %s   (log: %s)\n", $version, $log;
-    print '=' x 72, "\n";
-    print $logfh "== $version at " . strftime('%F %T', localtime) . "\n";
+    unless ($silent) {
+        print "\n", '=' x 72, "\n";
+        printf "== %s   (log: %s)\n", $version, $log;
+        print '=' x 72, "\n";
+    }
+    print $logfh "== $version at " . strftime('%F %T', localtime)
+               . ' in ' . getcwd() . "\n";
 
     # Emulate `perlbrew use $version` for the children: this perl's bin first,
     # every other perlbrew perl stripped out, and local::lib / PERL5LIB
@@ -344,8 +406,10 @@ for my $version (@targets) {
         last;
     }
 
-    if ($clean && !$failed && $version ne $targets[-1]) {
-        # leave a clean tree behind before the next perl takes over
+    if ($clean && !$failed && !$in_parallel && $version ne $targets[-1]) {
+        # leave a clean tree behind before the next perl takes over.  in
+        # parallel mode the whole private tree goes instead, so this would
+        # only cost a `make clean` nobody reads.
         run_cmd(['make', 'clean'], $logfh);
         clean_xs($logfh);
     }
@@ -354,20 +418,19 @@ for my $version (@targets) {
     $r{failed}  = $failed;
     close $logfh;
 
-    printf "-- %s: %s in %.1fs%s\n", $version,
-        ($failed ? "FAILED at '$failed'" : 'ok'),
-        $r{seconds},
-        (defined $r{files} ? " ($r{files})" : '');
-    print '-- ', join('  ', map { sprintf '%s %.1fs', $_->{label}, $_->{seconds} }
-                            @{ $r{steps} }), "\n";
-    push @results, \%r;
+    report_one(\%r) unless $silent;
+    return \%r;
+}
 
-    if ($failed && $stop) {
-        my %done = map { $_->{version} => 1 } @results, @skipped;
-        my @rest = grep { !$done{$_} } @targets;
-        print "-- --stop-on-fail: skipping @rest\n" if @rest;
-        last;
-    }
+# the two progress lines a finished perl prints, from the parent in either mode
+sub report_one {
+    my $r = shift;
+    printf "-- %s: %s in %.1fs%s\n", $r->{version},
+        ($r->{failed} ? "FAILED at '$r->{failed}'" : 'ok'),
+        $r->{seconds},
+        (defined $r->{files} ? " ($r->{files})" : '');
+    print '-- ', join('  ', map { sprintf '%s %.1fs', $_->{label}, $_->{seconds} }
+                            @{ $r->{steps} }), "\n";
 }
 
 # Remove the XS products by hand.  `make clean` cannot be relied on: the
@@ -378,6 +441,188 @@ sub clean_xs {
     my @gone = grep { -e $_ && unlink $_ } @XS_PRODUCTS;
     print $logfh "-- removed stale XS products: @gone\n" if @gone;
     print "-- removed stale XS products: @gone\n" if @gone && !$quiet;
+}
+
+# ------------------------------------------------------------ private trees --
+
+# Directories and files that must not be copied into a private build tree:
+# the build products of whichever perl last used the source tree (copying them
+# would recreate exactly the stale-object hazard the cleaning avoids), the
+# repository, and the log/work directory itself.
+my %SKIP_DIR  = map { $_ => 1 } qw(.git blib .build);
+my @SKIP_FILE = (qr/\.(?:o|a|so|bs|dylib|dll)$/, qr/^Parser\.(?:c|def)$/,
+                 qr/^Makefile(?:\.old)?$/, qr/^pm_to_blib$/, qr/^MYMETA\./,
+                 qr/^Chem-Structure-Parser-.*\.tar\.gz$/);
+
+sub copy_tree {
+    my ($src, $dst) = @_;
+    mkdirp($dst);
+    opendir my $dh, $src or die "$0: cannot read $src: $!\n";
+    my @entries = grep { !/^\.\.?$/ } readdir $dh;
+    closedir $dh;
+    for my $e (@entries) {
+        my $s = File::Spec->catfile($src, $e);
+        my $d = File::Spec->catfile($dst, $e);
+        if (-d $s) {
+            next if $SKIP_DIR{$e};
+            # a --log-dir inside the tree would otherwise copy itself forever
+            my $abs = File::Spec->rel2abs($s);
+            next if $abs eq $work_root || $abs eq $log_dir;
+            copy_tree($s, $d);
+            next;
+        }
+        next if grep { $e =~ $_ } @SKIP_FILE;
+        copy($s, $d) or die "$0: copy $s -> $d: $!\n";
+        chmod((stat $s)[2] & 07777, $d);
+    }
+}
+
+# The child's result hashref has to cross a fork, and %r is plain data, so
+# Data::Dumper out / eval in beats any IPC here: it also leaves the file behind
+# next to the log when something needs explaining.
+sub write_result {
+    my ($file, $r) = @_;
+    open my $fh, '>', $file or die "$0: cannot write $file: $!\n";
+    local $Data::Dumper::Indent   = 0;
+    local $Data::Dumper::Sortkeys = 1;
+    print $fh Data::Dumper->Dump([$r], ['R']);
+    close $fh or die "$0: close $file: $!\n";
+}
+
+sub read_result {
+    my $file = shift;
+    open my $fh, '<', $file or return undef;
+    local $/;
+    my $src = <$fh>;
+    close $fh;
+    my $R;
+    eval $src;                      ## no critic -- our own Dumper output
+    return ref $R eq 'HASH' ? $R : undef;
+}
+
+# ------------------------------------------------------------------ drivers --
+
+sub run_serial {
+    my @queue = @_;
+    my @out;
+    for my $version (@queue) {
+        my $r = build_one($version);
+        push @out, $r;
+        next unless $r->{failed} && $stop;
+        my %done = map { $_->{version} => 1 } @out;
+        my @rest = grep { !$done{$_} } @queue;
+        print "-- --stop-on-fail: skipping @rest\n" if @rest;
+        last;
+    }
+    return @out;
+}
+
+# Fork up to $par children, each in its own copy of the tree, reaping as they
+# finish and starting the next perl in the freed slot.
+sub run_parallel {
+    my @order   = @_;
+    my @queue   = @order;
+    my $src     = getcwd();
+    my %kid;                        # pid => { version, work, result }
+    my (@out, $halt);
+
+    my $reaper = sub {
+        my $pid    = shift;
+        my $status = shift;
+        my $kid    = delete $kid{$pid} or return;
+        my $r      = read_result($kid->{result});
+        if (!$r) {
+            # the child died without reporting: exec failure, signal, OOM
+            $r = { version => $kid->{version}, log => $kid->{log},
+                   reported => '?', steps => [], warnings => 0, seconds => 0,
+                   failed => sprintf('child exited %d%s', $status >> 8,
+                                     ($status & 127) ? ' on signal ' . ($status & 127) : '') };
+        }
+        push @out, $r;
+        report_one($r);
+        $halt = 1 if $r->{failed} && $stop;
+        if ($r->{failed} || $keep_work) { print "-- $kid->{version}: build tree kept at $kid->{work}\n" }
+        else                            { remove_tree($kid->{work}) }
+    };
+
+    local $SIG{INT} = local $SIG{TERM} = sub {
+        my $sig = shift;
+        print "\n-- $sig: stopping " . keys(%kid) . " running build(s)\n";
+        # each child leads its own process group (see the fork below), so one
+        # signal per group takes its make, its compilers and its prove with it;
+        # signalling the child perl alone would orphan those.
+        kill 'TERM', map { -$_ } keys %kid;
+        sleep 1;
+        kill 'KILL', map { -$_ } keys %kid;
+        exit 130;
+    };
+
+    while (@queue || %kid) {
+        while (@queue && keys(%kid) < $par && !$halt) {
+            my $version = shift @queue;
+            my $work    = File::Spec->catdir($work_root, "$version.$stamp");
+            my $result  = File::Spec->catfile($log_dir, "$version.$stamp.result");
+            my $log     = File::Spec->catfile($log_dir, "$version.$stamp.log");
+
+            remove_tree($work) if -d $work;
+            printf "-- %-20s starting (tree: %s)\n", $version, $work;
+            copy_tree($src, $work);
+
+            my $pid = fork;
+            die "$0: fork failed: $!\n" unless defined $pid;
+            if (!$pid) {                                  # child
+                $SIG{$_} = 'DEFAULT' for qw(INT TERM);
+                setpgrp 0, 0;   # so ^C reaches this whole build, once, via the
+                                # parent's handler rather than the terminal
+                chdir $work or die "$0: chdir $work: $!\n";
+                my $r = build_one($version, 1);
+                write_result($result, $r);
+                exit 0;
+            }
+            $kid{$pid} = { version => $version, work => $work,
+                           result => $result, log => $log };
+        }
+        last unless %kid;
+        my $pid = waitpid -1, 0;
+        last if $pid <= 0;
+        $reaper->($pid, $?);
+    }
+
+    if ($halt && @queue) {
+        print "-- --stop-on-fail: skipping @queue\n";
+    }
+    # report in version order, not completion order
+    my %by = map { $_->{version} => $_ } @out;
+    return map { $by{$_} } grep { $by{$_} } @order;
+}
+
+# --------------------------------------------------------------- main loop --
+
+my (@results, @skipped);
+my $t_all = time;
+
+my @queue;
+for my $version (@targets) {
+    if ($skip_old && defined $min_key && vkey($version) lt $min_key) {
+        printf "-- %s: SKIP (older than MIN_PERL_VERSION %s)\n", $version, $min_perl;
+        push @skipped, { version => $version, why => "< $min_perl" };
+        next;
+    }
+    push @queue, $version;
+}
+
+if ($par > 1 && @queue > 1) {
+    $in_parallel = 1;
+    $quiet       = 1; # N interleaved build logs on one terminal is noise
+    printf "-- %d perl(s), %d at a time%s; per-version output goes to the logs\n",
+        scalar @queue, $par, ($jobs ? " with make -j$jobs each" : '');
+    print "-- note: --deps shares one ~/.cpanm across the children; if a "
+        . "prerequisite install misbehaves, run once with -P 1 --deps first\n"
+        if $deps;
+    @results = run_parallel(@queue);
+}
+else {
+    @results = run_serial(@queue);
 }
 
 # ----------------------------------------------------------------- summary --
@@ -411,5 +656,9 @@ printf "%d/%d perl(s) passed%s in %.1fs.  Logs in %s\n",
     scalar(@results) - $bad, scalar(@targets) - scalar(@skipped),
     ($not_run ? " ($not_run not run)" : ''),
     time - $t_all, $log_dir;
+# every perl installed into its own site_perl, but nothing built here: say so,
+# because after a serial run the root held a tree built against the last perl.
+print "-- built in private trees; this directory is unbuilt (-P 1 to build here)\n"
+    if $in_parallel;
 
 exit($bad || $not_run ? 1 : 0);

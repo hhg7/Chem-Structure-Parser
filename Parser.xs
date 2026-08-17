@@ -425,6 +425,23 @@ static bool fld_nv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRL
 	return n ? str2nv(s, n, out) : 0;
 }
 
+/*charge_ok() -- columns 79-80 hold a digit and a sign, '1+' as the format
+writes it and '+1' as some programs do.  A file old enough to keep the entry id
+in columns 73-80 has the tail of it here instead, and 'DR' is not a charge, nor
+is '09'.  A field that is not one reads as the empty string a blank field would
+have given, which is the answer for "the file does not say".*/
+static bool charge_ok(const char *CSP_RESTRICT s, STRLEN n)
+{
+	STRLEN i, digits = 0, signs = 0;
+	if (n == 0 || n > 2) return 0;
+	for (i = 0; i < n; i++) {
+		if (s[i] >= '0' && s[i] <= '9') digits++;
+		else if (s[i] == '+' || s[i] == '-') signs++;
+		else return 0;
+	}
+	return digits <= 1 && signs <= 1;
+}
+
 /*guess_element() -- only when columns 77-78 are absent, which happens in
 files written before the element column existed and in files written by
 programs that should know better.
@@ -641,9 +658,17 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				STRLEN k;
 				if (ellen > 2) ellen = 2;
 				for (k = 0; k < ellen; k++) elbuf[k] = (char)toupper((unsigned char)s[k]);
-			} else {
-				ellen = guess_element(nm_raw, nm_rawlen, elbuf);
+				/*and not believed unless it spells an element.  A file written
+				before the element column existed keeps the entry id in columns
+				73-80 instead, so what sits where the element goes is '1G' and
+				every atom in pdb1gdr reads as element '1' -- which also stops
+				hydrogens => 0 from finding the hydrogens.  A field that is not
+				letters is not an element, and the atom name knows better.*/
+				for (k = 0; k < ellen; k++) {
+					if (!isALPHA(elbuf[k])) { ellen = 0; break; }
+				}
 			}
+			if (!ellen) ellen = guess_element(nm_raw, nm_rawlen, elbuf);
 			if (!keep_h && ellen == 1 && (elbuf[0] == 'H' || elbuf[0] == 'D')) { n_skipped++; continue; }
 
 			/*kept.  The residue boundary is settled first, before this atom has
@@ -697,6 +722,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				nm_n  = fld(line, llen, 12, 15, &nm_s);
 				alt_n = fld(line, llen, 16, 16, &alt_s);
 				chg_n = fld(line, llen, 78, 79, &chg_s);
+				if (!charge_ok(chg_s, chg_n)) chg_n = 0;
 
 				/*The sums and extremes are gathered here rather than in Perl
 				because they have to touch every atom whether or not the caller
@@ -1631,6 +1657,86 @@ static char *slurp(pTHX_ const char *restrict CSP_RESTRICT path, STRLEN *restric
 	return buf;
 }
 
+/*asking a parsed chain a question.
+
+Reading the hash of hashes back is Perl's job nine times in ten -- one lookup
+is one line of Perl and nothing to be gained by crossing into C for it.  A
+question asked once per chain of every chain of every file in a set is the
+exception: a structure with a dozen ions has more chains that are one ion than
+chains that are a polymer, and the loop that has to tell them apart runs the
+whole way down the set.
+
+Nothing here re-does chemistry, and nothing here consults it either: the answer
+is in the shape of the chain.*/
+
+/*the chain hash the caller means, from either shape of argument: a chain on
+its own, or the structure and a chain id.  Every wrong argument that has an
+obvious right one nearby says so, since the three hashes in a parsed structure
+-- structure, chain, residue -- all look alike from inside a hash reference and
+a false answer would be taken at face value.*/
+static HV *chain_arg(pTHX_ SV *CSP_RESTRICT first, SV *CSP_RESTRICT id, const char *CSP_RESTRICT who)
+{
+	HV *h;
+	if (!SvROK(first) || SvTYPE(SvRV(first)) != SVt_PVHV)
+		croak("%s: expected the chain hash reference from structure_info()", who);
+	h = (HV *)SvRV(first);
+	if (SvOK(id)) {
+		HE *he;
+		SV **p = hv_fetchs(h, "chains", 0);
+		if (!p || !*p || !SvROK(*p) || SvTYPE(SvRV(*p)) != SVt_PVHV)
+			croak("%s: expected the hash reference from structure_info()", who);
+		he = hv_fetch_ent((HV *)SvRV(*p), id, 0, 0);
+		if (!he || !SvROK(HeVAL(he)) || SvTYPE(SvRV(HeVAL(he))) != SVt_PVHV)
+			croak("%s: no chain '%s'", who, SvPV_nolen(id));
+		h = (HV *)SvRV(HeVAL(he));
+	}
+	//residue_order is what every chain has and nothing else in the structure does
+	if (!hv_exists(h, "residue_order", 13)) {
+		if (hv_exists(h, "chains", 6))
+			croak("%s: that is the whole structure, not a chain: pass one of $info->{chains}, or call %s($info, $chain)", who, who);
+		if (hv_exists(h, "atom_order", 10))
+			croak("%s: that is a residue, not a chain: a residue answers for itself, in $res->{type}", who);
+		croak("%s: expected the chain hash reference from structure_info()", who);
+	}
+	return h;
+}
+
+/*is_single_ion() -- true when a chain holds exactly one residue.
+
+An ion is often numbered into the chain it sits in -- the zinc of a zinc finger
+is residue 202 of chain A -- and just as often given a chain of its own, which
+is a chain with one residue in it and no sequence to read.  A caller walking
+chain_order wants those out of the way before it asks for a sequence or an
+alignment, and the count is the whole of the question: single means one residue
+in the chain, so a chain of two zincs is not one and a zinc numbered into a
+protein chain does not make that chain one.
+
+Single says nothing about how many atoms the residue has.  A sulphate is five
+atoms and a perchlorate is five different ones, and both are one residue, so
+both answer the same -- which they would not if the count were of atoms, and
+would not either if this asked whether the residue types as an ion.  That type
+comes off a table of names, and a table of names cannot be complete: SO4 is on
+the module's list and BF4 is not, and the difference between them is which ions
+someone got round to writing down, not anything about the file.  Counting
+residues asks nothing of the table and so cannot inherit its gaps.
+
+The residue is therefore not asked what it is, and the answer is about the shape
+of the chain rather than the chemistry in it: a chain that is one sugar, one
+buffer molecule, one water or one free amino acid answers true as well.  In a
+real file those are rare next to the ions and are the same nuisance to a caller
+walking chains -- one residue, no sequence -- but a caller who needs to tell
+them apart has it a lookup away, in the residue's own type.*/
+static bool chain_is_single_ion(pTHX_ HV *CSP_RESTRICT c)
+{
+	SV **p = hv_fetchs(c, "residue_order", 0);
+	if (!p || !*p || !SvROK(*p) || SvTYPE(SvRV(*p)) != SVt_PVAV) return 0;
+	/*residue_order rather than n_residues or the residues hash: it is the
+	chain's own list of what is in it, in the order the file had them, and
+	counting it needs no iterator reset that a caller mid-each() would feel.
+	av_len() is the last index, so 0 is one residue and -1 is none.*/
+	return av_len((AV *)SvRV(*p)) == 0;
+}
+
 MODULE = Chem::Structure::Parser		PACKAGE = Chem::Structure::Parser
 
 PROTOTYPES: DISABLE
@@ -1808,5 +1914,17 @@ res_type(name)
 		else if (ri.type == RT_WATER) t = "water";
 		else                          t = "other";
 		RETVAL = newSVpv(t, 0);
+	OUTPUT:
+		RETVAL
+
+bool
+is_single_ion(chain, id = &PL_sv_undef)
+	SV *chain
+	SV *id
+	CODE:
+		//two arguments mean the structure and a chain: an undefined id there is
+		//a chain that was not given, not a chain hash passed on its own
+		if (items > 1 && !SvOK(id)) croak("is_single_ion: no chain given");
+		RETVAL = chain_is_single_ion(aTHX_ chain_arg(aTHX_ chain, id, "is_single_ion"));
 	OUTPUT:
 		RETVAL

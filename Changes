@@ -41,3 +41,71 @@ Revision history for Chem-Structure-Parser
       n_skipped whatever the options were set to, and a structure read out of
       a 64-model ensemble can say that its 6,432 atoms are one model of
       411,648 rather than the whole file.  Both readers count it the same way.
+    - new: is_single_ion($chain), or is_single_ion($info, $chain), true when a
+      chain holds exactly one residue.  An ion given a chain of its own is a
+      chain with no sequence to read, and a structure with a dozen of them has
+      more of those chains than polymer ones, so the loop that puts them aside
+      is worth not writing by hand.  In XS, and single counts residues in the
+      chain: not atoms in the residue, so a sulphate and a perchlorate answer
+      the same, and not the residue's type, which comes off a table of names
+      that cannot be complete -- SO4 is on the module's ION list and BF4 is
+      not, and that is a fact about the list.  The residue is not asked what it
+      is, so a chain of one sugar or one water reads true as well; the residue
+      says which it is, in its own type.  A chain of two zincs is not one, and
+      neither is a protein chain with a zinc numbered into it.  Handing it the
+      whole structure with no chain id, or a residue, is fatal: all three are
+      hash references and a false answer would be taken at face value.
+    - fixed: SEQRES was read to the end of the line rather than to column 70.
+      An entry deposited before about 1996 keeps its id and a line number in
+      columns 73-80 of every record, and those became two more residues per
+      SEQRES line: pdb1gdr's 140-residue chain read as 162 residues with an X
+      every thirteenth place, which is a wrong sequence rather than a missing
+      one.  No file in the remediated archive is affected; the ones the archive
+      still distributes as deposited are.
+    - fixed: the element columns are no longer believed when they do not spell
+      an element.  The same files put part of the entry id in columns 77-78, so
+      every atom of pdb1gdr read as element '1' -- which also stopped
+      hydrogens => 0 from finding hydrogens, since the element is what says
+      which atoms those are.  A field that is not letters falls back to the
+      atom name, which the module already knows how to read.  Likewise the
+      charge columns: a charge is a digit and a sign, and 'DR' is not one, so
+      it reads as the empty string a blank field would have given.
+    - fixed: a HELIX length that is not a number now reads as empty rather
+      than as the text that was in columns 72-76.
+    - fixed: the text records -- TITLE, COMPND, SOURCE, KEYWDS, AUTHOR, EXPDTA,
+      JRNL -- are cut at column 72 when columns 73-80 hold nothing but the
+      entry id and a line number.  Text that is not the entry id is left alone,
+      so a title that really does run to column 80 is not truncated.
+    - fixed: a free-text COMPND or SOURCE is no longer thrown away.  A file
+      older than the MOL_ID convention writes 'COMPND    GAMMA DELTA RESOLVASE'
+      and names no chains, so the entry is the one molecule and every chain in
+      it gets it; $info->{compound}{1}{free_text} says the record was read that
+      way rather than parsed into tokens.
+    - fixed: an atom's altlocs list was missing the conformer that supplied the
+      coordinates when that record had no altloc letter.  disordered.pdb writes
+      ARG 27's CZ once with a blank altloc and once as B; the list held only
+      the B, so the occupancies of an atom summed to 0.5 and a caller writing
+      the conformers back out wrote one of two.
+    - resolution now falls back to REMARK 3's RESOLUTION RANGE HIGH when there
+      is no REMARK 2.  A file written by a refinement program rather than by
+      the archive often has the whole of REMARK 3 and no REMARK 2 at all, and
+      it is the same number the mmCIF reader already takes from
+      _refine.ls_d_res_high, so the two formats answer alike.  REMARK 2 still
+      wins where there is one, and a BIN RESOLUTION RANGE HIGH is never it.
+    - new: t/foreign.t, the cases that gemmi's and Biopython's own test
+      directories know about -- an atom whose first record has no altloc
+      letter, a coordinate line that stops early, the same record written
+      twice, a MODEL with no serial number, a serial number that spills out of
+      its columns, one residue modelled in two chemical states in mmCIF, the
+      element rules with no element columns, a resolution that is only in
+      REMARK 3, CRLF line endings, and CIFs that are not structures.
+    - new: t/data/pdb1gdr.ent, a 1993 entry that keeps its id in columns 73-80.
+    - new: t/oracle.t, which compares every atom of model 1 against gemmi --
+      chain, number, insertion code, name, altloc and coordinates, as a
+      multiset -- over t/data and a spread of STRUCTURE_INFO_TEST_DIR and
+      STRUCTURE_INFO_TEST_CIF_DIR.  t/real.t checks the C against a second
+      reader in Perl, which cannot catch a column both of them read wrongly
+      because one person wrote both.  It skips unless python3 can import gemmi.
+      Over 655 real structures the two agree atom for atom except where a
+      residue is modelled in two chemical states at once, which is one residue
+      here and two there.

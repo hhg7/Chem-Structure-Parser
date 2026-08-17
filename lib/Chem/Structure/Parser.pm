@@ -14,7 +14,7 @@ XSLoader::load('Chem::Structure::Parser', $VERSION);
 our @EXPORT_OK = qw(
 	structure_info structure_info_string pdb_info cif_info
 	structure_atoms structure_residues structure_ligands structure_sequences
-	chain_sequence structure_summary
+	chain_sequence structure_summary is_single_ion
 	aa3to1 aa1to3 res1 res_type formats h
 );
 our @EXPORT = @EXPORT_OK;
@@ -634,7 +634,13 @@ sub _assemble {
 					next;
 				}
 				# an alternate conformer: every one is kept on the atom, and
-				# the altloc option decides which supplies the coordinates
+				# the altloc option decides which supplies the coordinates.
+				# The one already there is put on the list first if it is not
+				# on it yet, which is the case where the first record of the
+				# pair had no altloc letter at all -- disordered.pdb writes
+				# ARG 27's CZ once with a blank altloc and once as B, and a
+				# list holding only the B is a list that has lost a conformer.
+				$have->{altlocs} ||= [ _conformer($have) ];
 				push @{ $have->{altlocs} }, _conformer($atom);
 				if ($o->{altloc} eq 'highest'
 				    && defined $atom->{occupancy} && defined $have->{occupancy}
@@ -818,6 +824,19 @@ sub _chain_type {
 # exist, so that everything about a chain is in one place
 sub _chain_stats {
 	my ($info) = @_;
+	# The free-text COMPND of an old file names no chains, so there was no
+	# chain to file it under when the header was read and there is one now: the
+	# entry is the one molecule and every chain in it is that molecule.  This is
+	# the only place a chain is added to entity_of_chain, because it is the only
+	# entity that could not say for itself which chains it means.
+	if (($info->{compound}{1} || {})->{free_text} && !%{ $info->{entity_of_chain} }) {
+		my $s = $info->{source}{1} || {};
+		$info->{entity_of_chain}{$_} = {
+			mol_id   => 1,
+			molecule => $info->{compound}{1}{molecule},
+			organism => $s->{organism_scientific},
+		} for @{ $info->{chain_order} };
+	}
 	for my $cid (@{ $info->{chain_order} }) {
 		my $c = $info->{chains}{$cid};
 		if (my $s = $info->{seqres}{$cid}) {
@@ -883,19 +902,23 @@ sub _parse_meta {
 			id_code        => _c($l, 62, 4),
 		};
 	}
+	# The entry id, for _untail(): the text records of an old file end in it, and
+	# it is the only thing that tells the stationery from the text.
+	my $eid = $info->{header}{id_code};
+
 	# a record that is not in the file reads as undef, not as an empty string:
 	# "there was no TITLE" and "the TITLE was blank" are different answers
-	$info->{title}      = $meta->{TITLE} ? _joined($meta->{TITLE}, 10) : undef;
-	$info->{caveat}     = _joined($meta->{CAVEAT}, 19) if $meta->{CAVEAT};
-	$info->{keywords}   = [ grep { length } map { _t($_) } split /,/, _joined($meta->{KEYWDS}, 10) ];
-	$info->{experiment} = [ grep { length } map { _t($_) } split /;/, _joined($meta->{EXPDTA}, 10) ];
-	$info->{authors}    = [ grep { length } map { _t($_) } split /,/, _joined($meta->{AUTHOR}, 10) ];
-	$info->{model_type} = _joined($meta->{MDLTYP}, 10) if $meta->{MDLTYP};
-	$info->{obsolete}   = _joined($meta->{OBSLTE}, 10) if $meta->{OBSLTE};
-	$info->{split}      = [ split ' ', _joined($meta->{SPLIT}, 10) ] if $meta->{SPLIT};
+	$info->{title}      = $meta->{TITLE} ? _joined($meta->{TITLE}, 10, $eid) : undef;
+	$info->{caveat}     = _joined($meta->{CAVEAT}, 19, $eid) if $meta->{CAVEAT};
+	$info->{keywords}   = [ grep { length } map { _t($_) } split /,/, _joined($meta->{KEYWDS}, 10, $eid) ];
+	$info->{experiment} = [ grep { length } map { _t($_) } split /;/, _joined($meta->{EXPDTA}, 10, $eid) ];
+	$info->{authors}    = [ grep { length } map { _t($_) } split /,/, _joined($meta->{AUTHOR}, 10, $eid) ];
+	$info->{model_type} = _joined($meta->{MDLTYP}, 10, $eid) if $meta->{MDLTYP};
+	$info->{obsolete}   = _joined($meta->{OBSLTE}, 10, $eid) if $meta->{OBSLTE};
+	$info->{split}      = [ split ' ', _joined($meta->{SPLIT}, 10, $eid) ] if $meta->{SPLIT};
 
-	$info->{compound} = _mol_records($meta->{COMPND}, 10);
-	$info->{source}   = _mol_records($meta->{SOURCE}, 10);
+	$info->{compound} = _mol_records($meta->{COMPND}, 10, 'molecule', $eid);
+	$info->{source}   = _mol_records($meta->{SOURCE}, 10, 'organism_scientific', $eid);
 	_entities($info);
 
 	for my $l (@{ $meta->{REVDAT} || [] }) {
@@ -912,7 +935,7 @@ sub _parse_meta {
 	for my $l (@{ $meta->{JRNL} || [] }) {
 		my $sub = lc _c($l, 12, 4);
 		next unless length $sub;
-		my $text = _c($l, 19);
+		my $text = _c(_untail($l, $eid), 19);
 		$info->{journal}{$sub} = length($info->{journal}{$sub} || '')
 			? _rejoin($info->{journal}{$sub}, $text)
 			: $text;
@@ -930,6 +953,21 @@ sub _parse_meta {
 	for my $l (@{ $info->{remarks}{2} || [] }) {
 		$info->{resolution} = $1 + 0 if $l =~ /RESOLUTION\.\s+($NUM)\s+ANGSTROM/;
 	}
+	# REMARK 3 says it too, as the high resolution limit of the refinement, and
+	# that is the one to fall back on: a file written by a refinement program
+	# rather than by the archive often has REMARK 3 and no REMARK 2 at all, and
+	# 5cvz_final.pdb reads as a structure of no resolution otherwise.  It is
+	# also the same number the mmCIF reader already takes from
+	# _refine.ls_d_res_high, so the two formats answer alike.  Anchored, because
+	# REMARK 3 also carries 'BIN RESOLUTION RANGE HIGH', which is a bin and not
+	# the structure.
+	if (!defined $info->{resolution}) {
+		for my $l (@{ $info->{remarks}{3} || [] }) {
+			next unless $l =~ /\ARESOLUTION RANGE HIGH\b[^:]*:\s*($NUM)/;
+			$info->{resolution} = $1 + 0;
+			last;
+		}
+	}
 	# anchored, because REMARK 3 also carries 'BIN FREE R VALUE' and
 	# 'ESTIMATED ERROR OF FREE R VALUE', which are not the R-free.  A value of
 	# NULL -- what an unrefined or pre-R-free structure has -- stays undef.
@@ -946,10 +984,16 @@ sub _parse_meta {
 	$info->{biological_assembly} = $info->{remarks}{350} if $info->{remarks}{350};
 
 	# SEQRES -- what was in the crystal, as opposed to what was modelled
+	#
+	# Thirteen residues to a line, columns 20 to 70, and no further: a file old
+	# enough to keep the entry id in columns 73-80 has '1GDR  81' sitting there,
+	# and reading to the end of the line makes two more residues out of it.
+	# pdb1gdr's 140-residue chain comes back 162 long that way, with an X every
+	# thirteenth place, which is a wrong sequence rather than a missing one.
 	for my $l (@{ $meta->{SEQRES} || [] }) {
 		my $cid = _c($l, 11, 1);
 		my $n   = _c($l, 13, 4);
-		my @res = split ' ', _c($l, 19);
+		my @res = split ' ', _c($l, 19, 51);
 		my $s = $info->{seqres}{$cid} ||= { chain => $cid, length => ($n =~ /\A\d+\z/ ? $n + 0 : undef), residues => [] };
 		push @{ $s->{residues} }, @res;
 	}
@@ -1022,6 +1066,13 @@ sub _parse_meta {
 	}
 
 	for my $l (@{ $meta->{HELIX} || [] }) {
+		# the length is a number or nothing.  A file that keeps its entry id in
+		# columns 73-80 puts '1GDR' where the length goes, and a caller adding
+		# lengths up has no way to tell that from a length.  Empty rather than
+		# undef, because empty is what every other column of a short record
+		# gives and a helix should not answer two ways about the same absence.
+		my $hlen = _c($l, 71, 5);
+		$hlen = '' unless defined _n($hlen);
 		push @{ $info->{helix} }, {
 			id            => _c($l, 11, 3),
 			init_resname  => _c($l, 15, 3),
@@ -1031,7 +1082,7 @@ sub _parse_meta {
 			end_chain     => _c($l, 31, 1),
 			end_resseq    => _c($l, 33, 4),
 			class         => _c($l, 38, 2),
-			length        => _c($l, 71, 5),
+			length        => $hlen,
 		};
 	}
 	for my $l (@{ $meta->{SHEET} || [] }) {
@@ -1100,9 +1151,9 @@ sub _parse_meta {
 
 # COMPND and SOURCE are "TOKEN: value;" lists broken into MOL_ID groups
 sub _mol_records {
-	my ($lines, $from) = @_;
+	my ($lines, $from, $free_key, $entry_id) = @_;
 	return {} unless $lines;
-	my $text = _joined($lines, $from);
+	my $text = _joined($lines, $from, $entry_id);
 	my %mol;
 	my $id = 1;
 	for my $piece (split /;/, $text) {
@@ -1123,6 +1174,17 @@ sub _mol_records {
 		} else {
 			$mol{$id}{$k} = exists $mol{$id}{$k} ? "$mol{$id}{$k} $v" : $v;
 		}
+	}
+	# A file older than the MOL_ID convention writes the record as free text --
+	# 'COMPND    GAMMA DELTA RESOLVASE', 'SOURCE    (ESCHERICHIA COLI)' -- and a
+	# reader that knows only about 'MOLECULE:' throws away the one thing the
+	# record says.  There is no chain list in that form because there was
+	# nothing to distinguish: the whole entry is the one molecule, which is what
+	# free_text says and what _chain_stats() does with it.
+	if (!%mol && $free_key && $text =~ /\S/) {
+		my $v = _t($text);
+		$v =~ s/\A\((.*)\)\z/$1/;    # SOURCE used to parenthesise the organism
+		%mol = (1 => { mol_id => 1, $free_key => $v, free_text => 1 });
 	}
 	return \%mol;
 }
@@ -1607,15 +1669,31 @@ sub _n {
 # KEYWDS breaks "COMPLEX (HORMONE-" / "RECEPTOR)" across lines -- so it joins
 # without a space; anything else takes one.
 sub _joined {
-	my ($lines, $from) = @_;
+	my ($lines, $from, $id) = @_;
 	return '' unless $lines && @$lines;
 	my $out = '';
 	for my $l (@$lines) {
-		my $t = _c($l, $from);
+		my $t = _c(_untail($l, $id), $from);
 		next unless length $t;
 		$out = _rejoin($out, $t);
 	}
 	return $out;
+}
+
+# The text records run to the end of the line, and in a file old enough to keep
+# its entry id in columns 73-80 the end of the line is '1GDR   3'.  Given the id
+# the HEADER carried, a line whose columns 73-80 hold nothing but that id and a
+# line number is cut there: 'GAMMA DELTA RESOLVASE' is the compound and the id
+# is the stationery.  Nothing else is cut -- a modern file uses those columns
+# for text, and text is not the entry id followed by a number -- so a title that
+# runs to column 80 is left alone.
+sub _untail {
+	my ($line, $id) = @_;
+	return $line unless defined $line && defined $id && length $id;
+	return $line unless length($line) > 72 && $id =~ /\A\w{1,4}\z/;
+	return substr($line, 72) =~ /\A\s*\Q$id\E(?:\s+\d+)?\s*\z/i
+		? substr($line, 0, 72)
+		: $line;
 }
 
 sub _rejoin {
@@ -1785,7 +1863,8 @@ it in.
     title       TITLE / _struct.title
     header      { classification, deposit_date, id_code }
     experiment  [ 'X-RAY DIFFRACTION' ]     (EXPDTA / _exptl.method)
-    resolution  2.6                         (REMARK 2 / _refine.ls_d_res_high)
+    resolution  2.6                (REMARK 2, then REMARK 3's RESOLUTION RANGE
+                                    HIGH / _refine.ls_d_res_high)
     r_work      0.196                       (REMARK 3 / _refine.ls_R_factor_R_work)
     r_free      0.278                       (REMARK 3 / _refine.ls_R_factor_R_free)
     keywords    [ ... ]                     (KEYWDS / _struct_keywords.text)
@@ -1873,7 +1952,10 @@ An atom:
     x y z       occupancy    bfactor       altloc   hetero
     altlocs   [ { altloc, x, y, z, occupancy, bfactor }, ... ]
               present only when the atom has alternate conformers; every
-              conformer is listed, including the one chosen above
+              conformer is listed, including the one chosen above, and one of
+              them having no altloc letter at all does not take it off the
+              list -- disordered.pdb writes ARG 27's CZ once with a blank
+              altloc and once as B, and both are conformers of one atom
 
 Options:
 
@@ -1955,6 +2037,53 @@ references that are in the nested structure.
 
 The heterogens that are neither water nor part of the polymer, keyed by
 residue name, chain and number.
+
+=head2 is_single_ion
+
+    is_single_ion($info->{chains}{E});     # 1     a chain that is one zinc
+    is_single_ion($info, 'E');             # 1     the same, by chain id
+    is_single_ion($info->{chains}{A});     # ''    a chain with a polymer in it
+
+    my @polymers = grep { !is_single_ion($info, $_) } @{ $info->{chain_order} };
+
+True when a chain holds exactly one residue.  An ion is often numbered into the
+chain it sits in -- the zinc of a zinc finger is residue 202 of chain A -- and
+just as often given a chain of its own, which is a chain with one residue in it
+and no sequence to read.  This is for the second kind, so that a loop over
+C<chain_order> can put them aside before it asks the rest for a sequence.
+
+C<single> counts residues in the chain, and nothing else:
+
+    a chain that is one CL                  # 1
+    a chain that is one SO4, five atoms     # 1
+    a chain that is one BF4, five atoms     # 1
+    a chain of two zincs                    # ''
+    a protein chain with a zinc in it       # ''
+
+So the number of atoms in the residue does not come into it, and a sulphate and
+a perchlorate answer the same.  Neither does the residue's C<type>: that comes
+off a table of names, and a table of names cannot be complete -- SO4 is on the
+module's list and BF4 is not, which is a fact about who wrote the list down and
+not about the file.  Counting residues asks the table nothing.
+
+The residue is therefore not asked what it is, and a chain that is one sugar,
+one buffer molecule, one water or one free amino acid reads true as well.  In a
+real file those are rare next to the ions and are the same nuisance to a caller
+walking chains, but where the difference matters it is a lookup away:
+
+    my $c = $info->{chains}{E};
+    my $r = $c->{residues}{ $c->{residue_order}[0] };
+    $r->{type} eq 'ion';        # ion, ligand, water, amino_acid, nucleotide
+    $r->{resname};              # 'ZN'
+
+L</res_type> is where those types come from, and C<< $c->{type} eq 'water' >> is
+the narrower question about a chain of nothing but waters.
+
+The argument is either one chain -- C<< $info->{chains}{$id} >>, or a chain out
+of C<< $info->{models} >> -- or the structure and a chain id, which is the same
+question written the way L</chain_sequence> takes it.  Handing it the whole
+structure without an id, or a residue, is fatal rather than false: all three
+are hash references, and a wrong answer there would be taken at face value.
 
 =head2 structure_sequences
 
@@ -2109,6 +2238,35 @@ whose SEQRES is 309 long.  Those are flagged C<< free => 1 >> and typed as
 ligands.
 
 Neither is a rule the format states; both are what the format means.
+
+=head1 FILES THAT KEEP THEIR ENTRY ID IN COLUMNS 73-80
+
+An entry deposited before about 1996 carried its id and a line number in the
+last eight columns of every record, and the archive still distributes those
+files as they were deposited.  Every field a reader takes to the end of the line
+is wrong on one of them, and wrong in a way nothing downstream can see: the
+SEQRES of a 140-residue chain comes back 162 long with an C<X> every thirteenth
+place, the compound is the compound with C<1GDR   3> after it, HELIX reports a
+length of C<1GDR>, and columns 77-78 make 105 atoms of element C<1> -- which
+also stops C<< hydrogens => 0 >> from finding any hydrogens, since it is the
+element that says which atoms those are.
+
+So the columns are read as columns.  SEQRES takes 20-70 and no more; an element
+field that is not letters is not an element and the atom name is used instead;
+a charge field that is not a digit and a sign reads as the empty string a blank
+one would have given; a HELIX length that is not a number reads as empty; and a
+text record whose columns 73-80 hold nothing but the entry id and a line number
+is cut there -- text that is not the entry id is left alone, so a title that
+really does run to column 80 is not truncated.
+
+COMPND and SOURCE predate the MOL_ID convention in a file like this and are free
+text: C<COMPND    GAMMA DELTA RESOLVASE>.  There is no chain list in that form
+because there was nothing to distinguish, so the entry is the one molecule and
+every chain in it gets it, and C<< $info->{compound}{1}{free_text} >> is 1 to
+say the record was read that way rather than parsed into tokens.
+
+F<t/data/pdb1gdr.ent> is one such file, a 1993 entry, and F<t/foreign.t> reads
+it.
 
 =head1 WHAT IS PARSED IN C, AND WHY
 

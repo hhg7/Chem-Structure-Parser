@@ -105,7 +105,7 @@ key:
 | `title` | `TITLE` | `_struct.title` |
 | `id` | `HEADER` | `_entry.id` |
 | `experiment` | `EXPDTA` | `_exptl.method` |
-| `resolution` | `REMARK 2` | `_refine.ls_d_res_high` |
+| `resolution` | `REMARK 2`, then `REMARK 3` | `_refine.ls_d_res_high` |
 | `r_work`, `r_free` | `REMARK 3` | `_refine.ls_R_factor_R_*` |
 | `keywords` | `KEYWDS` | `_struct_keywords.text` |
 | `authors` | `AUTHOR` | `_audit_author` |
@@ -351,7 +351,9 @@ $info
     │       │       │                      bfactor }, ... ]
     │       │       │                  present only when the atom has
     │       │       │                  alternate conformers; every conformer
-    │       │       │                  is listed, the chosen one included
+    │       │       │                  is listed, the chosen one included,
+    │       │       │                  and one of them having no letter at
+    │       │       │                  all does not take it off the list
     │       │       └── ...    N, C, O, CB, CG, CD1, CD2, CE1, CE2, CZ
     │       └── ...            1 .. 191, then the waters at 512 .. 574
     └── B                      the same again: 235 residues, 1621 atoms
@@ -506,6 +508,53 @@ The heterogens that are neither water nor part of the polymer, keyed by
 residue name, chain and number — which is what a binding-site table wants as
 its row label.
 
+## is_single_ion
+
+    is_single_ion($info->{chains}{E});     # 1     a chain that is one zinc
+    is_single_ion($info, 'E');             # 1     the same, by chain id
+    is_single_ion($info->{chains}{A});     # ''    a chain with a polymer in it
+
+    my @polymers = grep { !is_single_ion($info, $_) } @{ $info->{chain_order} };
+
+True when a chain holds exactly one residue. An ion is often numbered into the
+chain it sits in — the zinc of a zinc finger is residue 202 of chain A — and
+just as often given a chain of its own, which is a chain with one residue in it
+and no sequence to read. This is for the second kind, so that a loop over
+`chain_order` can put them aside before it asks the rest for a sequence.
+
+`single` counts residues in the chain, and nothing else:
+
+    a chain that is one CL                  # 1
+    a chain that is one SO4, five atoms     # 1
+    a chain that is one BF4, five atoms     # 1
+    a chain of two zincs                    # ''
+    a protein chain with a zinc in it       # ''
+
+So the number of atoms in the residue does not come into it, and a sulphate and
+a perchlorate answer the same. Neither does the residue's `type`: that comes off
+a table of names, and a table of names cannot be complete — SO4 is on the
+module's list and BF4 is not, which is a fact about who wrote the list down and
+not about the file. Counting residues asks the table nothing.
+
+The residue is therefore not asked what it is, and a chain that is one sugar,
+one buffer molecule, one water or one free amino acid reads true as well. In a
+real file those are rare next to the ions and are the same nuisance to a caller
+walking chains, but where the difference matters it is a lookup away:
+
+    my $c = $info->{chains}{E};
+    my $r = $c->{residues}{ $c->{residue_order}[0] };
+    $r->{type} eq 'ion';        # ion, ligand, water, amino_acid, nucleotide
+    $r->{resname};              # 'ZN'
+
+`res_type` is where those types come from, and `$c->{type} eq 'water'` is the
+narrower question about a chain of nothing but waters.
+
+The argument is either one chain — `$info->{chains}{$id}`, or a chain out of
+`$info->{models}` — or the structure and a chain id, which is the same question
+written the way `chain_sequence()` takes it. Handing it the whole structure
+without an id, or a residue, is fatal rather than false: all three are hash
+references, and a wrong answer there would be taken at face value.
+
 ## structure_sequences
 
     my $seq  = structure_sequences($info);          # { A => 'FPTIPLSRL...' }
@@ -634,6 +683,34 @@ chain whose SEQRES is 309 long. Those are flagged `free => 1` and typed as
 ligands.
 
 Neither is a rule the format states; both are what the format means.
+
+# Files that keep their entry id in columns 73-80
+
+An entry deposited before about 1996 carried its id and a line number in the
+last eight columns of every record, and the archive still distributes those
+files as they were deposited. Every field a reader takes to the end of the line
+is wrong on one of them, and wrong in a way nothing downstream can see: the
+SEQRES of a 140-residue chain comes back 162 long with an `X` every thirteenth
+place, the compound is the compound with `1GDR   3` after it, `HELIX` reports a
+length of `1GDR`, and columns 77-78 make 105 atoms of element `1` — which also
+stops `hydrogens => 0` from finding any hydrogens, since it is the element that
+says which atoms those are.
+
+So the columns are read as columns. SEQRES takes 20-70 and no more; an element
+field that is not letters is not an element and the atom name is used instead;
+a charge field that is not a digit and a sign reads as the empty string a blank
+one would have given; a `HELIX` length that is not a number reads as empty; and
+a text record whose columns 73-80 hold nothing but the entry id and a line
+number is cut there — text that is not the entry id is left alone, so a title
+that really does run to column 80 is not truncated.
+
+`COMPND` and `SOURCE` predate the `MOL_ID` convention in a file like this and
+are free text: `COMPND    GAMMA DELTA RESOLVASE`. There is no chain list in that
+form because there was nothing to distinguish, so the entry is the one molecule
+and every chain in it gets it, and `$info->{compound}{1}{free_text}` is 1 to say
+the record was read that way rather than parsed into tokens.
+
+`t/data/pdb1gdr.ent` is one such file, a 1993 entry, and `t/foreign.t` reads it.
 
 # Author
 

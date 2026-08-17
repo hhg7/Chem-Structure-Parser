@@ -101,6 +101,10 @@ no_leaks_ok { structure_info("$data/empty.cif") } 'nor does an empty one';
 	no_leaks_ok { structure_sequences($info) } 'structure_sequences does not leak';
 	no_leaks_ok { structure_summary($info) }   'structure_summary does not leak';
 	no_leaks_ok { eval { structure_atoms($info, 'Z') } } 'a failed view does not leak';
+	no_leaks_ok { is_single_ion($info, 'A'); is_single_ion($info->{chains}{B}) }
+		'is_single_ion does not leak: it reads the hash and takes nothing from it';
+	no_leaks_ok { eval { is_single_ion($info) }; eval { is_single_ion($info, 'Z') } }
+		'nor do its complaints';
 }
 
 #--------
