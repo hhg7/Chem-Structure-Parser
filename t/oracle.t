@@ -11,6 +11,18 @@
 # atom name, alternate location, and the three coordinates -- as a multiset, so
 # a file the two disagree about says which atoms and not merely how many.
 #
+# It needs nothing installed.  gemmi is not something a distribution can
+# require, so what gemmi answered for every structure in t/data is frozen in
+# t/data/oracle.txt -- written by t/data/oracle.pl from t/data/oracle.py -- and
+# that is what the comparison reads.  An installer with no python still runs
+# the whole of it, over every atom of every fixture.
+#
+# Where python3 can import gemmi, two more things happen: the frozen answer is
+# checked against the live one, so a fixture cannot be changed out from under
+# it, and the comparison is extended to a spread of STRUCTURE_INFO_TEST_DIR and
+# STRUCTURE_INFO_TEST_CIF_DIR, the same directories the rest of the suite
+# reads.  Set STRUCTURE_INFO_PYTHON to a python that has gemmi.
+#
 # Two differences are expected and are not failures, because both readings are
 # defensible and this module documents which it takes:
 #
@@ -22,59 +34,68 @@
 #
 #   * a file with no CRYST1 has no cell here and a 1x1x1 cell in gemmi, which
 #     is gemmi's default rather than the file's answer.
-#
-# It runs when python3 can import gemmi -- 'pip install gemmi' -- and skips
-# when it cannot, so the distribution builds on a machine without it.  The
-# structures are t/data, plus a spread of STRUCTURE_INFO_TEST_DIR and
-# STRUCTURE_INFO_TEST_CIF_DIR when those are set, the same directories the rest
-# of the suite reads.
 require 5.010;
 use strict;
 use warnings FATAL => 'all';
 use Cwd 'abs_path';
 use File::Basename 'dirname';
 use File::Spec;
-use File::Temp 'tempdir';
 use Chem::Structure::Parser;
 use Test::More;
 
-my $py = $ENV{STRUCTURE_INFO_PYTHON} || 'python3';
-my $has = do {
-	no warnings 'exec';
-	system("$py -c 'import gemmi' >/dev/null 2>&1") == 0;
-};
-plan skip_all => "$py cannot import gemmi" unless $has;
-
 my $data = dirname(abs_path(__FILE__)) . '/data';
-my $tmp  = tempdir(CLEANUP => 1);
+my $py   = $ENV{STRUCTURE_INFO_PYTHON} || 'python3';
+my $dump = "$data/oracle.py";
+# Double quotes and File::Spec->devnull rather than 'import gemmi' and
+# /dev/null: the frozen half below runs everywhere now, so this probe is
+# reached on a shell that does not take a single quote either.
+my $live = do {
+	no warnings 'exec';
+	my $null = File::Spec->devnull;
+	system(qq($py -c "import gemmi" >$null 2>&1)) == 0;
+};
 
-# --- the other reader ------------------------------------------------------
+# --- the other reader
 #
 # One line per atom of model 1, sorted, so that the comparison does not depend
 # on either reader's idea of the order.  The residue name is on the line too,
-# but as its own field, for the microheterogeneity check below.
-my $script = "$tmp/dump.py";
-open my $out, '>', $script or die "$script: $!";
-print $out <<'PY';
-import sys
-import gemmi
+# but as its own field, for the microheterogeneity check below.  Both the live
+# output of t/data/oracle.py and the frozen copy of it are read here, so the
+# two cannot be read as answers to different questions.
+sub gemmi_parse {
+	my ($lines) = @_;
+	my %info = (rows => [], models => '', resolution => '', spacegroup => '');
+	for my $l (@$lines) {
+		# the blank line a structure with no atoms prints, and the '# ' notes
+		# the frozen file carries, which a '#field value' line is not
+		next if !length $l || $l =~ /\A\#(?!\w)/;
+		if ($l =~ /\A\#(\w+) ?(.*)\z/) { $info{$1} = $2; next }
+		push @{ $info{rows} }, $l;
+	}
+	return \%info;
+}
 
-st = gemmi.read_structure(sys.argv[1])
-rows = []
-if len(st):
-    for chain in st[0]:
-        for res in chain:
-            for at in res:
-                alt = '' if at.altloc in ('', '\x00') else at.altloc
-                rows.append('%s|%d|%s|%s|%s|%.3f|%.3f|%.3f|%s' % (
-                    chain.name, res.seqid.num, res.seqid.icode.strip(),
-                    at.name, alt, at.pos.x, at.pos.y, at.pos.z, res.name))
-print('\n'.join(sorted(rows)))
-print('#models %d' % len(st))
-print('#resolution %s' % (st.resolution or ''))
-print('#spacegroup %s' % (st.spacegroup_hm or ''))
-PY
-close $out;
+# what gemmi said, when t/data/oracle.pl was last run: file name => what
+# gemmi_parse() makes of its section, or undef for a file gemmi refused.
+sub read_frozen {
+	my ($path) = @_;
+	open my $fh, '<', $path or die "$path: $!\nrun t/data/oracle.pl\n";
+	my (%by_file, $name, @lines, %refused);
+	while (defined(my $l = <$fh>)) {
+		chomp $l;
+		if ($l =~ /\A== (\S+)(?: (refused))?\z/) {
+			$by_file{$name} = [ @lines ] if defined $name;
+			($name, @lines) = ($1);
+			$refused{$name} = 1 if $2;
+			next;
+		}
+		push @lines, $l if defined $name;
+	}
+	$by_file{$name} = [ @lines ] if defined $name;
+	return map {
+		$_ => $refused{$_} ? undef : gemmi_parse($by_file{$_})
+	} keys %by_file;
+}
 
 sub gemmi_read {
 	my ($file) = @_;
@@ -85,21 +106,16 @@ sub gemmi_read {
 	# '90' that the entry id leaves in the charge columns.
 	open my $fh, '-|' or do {
 		open STDERR, '>', File::Spec->devnull or exit 1;
-		exec $py, $script, $file or exit 1;
+		exec $py, $dump, $file or exit 1;
 	};
 	my @lines = <$fh>;
 	close $fh;
 	return undef if $?;
 	chomp @lines;
-	my %info = (rows => []);
-	for my $l (@lines) {
-		if ($l =~ /\A\#(\w+) ?(.*)\z/) { $info{$1} = $2; next }
-		push @{ $info{rows} }, $l if length $l;
-	}
-	return \%info;
+	return gemmi_parse(\@lines);
 }
 
-# --- this one --------------------------------------------------------------
+# --- this one
 sub ours {
 	my ($info) = @_;
 	my @rows;
@@ -136,16 +152,15 @@ sub key { my $r = shift; $r =~ s/\|[^|]*\z//; return $r }
 sub _few { return @_ > 5 ? (@_[0 .. 4], sprintf('... and %d more', @_ - 5)) : @_ }
 
 sub compare {
-	my ($file) = @_;
-	my $them = gemmi_read($file);
+	my ($file, $them) = @_;
+	my $name = $file;
+	$name =~ s{.*/}{};
 	if (!$them) {
-		note("gemmi would not read $file; skipped");
+		note("gemmi would not read $name; skipped");
 		return;
 	}
 	my $info = structure_info($file);
 	my $us   = ours($info);
-	my $name = $file;
-	$name =~ s{.*/}{};
 	# gemmi reads the atom name out of _atom_site.label_atom_id, so an mmCIF
 	# written with the auth_* names alone -- which t/data/quirks.cif is, on
 	# purpose -- gives it no atoms at all.  Nothing to compare against is not a
@@ -200,9 +215,41 @@ sub compare {
 	}
 }
 
-# --- what to read ----------------------------------------------------------
-my @files = grep { -f } map { "$data/$_" } qw(mini.pdb mini.cif nmr.pdb nmr.cif
-                                              quirks.cif pdb1gdr.ent);
+# --- t/data, out of the frozen answers
+my %frozen = read_frozen("$data/oracle.txt");
+
+opendir(my $dh, $data) or die "$data: $!";
+my @here = sort grep { /\.(?:pdb|ent|cif|mmcif)\z/ } readdir $dh;
+closedir $dh;
+is_deeply([ sort keys %frozen ], \@here,
+	't/data/oracle.txt has gemmi\'s answer for every structure in t/data')
+	or diag('  run t/data/oracle.pl');
+
+diag(sprintf 'comparing %d structures against gemmi\'s frozen answer', scalar @here);
+compare("$data/$_", $frozen{$_}) for @here;
+
+# --- and against gemmi itself, where there is one
+if (!$live) {
+	note("$py cannot import gemmi; the frozen answers above are all of it");
+	done_testing();
+	exit 0;
+}
+
+# The frozen file is written by hand-run generator and the fixtures it describes
+# are not, so it is the half that can go stale: a fixture regenerated without
+# re-running t/data/oracle.pl would leave the comparison above checking this
+# module against an answer to an older file, and passing.
+for my $f (@here) {
+	my $now = gemmi_read("$data/$f");
+	if (!defined $frozen{$f} || !defined $now) {
+		ok(!defined $frozen{$f} && !defined $now,
+			"$f: gemmi still " . (defined $frozen{$f} ? 'reads' : 'refuses') . ' it')
+			or diag('  run t/data/oracle.pl');
+		next;
+	}
+	is_deeply($now, $frozen{$f}, "$f: t/data/oracle.txt is still what gemmi says")
+		or diag('  run t/data/oracle.pl');
+}
 
 sub spread {
 	my ($dir, $want, $re) = @_;
@@ -217,10 +264,10 @@ sub spread {
 }
 
 my $want = $ENV{STRUCTURE_INFO_TEST_ALL} ? 1e6 : 15;
-push @files, spread($ENV{STRUCTURE_INFO_TEST_DIR}, $want, qr/\.(pdb|ent)(\.gz)?\z/);
+my @files = spread($ENV{STRUCTURE_INFO_TEST_DIR}, $want, qr/\.(pdb|ent)(\.gz)?\z/);
 push @files, spread($ENV{STRUCTURE_INFO_TEST_CIF_DIR}, $want, qr/\.(cif|mmcif)(\.gz)?\z/);
 
-diag(sprintf 'comparing %d structures against gemmi', scalar @files);
-compare($_) for @files;
+diag(sprintf 'comparing %d structures against gemmi itself', scalar @files);
+compare($_, gemmi_read($_)) for @files;
 
 done_testing();

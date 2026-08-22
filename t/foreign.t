@@ -29,7 +29,7 @@ use Test::More;
 
 my $data = dirname(abs_path(__FILE__)) . '/data';
 
-# --- a file that keeps its entry id in columns 73-80 -----------------------
+# a file that keeps its entry id in columns 73-80
 #
 # Before 1996 every record of an entry carried the id and a line number in its
 # last eight columns, and the archive still distributes the files that were
@@ -90,7 +90,7 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 	is($i->{chains}{''}{n_missing}, 35, 'and it knows what SEQRES has that it does not');
 }
 
-# --- the same file name rule, without the file -----------------------------
+# --- the same file name rule, without the file
 {
 	# _id_from strips the archive's 'pdb' prefix and the '.ent' from a file
 	# named the way the archive names them, which is how pdb1gdr.ent would have
@@ -99,7 +99,7 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 	is($i->{id}, undef, 'a string has no name to take an id from');
 }
 
-# --- an atom whose first record has no altloc letter -----------------------
+# --- an atom whose first record has no altloc letter
 #
 # Biopython's Tests/PDB/disordered.pdb writes ARG 27's CZ twice: once with a
 # blank altloc column and once as B.  Both are conformers of one atom, and a
@@ -149,7 +149,7 @@ PDB
 	is(scalar @{ $cz->{altlocs} }, 2, 'and the one it beat is still on the list');
 }
 
-# --- a coordinate line that stops early ------------------------------------
+# --- a coordinate line that stops early
 #
 # Biopython's Tests/PDB/occupancy.pdb has a line cut off after the z
 # coordinate, which it says is what some programs write.  Occupancy and
@@ -170,7 +170,7 @@ PDB
 	is($i->{stats}{bfactor}{n}, 2, 'and the B-factor statistics count what there was');
 }
 
-# --- the same record twice -------------------------------------------------
+# --- the same record twice
 #
 # Biopython's Tests/PDB/a_structure.pdb repeats records to see what a reader
 # does with them: an atom written twice identically, and a residue whose second
@@ -192,7 +192,7 @@ PDB
 	is($i->{stats}{n_atoms}, 5, 'as they are in the file total');
 }
 
-# --- MODEL with no serial number, and atoms outside it ---------------------
+# --- MODEL with no serial number, and atoms outside it
 #
 # a_structure.pdb opens with a bare 'MODEL' and closes it, then goes on with
 # 880 more atoms that are in no model at all.  There is no reading of that
@@ -210,7 +210,7 @@ PDB
 	is($i->{stats}{total_atoms}, 2, 'which is what the file has');
 }
 
-# --- a serial number that spills out of its columns ------------------------
+# --- a serial number that spills out of its columns -----
 #
 # a_structure.pdb writes one atom as 'ATOM 111757', which puts the seventh
 # digit in column 12 and the first in column 6 -- so columns 1-6 are 'ATOM 1'
@@ -226,7 +226,7 @@ PDB
 	is($i->{records}{'ATOM 1'}, 1, 'and it is counted under the name it does have');
 }
 
-# --- one residue in two chemical states, in mmCIF -------------------------
+# --- one residue in two chemical states, in mmCIF ------
 #
 # 3JQH writes residue 1 as PRO in altloc A and SER in altloc B, and 1pfe writes
 # a cysteine as N2C and NCY: one position modelled in two chemical states at
@@ -276,7 +276,7 @@ CIF
 	is($i->{chains}{A}{sequence}, 'P', 'the sequence has one residue in it, not two');
 }
 
-# --- the element rules, with no element columns ---------------------------
+# --- the element rules, with no element columns --------
 #
 # Files written before columns 77-78 existed, and files written by programs
 # that ignore them, leave the atom name as the only evidence.  a_structure.pdb
@@ -314,7 +314,7 @@ CIF
 	is_deeply($i->{chains}{A}{elements}, { XX => 1 }, 'in the chain as well as the structure');
 }
 
-# --- a resolution that is only in REMARK 3 --------------------------------
+# a resolution that is only in REMARK 3
 #
 # gemmi's tests/5cvz_final.pdb is a refinement program's output: it has the
 # whole of REMARK 3 and no REMARK 2 at all.  The high resolution limit of the
@@ -345,7 +345,7 @@ PDB
 	is($i->{resolution}, 2.6, 'REMARK 2 wins where the file has one');
 }
 
-# --- line endings ---------------------------------------------------------
+# --- line endings 
 #
 # gemmi keeps tests/eol-test.cif for this.  A file that came through a Windows
 # machine is read the same as one that did not.
@@ -364,7 +364,7 @@ PDB
 	is($ca->{charge}, '', 'nor is the field after it');
 }
 
-# --- a CIF that is not a structure ---------------------------------------
+# --- a CIF that is not a structure -
 #
 # gemmi's tests/ has several: HEM.cif and SO3.cif are chemical component
 # definitions, 2013551.cif is a small-molecule CIF out of the COD, and
@@ -403,7 +403,7 @@ CIF
 	is(scalar @{ $cod->{chain_order} }, 0, 'and no chains come out of it');
 }
 
-# --- what a chain of one residue is -------------------------------------
+# --- what a chain of one residue is ------------------
 #
 # gemmi's tests/5wkd.pdb and ions.pdb in Biopython's suite are both mostly
 # this: an ion given a chain of its own, which a loop over chain_order asking
