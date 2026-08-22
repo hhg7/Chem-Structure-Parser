@@ -79,7 +79,12 @@ sub gemmi_parse {
 # gemmi_parse() makes of its section, or undef for a file gemmi refused.
 sub read_frozen {
 	my ($path) = @_;
-	open my $fh, '<', $path or die "$path: $!\nrun t/data/oracle.pl\n";
+	# BAIL_OUT rather than die: a die here exits with ENOENT and prove reports
+	# only 'Dubious, test returned 2', which says nothing about which file is
+	# missing.  The frozen answer is not optional -- skipping instead would be a
+	# cross-validation test that silently never runs.
+	open my $fh, '<', $path
+		or BAIL_OUT("$path: $!; run t/data/oracle.pl to write it");
 	my (%by_file, $name, @lines, %refused);
 	while (defined(my $l = <$fh>)) {
 		chomp $l;
