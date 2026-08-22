@@ -3,14 +3,14 @@
 # same files MANIFEST.SKIP keeps out of a release.
 
 # XS build products
-Info.c
-Info.bs
+Parser.c
+Parser.bs
 *.o
 *.a
 *.so
 *.dylib
 *.dll
-Info.def
+Parser.def
 
 # ExtUtils::MakeMaker
 Makefile
@@ -21,7 +21,10 @@ pm_to_blib
 blibdirs
 blib/
 
+# md2pod.pl, which writes it beside the POD half of lib/Chem/Structure/Parser.pm
+read.me.pod
+
 # Dist::Zilla
 .build/
-Structure-Info-*/
-Structure-Info-*.tar.gz
+Chem-Structure-Parser-*/
+Chem-Structure-Parser-*.tar.gz

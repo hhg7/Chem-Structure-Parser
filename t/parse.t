@@ -31,7 +31,7 @@ is_deeply($p->{resname}, [ 'MET', 'MET', 'MET', 'ZN' ], 'residue name, columns 1
 is_deeply($p->{chain},   [ ('A') x 4 ],                 'chain id, column 22');
 is_deeply($p->{resseq},  [ 1, 1, 1, 202 ],              'residue number, columns 23-26');
 is_deeply($p->{icode},   [ ('') x 4 ],                  'insertion code, column 27');
-is_deeply($p->{element}, [ 'N', 'C', 'C', 'ZN' ],       'element, columns 77-78');
+is_deeply($p->{element}, [ 'N', 'C', 'C', 'Zn' ],       'element, columns 77-78');
 is_deeply($p->{charge},  [ '', '', '', '2+' ],          'charge, columns 79-80');
 is_deeply($p->{het},     [ 0, 0, 0, 1 ],                'ATOM and HETATM are told apart');
 is_deeply($p->{model},   [ (1) x 4 ],                   'a file with no MODEL record is model 1');
@@ -141,7 +141,7 @@ for my $case (
 		'HETATM    4 FE    FE A   4      10.000  10.000  10.000',
 		'ATOM      5  N   ALA A   1      10.000  10.000  10.000',
 	), {});
-	is_deeply($q->{element}, [ 'C', 'CA', 'H', 'FE', 'N' ],
+	is_deeply($q->{element}, [ 'C', 'Ca', 'H', 'Fe', 'N' ],
 		'the element is guessed from which column the atom name starts in');
 }
 

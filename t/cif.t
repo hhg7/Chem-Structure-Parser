@@ -102,6 +102,18 @@ for my $pair ([ 'mini', 'one of everything' ],
 		'and the element counts come out the same as from the PDB');
 }
 
+# the per-chain tally, which the two readers fill in from the same rule and so
+# have to agree on chain by chain as well as structure-wide
+{
+	my $c = structure_info("$data/mini.cif");
+	my $p = structure_info("$data/mini.pdb");
+	is_deeply([ map { $c->{chains}{$_}{elements} } @{ $c->{chain_order} } ],
+	          [ map { $p->{chains}{$_}{elements} } @{ $p->{chain_order} } ],
+		'the per-chain element counts agree with the PDB reader');
+	is($c->{chains}{A}{elements}{Zn}, 1,
+		'and a type_symbol of ZN is filed under the IUPAC symbol');
+}
+
 #--------------------------------------------------------------------
 # the header, where the two formats file the same fact differently
 #--------------------------------------------------------------------

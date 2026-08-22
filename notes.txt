@@ -64,3 +64,10 @@ column 13, so `CA  ` is a calcium. A hydrogen with a long name like `HG11`
 also starts in column 13, and taking its first two letters makes it mercury;
 what separates them is that it fills all four columns, which no two-letter
 element's name does.
+
+All three roads to a symbol shout it — the columns are capitals, mmCIF's
+`type_symbol` is capitals as often as not, and the guess above uppercases what
+it takes from the name — so the symbol is put back into IUPAC's case once,
+where it is settled, and a zinc reads back as `Zn` whichever road it took.
+Only the 118 named elements are corrected: a field that spells no element is
+left as the file wrote it rather than dressed up as one.

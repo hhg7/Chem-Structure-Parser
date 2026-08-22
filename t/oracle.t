@@ -187,6 +187,9 @@ sub compare {
 		or do { diag("  $_") for _few(@wrong_name) };
 
 	if (length $them->{resolution} && defined $info->{resolution}) {
+		# REMARK 2 writes the resolution to two decimals, so half of the last
+		# place is as far apart as two readings of the same field can be; more
+		# than that is a different number rather than a rounding.
 		ok(abs($info->{resolution} - $them->{resolution}) < 0.005,
 			"$name: the same resolution ($info->{resolution})");
 	}

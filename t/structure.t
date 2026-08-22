@@ -174,12 +174,17 @@ is($ca->{name},    'CA', 'the atom knows its name');
 is($ca->{element}, 'C',  'and its element');
 is($ca->{hetero},  0,    'and which record it came from');
 ok(!exists $ca->{altlocs}, 'an atom with one conformer carries no altloc list');
+# The fixture writes the coordinates with %8.3f and the reader is exact for a
+# fixed-point field, so the difference observed here is 0 -- on a double, a long
+# double and a __float128 perl alike.  1e-9 is not room for the conversion to be
+# wrong in; it is there so that a difference of the size a mis-read column gives
+# (0.001 at the very least) still fails.
 cmp_ok(abs($ca->{x} - 20.5), '<', 1e-9, 'x');
 cmp_ok(abs($ca->{y} - 14.0), '<', 1e-9, 'y');
 cmp_ok(abs($ca->{z} - 13.5), '<', 1e-9, 'z');
 
-is($info->{chains}{A}{residues}{202}{atoms}{ZN}{element}, 'ZN',
-	'a two-letter element is read as two letters');
+is($info->{chains}{A}{residues}{202}{atoms}{ZN}{element}, 'Zn',
+	'a two-letter element is read as two letters, and cased as IUPAC writes it');
 
 # a residue's centre and mean B-factor
 my $c = $info->{chains}{A}{residues}{6}{center};
@@ -251,7 +256,29 @@ is($info->{stats}{total_atoms},
 is($info->{stats}{n_water_atoms}, 2, 'water atoms are counted');
 is($info->{stats}{n_hydrogens},   1, 'so are hydrogens');
 is($info->{stats}{elements}{S},   2, 'elements are tallied');
-is($info->{stats}{elements}{SE},  1, 'including two-letter ones');
+is($info->{stats}{elements}{Se},  1, 'including two-letter ones');
+is($info->{stats}{elements}{Zn},  1, 'and the zinc written ZN is filed under Zn');
+ok(!exists $info->{stats}{elements}{ZN}, 'with nothing left under the shouted spelling');
+{
+	# the tally counts coordinate records, which is what n_atoms counts, so the
+	# two have to add up -- for the structure and for each chain of it
+	my $sum = 0;
+	$sum += $_ for values %{ $info->{stats}{elements} };
+	is($sum, $info->{stats}{n_atoms}, 'the element counts add up to n_atoms');
+	for my $cid (@{ $info->{chain_order} }) {
+		my $c = $info->{chains}{$cid};
+		my $n = 0;
+		$n += $_ for values %{ $c->{elements} };
+		is($n, $c->{n_atoms}, "chain $cid: its element counts add up to its n_atoms");
+	}
+	# every count is a non-negative whole number, not a string that looks like one
+	my @bad = grep { !/\A[0-9]+\z/ } values %{ $info->{stats}{elements} };
+	is_deeply(\@bad, [], 'every count is an unsigned integer');
+	is($info->{chains}{A}{elements}{Zn}, 1, 'the zinc is tallied against the chain it sits in');
+	ok(!exists $info->{chains}{B}{elements}{Zn}, 'and against no other chain');
+	is_deeply([ sort keys %{ $info->{chains}{B}{elements} } ], [ qw(C O P) ],
+		'a chain tallies only the elements it holds');
+}
 ok($info->{stats}{bfactor}{min} <= $info->{stats}{bfactor}{mean}, 'B-factor min <= mean');
 ok($info->{stats}{bfactor}{mean} <= $info->{stats}{bfactor}{max}, 'B-factor mean <= max');
 ok($info->{stats}{bbox}{xmin} < $info->{stats}{bbox}{xmax}, 'the bounding box has a width');

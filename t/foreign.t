@@ -285,12 +285,12 @@ CIF
 {
 	my @want = (
 		[ ' CA ', 'CA',  'C',  'a name right-justified from column 14 is one letter' ],
-		[ 'CA  ', 'CA',  'CA', 'and one starting in column 13 is two' ],
+		[ 'CA  ', 'CA',  'Ca', 'and one starting in column 13 is two' ],
 		[ 'HG11', 'HG11','H',  'a hydrogen that fills the field is not mercury' ],
 		[ '1HB ', '1HB', 'H',  'a hydrogen count in column 13 is not an element' ],
-		[ 'FE  ', 'FE',  'FE', 'iron' ],
+		[ 'FE  ', 'FE',  'Fe', 'iron' ],
 		[ ' N  ', 'N',   'N',  'nitrogen' ],
-		[ 'CL  ', 'CL',  'CL', 'chlorine' ],
+		[ 'CL  ', 'CL',  'Cl', 'chlorine' ],
 	);
 	for my $w (@want) {
 		my ($cols, $name, $element, $why) = @$w;
@@ -299,6 +299,19 @@ CIF
 		my $r = $i->{chains}{A}{residues}{1};
 		is($r->{atoms}{$name} && $r->{atoms}{$name}{element}, $element, $why);
 	}
+}
+
+# The case correction knows the 118 symbols and nothing else, so a field that
+# spells no element keeps the spelling the file gave it rather than being
+# dressed up as one.  'XX' is not an element and 'Xx' would look like one.
+{
+	my $line = sprintf("%-76s%-2s\n",
+		'HETATM    1  X1  LIG A   1       1.000   2.000   3.000  1.00 10.00', 'XX');
+	my $i = structure_info_string($line);
+	is($i->{chains}{A}{residues}{1}{atoms}{X1}{element}, 'XX',
+		'a two-letter field that is not an element is left as the file wrote it');
+	is_deeply($i->{stats}{elements}, { XX => 1 }, 'and is tallied under that spelling');
+	is_deeply($i->{chains}{A}{elements}, { XX => 1 }, 'in the chain as well as the structure');
 }
 
 # --- a resolution that is only in REMARK 3 --------------------------------
@@ -414,8 +427,8 @@ PDB
 	is($i->{chains}{F}{residues}{102}{type}, 'ion', 'and so is a sulphate, which is on the list');
 	is($i->{chains}{G}{residues}{103}{type}, 'ligand',
 		'while BF4, which is not on it, is a ligand -- a fact about the list');
-	is($i->{chains}{E}{residues}{101}{atoms}{ZN}{element}, 'ZN',
-		'a two-letter element in columns 77-78 is read whole');
+	is($i->{chains}{E}{residues}{101}{atoms}{ZN}{element}, 'Zn',
+		'a two-letter element in columns 77-78 is read whole, and spelled as IUPAC does');
 }
 
 done_testing();
