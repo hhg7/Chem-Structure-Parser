@@ -3,6 +3,105 @@ Revision history for Chem-Structure-Parser
 
 0.03 2026-09-08 CDT
 
+ - new: the rest of the physical properties, all computed by structure_info()
+   on the way past and reachable through $info->{features} or the functions
+   named below.  Each is a translation of somebody else's implementation and is
+   tested against it rather than against itself.
+
+   - shape: the gyration tensor, its principal moments, and the asphericity,
+     acylindricity and relative shape anisotropy built from them, after
+     mdtraj's geometry/shape.py.  Agrees with it to eight figures.
+
+   - interface: each chain's surface with the other chains taken away, and so
+     what the chains bury between them -- $f->{sasa}{buried}, and sasa_alone
+     and buried on every chain.  One more surface calculation per chain, each
+     touching only that chain's atoms, so all of them together cost about what
+     the first one cost.  interface => 0 turns it off.
+
+   - torsion angles: phi, psi, omega and chi1 to chi5 on every residue, in
+     degrees, after mdtraj's compute_phi and its relatives.
+
+   - new: structure_contacts(), which residues touch which, after mdtraj's
+     compute_contacts() with its closest-heavy scheme; n_contacts on every
+     residue.  Cross-chain and neighbouring pairs are reported as well as the
+     ones mdtraj's `all' considers.
+
+   - new: structure_hbonds(), the backbone hydrogen bonds by Kabsch and
+     Sander's electrostatic energy, after mdtraj's kabsch_sander().  The amide
+     hydrogen is placed rather than read, so it works on a crystal structure
+     that has none.  Exact: the same bonds and the same energies to 4e-5
+     kcal/mol over 1A42, 1A22, 1AHW and 3AU6.
+
+   - secondary structure: ss and ss_simple on every residue, the Kabsch-Sander
+     dictionary read off those bonds.  This is the one number in the module
+     that does not reproduce its reference exactly -- 96.9% of residues
+     eight-state and 98.2% three-state against mdtraj's compute_dssp() over
+     3,314 residues, the residual being beta sheet extension across bulges,
+     which mdtraj's implementation does and this does not.  t/features.t bounds
+     the disagreement rather than asserting equality, and the documentation
+     says so.
+
+   - half-sphere exposure: hse_up and hse_down on every standard amino acid
+     residue, after Biopython's HSExposureCB.  Exact.
+
+ - a torsion angle and a Kabsch-Sander amide hydrogen are no longer measured
+   across a chain break.  mdtraj takes the residue before this one to be
+   whichever came before it in the file and computes a phi, or places a
+   hydrogen, across whatever gap is there; here the two must be peptide-bonded
+   first, at the 1.8 A Biopython's PPBuilder uses.  Four collinear atoms get no
+   torsion either, rather than the zero atan2(0, 0) returns.
+
+ - t/data gains ss.pdb and fold.pdb, with their mmCIF twins: five cysteines of
+   1AHW, two of them bonded and one not, and sixty consecutive residues of 1A42
+   that hold an alpha helix, a 3-10 helix, two strands and the turns between
+   them.  Without the second, the hydrogen bonds and the secondary structure
+   would have had almost nothing in t/data to be tested on.
+
+ - structure.info.pl gains --ss, one row per disulfide with what the file
+   declares beside it.
+
+ - structure_info() computes the physical properties on the way past and
+   leaves them in $info->{features}, so most callers never name
+   structure_features() at all.  This is not free: reading goes from about
+   214,000 atoms a second to about 19,500, eleven times the cost, nearly all of
+   it the solvent-accessible surface at 960 sphere points per atom.  With
+   sasa => 0 everything else together is 2.7x the read, and interface => 0
+   alone takes the whole thing from 10.9x to 7.1x.
+   features => 0 is the way back to the old speed,
+   and is what to reach for when reading a directory for its headers or its
+   sequences.  atoms => 0 turns them off on its own rather than dying, so
+   structure_sequences($file, atoms => 0) still works.
+
+ - with no options, structure_features(), structure_sasa(),
+   structure_pi_stacking() and structure_disulfides() hand back what the read
+   already computed rather than walking the structure a second time.  Name any
+   option and they compute again with it in force.
+
+ - new: structure_disulfides(), and $features->{disulfides} -- the disulfide
+   bonds the coordinates show, as against $info->{ssbond}, which is what the
+   depositor said.  Each bond is also written onto both of its residues, as
+   {disulfide}.  The rule is mdtraj's: a cysteine with an SG and no HG, paired
+   with another under 3.0 A, so a cysteine whose thiol hydrogen was modelled is
+   reduced and holds no bond.  disulfide_distance moves the cutoff.
+
+   The two answers agree on every entry with disulfides in a 60-entry spread of
+   PDBbind, and their bond lengths agree to the two decimals SSBOND is written
+   in.  Over a wider sweep they agree on 21 of 22: 1A4K is a Fab that is in the
+   file twice, and its SSBOND records cover one copy while its coordinates show
+   both.
+
+   The comparison is against mdtraj's rule and not against mdtraj's function.
+   Topology.create_disulfide_bonds() is handed the angstrom positions its PDB
+   reader parsed and compares them with 0.3, meaning nanometres, so it tests
+   for an SG-SG separation under 0.3 A and finds nothing on any file -- on
+   1A4K, 8 pairs under 0.3 nm and 0 under 0.3 A.  The SG-SG bonds that do turn
+   up in its topology come from the file's own CONECT records.
+
+ - fixed: a structure whose atom records have unreadable coordinate columns was
+   mistaken for one read with atoms => 0 and died where it should have carried
+   on.  The two are told apart by the atom names the residues list, not by the
+   positions that came back.
+
  - new: structure_features(), the physical properties of a structure in one
    call -- solvent-accessible surface, radius of gyration, molecular weight,
    centroid and centre of mass, mean Kyte-Doolittle hydropathy, the aromatic

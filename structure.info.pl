@@ -18,9 +18,9 @@ use Getopt::Long;
 use Chem::Structure::Parser;
 
 my %opt = (fasta => 0, tsv => 0, ligands => 0, dump => 0, seqres => 0,
-           features => 0, stacks => 0, chain => undef);
+           features => 0, stacks => 0, ss => 0, chain => undef);
 GetOptions(\%opt, 'fasta', 'tsv', 'ligands', 'dump', 'seqres', 'features', 'stacks',
-           'chain=s', 'help')
+           'ss', 'chain=s', 'help')
 	or die "see --help\n";
 
 if ($opt{help} || !@ARGV) {
@@ -34,6 +34,7 @@ usage: structure.info.pl [options] file.pdb|file.cif ...
     --dump       the whole hash of hashes, via Data::Dumper
     --features   one row per structure: surface, size, mass, hydropathy
     --stacks     one row per stacked pair of aromatic rings
+    --ss         one row per disulfide, with what the file declares beside it
     --chain ID   only this chain
 
 With no option, prints a readable summary of each file.
@@ -60,10 +61,11 @@ for my $file (@ARGV) {
 	}
 
 	if ($opt{features}) {
-		my $f = structure_features($info);
+		my $f = $info->{features};
 		unless ($header_printed++) {
 			print join("\t", qw(id file n_atoms mass rg rg_mass sasa apolar polar
-			                    hydropathy aromatic_fraction n_pi_stacking)), "\n";
+			                    hydropathy aromatic_fraction n_pi_stacking
+			                    n_disulfides)), "\n";
 		}
 		print join("\t",
 			$info->{id} // '',
@@ -78,7 +80,28 @@ for my $file (@ARGV) {
 			(defined $f->{hydropathy}        ? sprintf('%.4f', $f->{hydropathy})        : ''),
 			(defined $f->{aromatic_fraction} ? sprintf('%.4f', $f->{aromatic_fraction}) : ''),
 			scalar @{ $f->{pi_stacking} },
+			scalar @{ $f->{disulfides} },
 		), "\n";
+		next;
+	}
+
+	if ($opt{ss}) {
+		# what the coordinates show against what the depositor wrote down; a
+		# bond in one column and not the other is a fact about the entry
+		my $key = sub {
+			my ($c1, $r1, $c2, $r2) = @_;
+			return join '|', sort "$c1/$r1", "$c2/$r2";
+		};
+		my %found = map { $key->(@{$_}{qw(chain1 residue1 chain2 residue2)}) => $_->{distance} }
+		            @{ structure_disulfides($info) };
+		my %said  = map { $key->(@{$_}{qw(chain1 resseq1 chain2 resseq2)}) => $_->{length} }
+		            @{ $info->{ssbond} || [] };
+		for my $k (sort keys %{ { %found, %said } }) {
+			next if defined $opt{chain} && $k !~ m{(?:\A|\|)\Q$opt{chain}\E/};
+			printf "%s\t%s\t%s\t%s\n", $info->{id} // '', $k,
+				(defined $found{$k} ? sprintf('%.3f', $found{$k}) : 'not found'),
+				(defined $said{$k}  ? $said{$k}                   : 'not declared');
+		}
 		next;
 	}
 

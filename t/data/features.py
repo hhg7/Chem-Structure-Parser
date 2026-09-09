@@ -24,6 +24,16 @@
 # what pins the answer exactly; the float32 column is what mdtraj ships and is
 # compared against with a tolerance of one sphere point per atom.
 #
+# The disulfides are mdtraj's rule and not mdtraj's function.  Its
+# Topology.create_disulfide_bonds() is handed the positions the PDB reader
+# parsed, which are angstrom, and compares them with 0.3 -- "this is supposed to
+# be nm. I think we're good", says the comment beside it -- so it tests for an
+# SG-SG separation under 0.3 A and finds nothing on any file.  The SG-SG bonds
+# that do appear in topology.bonds come from the file's own CONECT records,
+# which is the declared answer rather than a computed one.  So the rule is
+# transcribed below with its units made consistent, and both answers are printed
+# so the difference stays visible.
+#
 # pi_stacking() is handed unitcell_vectors of None.  A PDB CRYST1 record
 # describes the crystal, not a simulation box, and mdtraj's centroid distances
 # apply the minimum image convention when a box is set -- which would measure
@@ -33,6 +43,12 @@ import sys
 import numpy as np
 import mdtraj as md
 from mdtraj.geometry.sasa import _ATOMIC_RADII
+
+# Biopython, for the half-sphere exposure only: HSExposureCB is Biopython's and
+# mdtraj has no equivalent.  It reads the file itself, so the H lines are
+# written for PDB files alone -- t/cif.t is what says the two formats agree.
+from Bio.PDB import PDBParser
+from Bio.PDB.HSExposure import HSExposureCB
 
 PROBE = 0.14      # nm, mdtraj's default
 NPTS = 960        # sphere points per atom, mdtraj's default
@@ -114,6 +130,115 @@ def res_index(res):
     return res.index
 
 
+def disulfides(t):
+    """mdtraj's Topology.create_disulfide_bonds() rule, in nanometres: a CYS
+    with an SG and no HG, paired with another under 0.3 nm."""
+    def is_cyx(res):
+        names = [a.name for a in res.atoms]
+        return "SG" in names and "HG" not in names
+
+    cyx = [r for r in t.topology.residues if r.name == "CYS" and is_cyx(r)]
+    sg = {r.index: [a.index for a in r.atoms if a.name == "SG"][0] for r in cyx}
+    pos = t.xyz[0]
+    out = []
+    for i in range(len(cyx)):
+        for j in range(i):
+            a, b = sg[cyx[i].index], sg[cyx[j].index]
+            d = float(np.linalg.norm(pos[a] - pos[b]))
+            if d < 0.3:
+                lo, hi = sorted((cyx[i].index, cyx[j].index))
+                out.append((lo, hi, d * 10.0))
+    return sorted(out)
+
+
+# Biopython's Bio.PDB.Polypeptide.PPBuilder `radius': the largest C-to-N
+# separation that still means two residues are joined.
+PEPTIDE_BOND = 0.18   # nm
+
+
+def linked(t, prev, nxt):
+    """Are these two residues actually peptide-bonded?  mdtraj does not ask --
+    it takes the residue next to this one in the file and computes a phi across
+    whatever gap is there -- so the answer is printed beside every angle and the
+    test uses it."""
+    if prev is None or nxt is None or prev.chain is not nxt.chain:
+        return False
+    c = [a.index for a in prev.atoms if a.name == "C"]
+    n = [a.index for a in nxt.atoms if a.name == "N"]
+    if not c or not n:
+        return False
+    return bool(np.linalg.norm(t.xyz[0][c[0]] - t.xyz[0][n[0]]) < PEPTIDE_BOND)
+
+
+# The shorter projected length against the bond it came from, which is the sine
+# of the angle between them: below this the four atoms are collinear and there
+# is no torsion to measure.  The same rule and the same constant as Parser.xs,
+# which is where the two measurements behind the constant are written down --
+# 0.736 at worst for real geometry, 1.1e-6 at best for mini.pdb's collinear one.
+COLLINEAR = 1e-3
+
+
+def torsion_defined(t, idx):
+    """Is there an angle here at all?  mini.pdb lays a residue's atoms out along
+    a straight line on purpose, and four collinear atoms have no torsion --
+    atan2(0, 0) gives zero, which is a number where there is no answer."""
+    p = t.xyz[0][list(idx)].astype(np.float64)
+    b0, b1, b2 = p[0] - p[1], p[2] - p[1], p[3] - p[2]
+    n1 = np.linalg.norm(b1)
+    l0, l2 = np.linalg.norm(b0), np.linalg.norm(b2)
+    if n1 == 0 or l0 == 0 or l2 == 0:
+        return False
+    u = b1 / n1
+    v = b0 - np.dot(b0, u) * u
+    w = b2 - np.dot(b2, u) * u
+    return bool(np.linalg.norm(v) > l0 * COLLINEAR and np.linalg.norm(w) > l2 * COLLINEAR)
+
+
+def torsions(t):
+    """mdtraj's phi, psi, omega and chi1..chi5, by residue index, each with
+    whether the residues it was measured across are bonded and whether the four
+    atoms define an angle at all."""
+    top = t.topology
+    by_index = {r.index: r for r in top.residues}
+    rows = []
+
+    def neighbour(res, step):
+        other = by_index.get(res.index + step)
+        return other if other is not None and other.chain is res.chain else None
+
+    for name, fn, owner in (("phi", md.compute_phi, 1),
+                            ("psi", md.compute_psi, 0),
+                            ("omega", md.compute_omega, 0)):
+        idx, ang = fn(t)
+        for k in range(len(idx)):
+            res = top.atom(int(idx[k][owner])).residue
+            if name == "phi":
+                ok = linked(t, neighbour(res, -1), res)
+            else:
+                ok = linked(t, res, neighbour(res, 1))
+            rows.append((res.index, name, float(np.degrees(ang[0][k])), int(ok),
+                         int(torsion_defined(t, idx[k]))))
+
+    for k, fn in enumerate((md.compute_chi1, md.compute_chi2, md.compute_chi3,
+                            md.compute_chi4, md.compute_chi5), start=1):
+        idx, ang = fn(t)
+        for j in range(len(idx)):
+            res = top.atom(int(idx[j][0])).residue
+            rows.append((res.index, "chi%d" % k, float(np.degrees(ang[0][j])), 1,
+                         int(torsion_defined(t, idx[j]))))
+    return sorted(rows)
+
+
+def recorded_sg_bonds(t):
+    """What mdtraj's topology actually holds, which on a PDB file is whatever
+    its CONECT records said.  Printed for the contrast, not compared against."""
+    n = 0
+    for a, b in t.topology.bonds:
+        if a.name == "SG" and b.name == "SG":
+            n += 1
+    return n
+
+
 def load(path):
     # mdtraj dispatches on the file name, and a 1993 entry is called .ent
     if path.endswith(('.ent', '.pdb')):
@@ -172,6 +297,32 @@ def main(path):
             k, cid, res.resSeq, res.name, got[0], got[1], got[2]))
     print('T sasa %.9f %.9f %.9f' % (a32.sum(), a64.sum(), point.sum()))
 
+    # Each chain's surface with the other chains taken away, which with the
+    # surface it has in the structure is the area the chains bury between them.
+    #
+    # Grouped by chain_id and not by mdtraj's own chains: mdtraj starts a new
+    # chain at every TER record, so one deposited chain becomes three or four of
+    # them -- the polymer, its heterogens, its waters -- while this module keeps
+    # a chain whole.  Grouping by the author's chain id puts mdtraj's back
+    # together and the two agree atom for atom.
+    #
+    # Only for PDB files.  mdtraj takes an mmCIF file's chains from
+    # label_asym_id, the archive's lettering, so there is no author id to group
+    # by and no comparison to make; t/cif.t is what says the two formats give
+    # the same answer here.
+    if path.endswith(('.pdb', '.ent')):
+        by_chain = {}
+        for a in top.atoms:
+            by_chain.setdefault((a.residue.chain.chain_id or '').strip() or '-', []).append(a.index)
+        for cid in sorted(by_chain):
+            idx = by_chain[cid]
+            sub = t.atom_slice(idx)
+            r = np.array([_ATOMIC_RADII[a.element.symbol] for a in sub.topology.atoms]) + PROBE
+            i32 = md.shrake_rupley(sub, probe_radius=PROBE, n_sphere_points=NPTS)[0].sum() * 100.0
+            i64 = sasa_float64(sub.xyz[0], r, NPTS).sum() * 100.0
+            pt = (4.0 * np.pi * (r * 10.0) ** 2 / NPTS).sum()
+            print('I %s %d %.9f %.9f %.9f' % (cid, len(idx), i32, i64, pt))
+
     xyz = np.asarray(t.xyz[0], dtype=np.float64) * 10.0
     mass = np.array([a.element.mass for a in top.atoms], dtype=np.float64)
     mu = xyz.mean(0)
@@ -184,6 +335,60 @@ def main(path):
     print('T mass %.9f' % mass.sum())
     print('T center %.9f %.9f %.9f' % tuple(mu))
     print('T com %.9f %.9f %.9f' % tuple(com))
+
+    for lo, hi, d in disulfides(t):
+        print('S %d %d %.9f' % (lo, hi, d))
+    print('#sg_bonds_recorded %d' % recorded_sg_bonds(t))
+
+    for ri, name, value, ok, defined in torsions(t):
+        print('D %d %s %.9f %d %d' % (ri, name, value, ok, defined))
+
+    # Residue contacts, mdtraj's closest-heavy scheme.  Only the pairs mdtraj's
+    # `all' considers -- same chain, three or more apart in it -- because those
+    # are the ones it has an opinion about; this module reports the neighbouring
+    # and the cross-chain pairs too, and the test does not hold those to mdtraj.
+    # Capped at 8 A so the frozen file stays a fixture rather than a matrix.
+    try:
+        cd, cpairs = md.compute_contacts(t, contacts='all', scheme='closest-heavy')
+        for (a, b), dist in zip(cpairs, cd[0]):
+            if dist * 10.0 <= 8.0:
+                print('C %d %d %.9f' % (a, b, dist * 10.0))
+    except ValueError:
+        pass    # no residue pairs three apart in one chain: nothing to compare
+
+    if path.endswith(('.pdb', '.ent')):
+        st = PDBParser(QUIET=True).get_structure('x', path)
+        model = next(iter(st))
+        HSExposureCB(model)
+        for chain in model:
+            for res in chain:
+                u = res.xtra.get('EXP_HSE_B_U')
+                if u is None:
+                    continue
+                cid = (chain.id or '').strip() or '-'
+                _, num, icode = res.id
+                print('H %s %d %s %d %d' % (cid, num, (icode or '').strip() or '-',
+                                            u, res.xtra.get('EXP_HSE_B_D')))
+
+    # Backbone hydrogen bonds, mdtraj's kabsch_sander.  Its H is placed from
+    # the previous residue in the file whether or not the two are bonded, so the
+    # linked flag rides along the way it does for the torsions.
+    ks = md.geometry.kabsch_sander(t)[0].tocoo()
+    by_index = {r.index: r for r in top.residues}
+    for a, d, e in sorted(zip(ks.row, ks.col, ks.data)):
+        prev = by_index.get(int(d) - 1)
+        cur = by_index.get(int(d))
+        ok = linked(t, prev, cur) if (prev is not None and cur is not None) else False
+        print('B %d %d %.9f %d' % (int(a), int(d), float(e), int(ok)))
+
+    # Secondary structure, mdtraj's compute_dssp.  See the head of the block in
+    # Parser.xs: this module's assignment is the Kabsch-Sander dictionary and
+    # agrees with mdtraj on most residues but not all, so the test bounds the
+    # disagreement rather than demanding equality.
+    dssp = md.compute_dssp(t, simplified=False)[0]
+    for i, v in enumerate(dssp):
+        v = v.strip() or '_'
+        print('X %d %s' % (i, v))
 
     rings = rings_of(top)
     print('#rings %d' % len(rings))

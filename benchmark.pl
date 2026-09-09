@@ -90,8 +90,12 @@ sub timeit {
 
 printf "%d files from %s\n\n", scalar @files, $dir;
 
-my $xs = timeit('structure_info', sub {
-	my $i = structure_info($_[0]);
+# features => 0 on every read below: this half of the benchmark is about the
+# parse, and comparing a read that computes the solvent-accessible surface with
+# a pure-Perl reader that does not would be comparing two different jobs.  What
+# the default costs is the structure_info line in the second half.
+my $xs = timeit('structure_info, features => 0', sub {
+	my $i = structure_info($_[0], features => 0);
 	return $i->{stats}{n_atoms};
 });
 timeit('structure_info, atoms => 0', sub {
@@ -99,11 +103,11 @@ timeit('structure_info, atoms => 0', sub {
 	return $i->{stats}{n_atoms};
 });
 timeit('structure_info, no water or hydrogen', sub {
-	my $i = structure_info($_[0], waters => 0, hydrogens => 0);
+	my $i = structure_info($_[0], waters => 0, hydrogens => 0, features => 0);
 	return $i->{stats}{n_atoms};
 });
 timeit('structure_info, meta => 0', sub {
-	my $i = structure_info($_[0], meta => 0);
+	my $i = structure_info($_[0], meta => 0, features => 0);
 	return $i->{stats}{n_atoms};
 });
 my $raw = timeit('the XS parse alone', sub {
@@ -158,19 +162,23 @@ my $pps = timeit('pure Perl, and the same statistics', sub {
 # The surface is the expensive one: nine hundred and sixty sphere points per
 # atom, each tested against the atom's neighbours.  Timed over the same files so
 # that the cost can be read against the cost of reading them in the first place.
-my $feat = timeit('structure_features', sub {
-	my $i = structure_info($_[0], meta => 0);
-	structure_features($i);
+my $feat = timeit('structure_info, the default', sub {
+	my $i = structure_info($_[0]);
 	return $i->{stats}{n_atoms};
 });
 timeit('structure_sasa alone', sub {
-	my $i = structure_info($_[0], meta => 0);
+	my $i = structure_info($_[0], meta => 0, features => 0);
 	structure_sasa($i);
 	return $i->{stats}{n_atoms};
 });
 timeit('structure_pi_stacking alone', sub {
-	my $i = structure_info($_[0], meta => 0);
+	my $i = structure_info($_[0], meta => 0, features => 0);
 	structure_pi_stacking($i);
+	return $i->{stats}{n_atoms};
+});
+timeit('structure_disulfides alone', sub {
+	my $i = structure_info($_[0], meta => 0, features => 0);
+	structure_disulfides($i);
 	return $i->{stats}{n_atoms};
 });
 
@@ -238,7 +246,7 @@ sub perl_sasa {
 	# the smallest of the set, so the Perl version finishes
 	my ($small, $n_small);
 	for my $f (@files) {
-		my $i = structure_info($f, meta => 0);
+		my $i = structure_info($f, meta => 0, features => 0);
 		next if defined $n_small && $i->{stats}{n_atoms} >= $n_small;
 		($small, $n_small) = ($i, $i->{stats}{n_atoms});
 	}
@@ -266,8 +274,8 @@ between them and the coordinates, chain types, ligand and ion classification.
 What the C buys is the reading; building a hash of hashes out of what was read
 costs what it costs, in any language, because the hashes are the answer.
 
-structure_features() adds @{[ sprintf '%.1f', $feat / $xs ]}x the cost of reading the same files, and
-is the one part of the module where the C is not competing with a plausible
+Reading with the properties on -- which is the default -- costs @{[ sprintf '%.1f', $feat / $xs ]}x reading
+without them, and is the one part of the module where the C is not competing with a plausible
 Perl: nine hundred and sixty sphere points per atom against each of that atom's
 neighbours is a loop nobody would write in Perl twice, which is what the
 single-structure comparison above is there to show.

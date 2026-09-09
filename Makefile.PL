@@ -25,7 +25,8 @@ my $define = '';
 if ($Config{nvtype} eq 'long double') {
 	my $src = "#include <math.h>\n"
 	        . "int main(void) { long double x = 1.0L;\n"
-	        . "  volatile long double r = fabsl(x) + sqrtl(x) + acosl(x) + cosl(x) + sinl(x);\n"
+	        . "  volatile long double r = fabsl(x) + sqrtl(x) + acosl(x) + cosl(x) + sinl(x)\n"
+	        . "    + atan2l(x, x);\n"
 	        . "  return (int)r * 0; }\n";
 	my $dir = File::Temp::tempdir(CLEANUP => 1);
 	my $c   = File::Spec->catfile($dir, 'ldmath.c');

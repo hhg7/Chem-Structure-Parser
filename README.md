@@ -491,6 +491,9 @@ that goes unnoticed until the ten-thousandth file.
     hetatm    => 1          keep HETATM records
     atoms     => 1          build the atom hashes; 0 stops at the residue
                             level, which is much smaller and faster
+    features  => 1          compute the physical properties, into
+                            {features} and onto the chains, residues and
+                            atoms; see structure_features below
     meta      => 1          parse the header records
     anisou    => 0          keep ANISOU lines
     chains    => ['A','B']  read only these chains
@@ -508,6 +511,25 @@ v2020 is 2wy2: 33 MB, 64 models, 411,648 atom records.
     structure_info($f)                # model 1 only    50 MB    0.07 s
     structure_info($f, model => 'all')                 711 MB    1.4 s
     structure_info($f, model => 'all', atoms => 0)     418 MB    0.9 s
+
+`features` is the expensive one, and it is on by default because a structure's
+surface, size and contacts are as much a part of what it is as its sequence, and
+a caller who has to know to ask mostly does not. What it costs is measured, over
+60 structures of PDBbind:
+
+    structure_info($f, features => 0)         1.50 s   214,000 atoms/s
+    structure_info($f)                       16.38 s    19,500 atoms/s   10.9x
+    ... with interface => 0                  10.67 s    30,000 atoms/s    7.1x
+    ... with sasa => 0                        4.01 s    80,000 atoms/s    2.7x
+
+Nearly all of it is the solvent-accessible surface, at 960 sphere points per
+atom; everything else together is 2.7 times the read. `interface => 0` drops the
+per-chain surfaces and takes a third off the whole thing.
+
+`features => 0` is what to reach for when reading a directory for its headers or
+its sequences. `atoms => 0` turns them off on its own — there are no coordinates
+to compute from — rather than dying, so `structure_sequences($f, atoms => 0)`
+still works.
 
 Filtering happens in the C, before a hydrogen or a water has become a Perl
 value, so `hydrogens => 0` is cheaper than reading them and throwing them away.
@@ -650,7 +672,8 @@ example at the top of this document is its output.
 
 ## structure_features
 
-    my $f = structure_features($info);
+    my $f = $info->{features};        # structure_info computed them already
+    my $g = structure_features($info);   # the same hash, not a second walk
 
     $f->{sasa}{total};        # 17805.0   solvent-accessible surface, A^2
     $f->{sasa}{apolar};       # 8211.8    the carbon and sulphur part of it
@@ -660,6 +683,7 @@ example at the top of this document is its output.
     $f->{hydropathy};         # -0.452    mean Kyte-Doolittle over the sequence
     $f->{aromatic_fraction};  # 0.1263    the F, W and Y share of it
     @{ $f->{pi_stacking} };   # the stacked pairs of aromatic rings
+    @{ $f->{disulfides} };    # the SG-SG pairs close enough to be bonded
 
 (1a22 again, the structure the summary at the top of this document is of.)
 
@@ -667,6 +691,12 @@ Everything the module can work out about a structure that is a number rather
 than a name. One call, because all of it has to touch every atom and the
 expensive part is walking the structure into coordinate arrays: asking for all
 of it costs one walk.
+
+`structure_info()` makes that call on the way past and leaves the answer in
+`$info->{features}`, so most callers never name this function at all. With no
+options it is a lookup — it hands back what is already there. Name any option
+and it walks the structure again with that option in force. `features => 0` on
+the read is how to skip the work; see `structure_info`'s options above.
 
 The whole-structure figures come back in the hash. What is per-atom, per-residue
 or per-chain is written into `$info` instead, where the atom, residue and chain
@@ -679,9 +709,25 @@ already are:
     $info->{chains}{A}{residues}{54}{rsa};             # 0.103    ... as a fraction of its maximum
     $info->{chains}{A}{residues}{54}{atoms}{CZ}{sasa}; # one atom's
 
+    $info->{chains}{A}{buried};                        # 1445.0   what it buries
+    $info->{chains}{A}{residues}{54}{phi};             # -127.6   degrees
+    $info->{chains}{A}{residues}{54}{psi};             #   20.5
+    $info->{chains}{A}{residues}{54}{chi};             # [ -60.6, -82.9 ]
+    $info->{chains}{A}{residues}{54}{ss};              # 'E'      or H G I B T S ' '
+    $info->{chains}{A}{residues}{54}{ss_simple};       # 'E'      or H or C
+    $info->{chains}{A}{residues}{54}{hse_up};          # 12       half-sphere exposure
+    $info->{chains}{A}{residues}{54}{n_contacts};      # 13
+    $info->{chains}{A}{residues}{23}{disulfide};       # [ { chain, residue, distance } ]
+
 `store => 0` turns that off and leaves `$info` exactly as it was; the totals
 still come back. Asking twice replaces what was stored rather than adding to it,
 so a second call with a different probe radius leaves the second answer behind.
+
+Three of the properties are *only* per-residue — the torsion angles, the
+half-sphere exposure and the secondary structure — so `store => 0` does not
+compute them at all rather than computing them and dropping them on the floor.
+`structure_info()` always stores, so this is only reachable by calling
+`structure_features()` yourself.
 
 ### What comes back
 
@@ -699,6 +745,10 @@ so a second call with a different probe radius leaves the second answer behind.
 | `aromatic_fraction`, `n_aromatic` | how much of that sequence is phenylalanine, tryptophan or tyrosine |
 | `sequence_length` | how long the sequence those two are over is |
 | `pi_stacking` | the arrayref `structure_pi_stacking()` returns |
+| `disulfides` | the arrayref `structure_disulfides()` returns |
+| `contacts` | the arrayref `structure_contacts()` returns |
+| `hbonds` | the arrayref `structure_hbonds()` returns |
+| `shape` | `gyration_tensor`, `principal_moments`, `asphericity`, `acylindricity`, `anisotropy` |
 
 `rg`, `center` and `center_of_mass` are absent from a structure with no atoms in
 it, and `rg_mass` and `center_of_mass` from one whose atoms have no mass between
@@ -718,6 +768,14 @@ surface than its neighbours in the archive unless they are taken out.
 | --- | --- | --- |
 | `sasa` | 1 | compute the solvent-accessible surface |
 | `pi_stacking` | 1 | look for stacked aromatic rings |
+| `disulfides` | 1 | look for SG-SG pairs close enough to be bonded |
+| `interface` | 1 | also run the surface on each chain alone, for the buried area |
+| `shape` | 1 | the gyration tensor and the descriptors built from it |
+| `dihedrals` | 1 | phi, psi, omega and chi1-chi5, onto each residue |
+| `contacts` | 1 | which residues touch which |
+| `exposure` | 1 | half-sphere exposure, onto each amino acid residue |
+| `hbonds` | 1 | backbone hydrogen bonds, by Kabsch and Sander's energy |
+| `secondary` | 1 | secondary structure, onto each residue |
 | `store` | 1 | write the per-atom, per-residue and per-chain figures into `$info` |
 | `probe` | 1.4 | solvent probe radius, angstrom |
 | `points` | 960 | sphere points per atom, from 1 to 10,000,000 |
@@ -728,6 +786,9 @@ surface than its neighbours in the archive unless they are taken out.
 | `edge_plane_min`, `edge_plane_max` | 50, 90 | ... and the angle between the ring planes |
 | `edge_normal_min`, `edge_normal_max` | 0, 30 | ... and between a normal and the centroid line |
 | `edge_radius` | 1.5 | ... and how close to a centroid the two planes' shared line must pass |
+| `disulfide_distance` | 3.0 | the largest SG-SG separation that counts as a bond, angstrom |
+| `peptide_bond` | 1.8 | the largest C-to-N separation that still joins two residues, angstrom |
+| `contact_distance` | 4.5 | the largest heavy-atom separation that counts as a contact, angstrom |
 
 A structure read with `atoms => 0` has no coordinates to work from, and saying
 so is more use than reporting no surface:
@@ -736,6 +797,61 @@ so is more use than reporting no surface:
     structure_features($info);
     # dies: this structure has no atom hashes to work from;
     #       read it again without atoms => 0
+
+### Shape, and what the chains bury
+
+`$f->{shape}` is the gyration tensor and the three numbers built from its
+eigenvalues, which are mdtraj's `geometry/shape.py`:
+
+    $f->{shape}{principal_moments};   # [ 74.1, 92.6, 132.1 ]  A^2, ascending
+    $f->{shape}{asphericity};         # 41.84   how far from a sphere
+    $f->{shape}{acylindricity};       # 21.10   how far from a cylinder
+    $f->{shape}{anisotropy};          # 0.0233  0 for a sphere, 1 for a line
+
+The three moments sum to `rg` squared, which is the same sum read two ways.
+
+`$f->{sasa}{buried}` is what the chains bury against each other — the surface
+they have apart, less the surface they have together — and each chain carries
+`sasa_alone` and `buried` of its own. A two-body interface is usually quoted as
+half of the total, because the area is counted once on each side of it.
+
+    $f->{sasa}{buried} / 2;              # 1471.2 A^2 of interface
+    $info->{chains}{A}{buried};          # 1445.0 A^2, chain A's side of it
+
+It costs one more surface calculation per chain, and a chain's calculation
+touches only that chain's atoms, so all of them together cost about what the
+first one cost rather than the number of chains times it. `interface => 0` turns
+it off.
+
+### Torsion angles
+
+`phi`, `psi` and `omega` on each residue, in degrees, and `chi` as a list of
+chi1 upwards — mdtraj's `compute_phi`, `compute_psi`, `compute_omega` and
+`compute_chi1` through `compute_chi5`.
+
+An angle that would be measured across a chain break is not reported: the two
+residues must be peptide-bonded first, at Biopython's `PPBuilder` radius of
+1.8 Å. mdtraj takes the residue before this one to be whichever came before it
+in the file and computes a phi across whatever gap is there, which is a number
+rather than an answer. Four collinear atoms get no angle either, for the same
+reason.
+
+`omega` near zero is a cis peptide bond, which `$info->{cispep}` is the
+depositor's own record of — two answers to one question, as with the disulfides.
+
+### Half-sphere exposure
+
+`hse_up` and `hse_down` on each residue: the CA atoms of other residues within
+12 Å, split by which side of the plane through this residue's CA they fall —
+`hse_up` towards the side chain. It says something the accessible surface does
+not, because a residue can be buried and still have its side chain pointing into
+a cavity. This is Biopython's `Bio.PDB.HSExposure.HSExposureCB`, and the two
+agree exactly.
+
+Only the twenty standard amino acids, because Biopython's is built on
+`CaPPBuilder` with `aa_only`, so a selenomethionine is invisible to it — it
+neither gets a figure nor counts towards anybody else's. Glycine gets the
+virtual CB Biopython builds for it.
 
 ## structure_sasa
 
@@ -836,6 +952,129 @@ two aromatic rings in a small protein would qualify on distance alone. ProLIF,
 whose geometry mdtraj's is taken from, has 5.5 A, and mdtraj's other three
 distances are ProLIF's converted. So 5.5 A is what was meant, and it is what
 this uses. `face_distance => 55` gets the number mdtraj ships.
+
+## structure_contacts
+
+    for my $c (@{ structure_contacts($info) }) {
+        printf "%s%s - %s%s  %.2f A\n",
+            $c->{chain1}, $c->{residue1}, $c->{chain2}, $c->{residue2}, $c->{distance};
+    }
+
+Which residues touch which: pairs whose closest heavy atoms are within
+`contact_distance`, with that distance. `$residue->{n_contacts}` counts them per
+residue. Hydrogens are left out, which is what makes the number comparable
+between a structure that has them and one that does not.
+
+This is mdtraj's `compute_contacts()` with its default `closest-heavy` scheme.
+mdtraj's `all` pairs up residues in the same chain that are three or more apart
+in it; this reports those and the neighbouring and cross-chain pairs too,
+because a caller looking at a complex wants the interface and dropping it
+silently would be strange. `t/features.t` compares the subset mdtraj has an
+opinion about, and finds the same distances.
+
+## structure_hbonds
+
+    for my $b (@{ structure_hbonds($info) }) {
+        printf "%s%s N-H ... O=C %s%s  %.2f kcal/mol\n",
+            $b->{donor_chain}, $b->{donor_residue},
+            $b->{acceptor_chain}, $b->{acceptor_residue}, $b->{energy};
+    }
+
+The backbone hydrogen bonds, by Kabsch and Sander's electrostatic definition:
+a charge of -0.42 e on the carbonyl oxygen and +0.20 e on the amide hydrogen,
+their opposites on the carbon and the nitrogen, and the four-way Coulomb sum as
+the energy. Anything below -0.5 kcal/mol is a bond.
+
+The amide hydrogen is not read from the file, it is placed — one angstrom from
+N along the previous residue's C=O — which is what lets the definition be used
+on a crystal structure that has no hydrogens in it. Proline has no amide
+hydrogen and never donates. Each nitrogen keeps its two best acceptors.
+
+This is mdtraj's `kabsch_sander()`, and the two agree exactly: over 1A42, 1A22,
+1AHW and 3AU6 they find the same bonds and the same energies to 4e-5 kcal/mol,
+which is float32 rounding on mdtraj's side.
+
+### Secondary structure
+
+The same bonds, read for the patterns they fall into, give every residue a
+letter — the Kabsch–Sander dictionary:
+
+| letter | what it is |
+| --- | --- |
+| `H` | alpha helix |
+| `G` | 3-10 helix |
+| `I` | pi helix |
+| `E` | extended strand |
+| `B` | isolated beta bridge |
+| `T` | hydrogen-bonded turn |
+| `S` | bend |
+| ` ` | none of them |
+
+`$residue->{ss}` is that letter and `$residue->{ss_simple}` is the three-state
+reduction of it — `H` for the three helices, `E` for the two sheet letters, `C`
+for everything else. A residue with no backbone gets neither, because it is not
+coil, it is not protein.
+
+**This is the one number in the module that does not reproduce its reference
+exactly.** Against mdtraj's `compute_dssp()` it agrees on 96.9% of residues
+eight-state and 98.2% three-state, measured over 1A42, 1A22, 1AHW, 3AU6 and
+1A4K — 3,314 residues. The residual is almost all beta sheet extension: mdtraj's
+implementation joins ladders across bulges, a rule past the 1983 paper's core
+definitions, and this does not. `t/features.t` bounds the disagreement rather
+than asserting equality, and says so where it does. If you need DSSP's exact
+answer, run DSSP.
+
+## structure_disulfides
+
+    for my $b (@{ structure_disulfides($info) }) {
+        printf "%s%s - %s%s  %.2f A\n",
+            $b->{chain1}, $b->{residue1}, $b->{chain2}, $b->{residue2}, $b->{distance};
+    }
+    # A23 - A88    2.01 A
+    # A134 - A194  2.04 A
+
+    $info->{chains}{A}{residues}{23}{disulfide};
+    # [ { chain => 'A', residue => '88', distance => 2.011 } ]
+
+The disulfide bonds the coordinates show: pairs of cysteines whose SG atoms are
+close enough to be bonded. Each bond is also written onto both of its residues,
+as a list naming the partner — a list because a cysteine that appears to hold
+two bonds means something is wrong with the entry, and reporting both is more
+use than dropping one.
+
+The rule is a cysteine with an `SG` and no `HG`, paired with another under 3.0 Å.
+The `HG` test is what separates a cysteine whose thiol hydrogen was modelled — so
+it is reduced, and holds no bond — from one that was not; a crystal structure
+with no hydrogens has no `HG` anywhere and every cysteine is a candidate, which
+is right. `disulfide_distance` moves the cutoff.
+
+Only residues named `CYS`. AMBER and CHARMM rename a bonded cysteine to `CYX`,
+and a structure that has been through a force field needs its residues named the
+way the archive names them.
+
+### Against what the file says
+
+`$info->{ssbond}` is the other answer: what the depositor wrote in an SSBOND
+record, or in an mmCIF `_struct_conn` row of type `disulf`. Neither is the
+authority, and comparing them is worth doing:
+
+    my $key = sub {
+        my ($c1, $r1, $c2, $r2) = @_;
+        return join '|', sort "$c1/$r1", "$c2/$r2";
+    };
+    my %found = map { $key->(@{$_}{qw(chain1 residue1 chain2 residue2)}) => $_->{distance} }
+                @{ structure_disulfides($info) };
+    my %said  = map { $key->(@{$_}{qw(chain1 resseq1 chain2 resseq2)}) => $_->{length} }
+                @{ $info->{ssbond} };
+    my @undeclared = grep { !exists $said{$_}  } keys %found;
+    my @unseen     = grep { !exists $found{$_} } keys %said;
+
+Over a 60-entry spread of PDBbind the two agree on every entry that has
+disulfides, and where both name the same bond their lengths agree to the two
+decimals SSBOND is written in. Over a wider sweep they agree on 21 of 22; the
+one that does not is 1A4K, a Fab that is in the file twice, whose SSBOND records
+cover one copy and whose coordinates show both. A disagreement is a fact about
+the entry, not about either answer.
 
 ## aa3to1
 
@@ -975,6 +1214,14 @@ where mdtraj is installed so the frozen answer cannot go stale.
 | what | from | as implemented in |
 | --- | --- | --- |
 | solvent-accessible surface | Shrake, A; Rupley, J A (1973) *J Mol Biol* 79(2):351-71 | mdtraj 1.11's `mdtraj.geometry.shrake_rupley` |
+| gyration tensor and shape | | mdtraj's `geometry/shape.py` |
+| torsion angles | | `mdtraj.compute_phi`, `compute_psi`, `compute_omega`, `compute_chi1`-`chi5` |
+| residue contacts | | `mdtraj.compute_contacts`, `closest-heavy` |
+| backbone hydrogen bonds | Kabsch, W; Sander, C (1983) *Biopolymers* 22(12):2577-637 | `mdtraj.geometry.kabsch_sander` |
+| secondary structure | the same paper | `mdtraj.compute_dssp` — the one place the agreement is not exact; see `structure_hbonds` |
+| half-sphere exposure | Hamelryck, T (2005) *Proteins* 59(1):38-48 | Biopython's `Bio.PDB.HSExposure.HSExposureCB` |
+| the peptide-bond cutoff | | Biopython's `Bio.PDB.Polypeptide.PPBuilder` `radius` |
+| disulfides | | mdtraj's `Topology.create_disulfide_bonds` rule |
 | van der Waals radii | Bondi, A (1964) *J Phys Chem* 68:441, extended by Mantina, M *et al.* (2009) *J Phys Chem A* 113:5806, with Shannon, R D (1976) *Acta Cryst* A32:751 ionic radii for the ions that are always ionised | mdtraj's `_ATOMIC_RADII` |
 | atomic masses | | mdtraj's `mdtraj/core/element.py` |
 | pi-stacking geometry | ProLIF's FaceToFace and EdgeToFace | `mdtraj.geometry.pi_stacking` |
@@ -992,12 +1239,25 @@ digits, and mdtraj as it ships differs on four atoms of 620, by one sphere point
 each — a point sitting within a float32 ulp of a neighbouring atom's surface is
 accessible at one width and covered at the other.
 
-Two things are deliberately not mdtraj's, and both are argued where they are
-written down: the face-to-face centroid distance, above, and `rg_mass`.
+Three of these are deliberately not what the reference does, and each is argued
+where it is written down. mdtraj computes a torsion angle, and places a Kabsch–
+Sander amide hydrogen, between whichever residues are next to each other in the
+file — across a chain break, where the chemistry never joined them; here the two
+must be peptide-bonded first. mdtraj's `Topology.create_disulfide_bonds()`
+compares angstrom coordinates against a nanometre cutoff and so finds no
+disulfide in any file; the rule it documents is the one implemented here. And
+the face-to-face pi-stacking distance, above.
+
+Two more are deliberately not mdtraj's: `rg_mass`, and
 `compute_rg(traj, masses=m)` weights the distances by mass but still measures
 them from the geometric centroid; `rg_mass` measures from the centre of mass,
 which is what the quantity means. `rg` takes mdtraj's default of equal weights,
 where the two centres are the same point and the two answers agree exactly.
+
+The last is the secondary structure, which is the only number here that does not
+reproduce its reference: 96.9% agreement eight-state, 98.2% three-state, over
+3,314 residues. It is written up under `structure_hbonds` above, and
+`t/features.t` bounds the disagreement instead of pretending there is none.
 
 # What is parsed in C, and why
 

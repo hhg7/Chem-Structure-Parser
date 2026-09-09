@@ -123,9 +123,16 @@ no_leaks_ok { structure_info("$data/empty.cif") } 'nor does an empty one';
 		'nor does it with nothing written back';
 	no_leaks_ok { structure_sasa($info) }        'structure_sasa does not leak';
 	no_leaks_ok { structure_pi_stacking($info) } 'structure_pi_stacking does not leak';
+	no_leaks_ok { structure_disulfides($info) } 'structure_disulfides does not leak';
 	no_leaks_ok { structure_features($info, sasa => 0) }
 		'nor does asking for only half of it';
 	no_leaks_ok { structure_features($info, pi_stacking => 0) } 'or the other half';
+	no_leaks_ok { structure_features($info, disulfides => 0) } 'or without the disulfides';
+	no_leaks_ok { structure_contacts($info) } 'structure_contacts does not leak';
+	no_leaks_ok { structure_hbonds($info) }   'structure_hbonds does not leak';
+	for my $off (qw(shape dihedrals contacts exposure hbonds secondary interface)) {
+		no_leaks_ok { structure_features($info, $off => 0) } "nor does $off => 0";
+	}
 	no_leaks_ok { eval { structure_features($info, probe => -1) } }
 		'a refused option does not leak';
 	no_leaks_ok { eval { structure_features({ chains => {} }) } }
@@ -142,6 +149,30 @@ no_leaks_ok { structure_features(structure_info("$data/empty.pdb")) }
 	'an empty structure does not leak';
 no_leaks_ok { structure_features(structure_info("$data/bases.cif")) }
 	'nor does an mmCIF one with rings in it';
+{
+	# the disulfide list is written onto the residues as well as returned, and
+	# a second call has to replace it rather than add to it -- which is a
+	# delete and a fresh AV, the shape a reference count goes wrong in
+	my $ss = structure_info("$data/ss.pdb");
+	no_leaks_ok { structure_features($ss) } 'a structure with disulfides does not leak';
+	no_leaks_ok { structure_features($ss) for 1 .. 3 }
+		'nor does replacing what an earlier call wrote onto its residues';
+}
+no_leaks_ok { structure_info("$data/ss.pdb") }
+	'and neither does structure_info computing all of it on the way past';
+{
+	# the folded fixture is the one with hydrogen bonds, secondary structure and
+	# torsion angles in it, all of which are written onto the residues and all of
+	# which have to be replaced rather than added to on a second call
+	my $fold = structure_info("$data/fold.pdb");
+	no_leaks_ok { structure_features($fold) } 'a folded structure does not leak';
+	no_leaks_ok { structure_features($fold) for 1 .. 3 }
+		'nor does asking three more times';
+	no_leaks_ok { structure_hbonds($fold, peptide_bond => 2.0) }
+		'nor does a hydrogen bond list built to a different rule';
+}
+no_leaks_ok { structure_info("$data/fold.cif") }
+	'nor the same structure read as mmCIF';
 
 #--------
 # no cycles: the whole structure must go away when the caller drops it

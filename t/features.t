@@ -30,6 +30,7 @@ use File::Basename 'dirname';
 use File::Spec;
 use Chem::Structure::Parser qw(
 	structure_info structure_features structure_sasa structure_pi_stacking
+	structure_disulfides
 );
 
 my $dir = File::Spec->catdir(dirname(__FILE__), 'data');
@@ -134,7 +135,8 @@ sub compare {
 	my $res  = walk($info);
 
 	my ($n_atom, $n_res, $worst64, $worst32) = (0, 0, 0, 0);
-	my (%want_pi, %seen_res);
+	my (%want_pi, %want_ss, %want_alone, %want_tors, %want_cont, %want_hse,
+	    %want_hb, %want_dssp, %seen_res);
 	for my $l (@$rows) {
 		my @w = split ' ', $l;
 		if ($w[0] eq 'A') {
@@ -193,6 +195,21 @@ sub compare {
 			}
 		} elsif ($w[0] eq 'P') {
 			$want_pi{"$w[1] $w[2]"} = 1;
+		} elsif ($w[0] eq 'S') {
+			$want_ss{"$w[1] $w[2]"} = $w[3];
+		} elsif ($w[0] eq 'B') {
+			$want_hb{"$w[1] $w[2]"} = [ $w[3], $w[4] ];   # energy, is the link real
+		} elsif ($w[0] eq 'X') {
+			$want_dssp{$w[1]} = $w[2];
+		} elsif ($w[0] eq 'C') {
+			$want_cont{"$w[1] $w[2]"} = $w[3];
+		} elsif ($w[0] eq 'H') {
+			$want_hse{"$w[1]|$w[2]" . ($w[3] eq '-' ? '' : $w[3])} = [ $w[4], $w[5] ];
+		} elsif ($w[0] eq 'D') {
+			# value, is the link real, is the angle defined at all
+			$want_tors{"$w[1] $w[2]"} = [ @w[3 .. 5] ];
+		} elsif ($w[0] eq 'I') {
+			$want_alone{$w[1]} = [ @w[2 .. 5] ];   # n_atoms, f32, f64, one point
 		}
 	}
 
@@ -208,6 +225,217 @@ sub compare {
 	my %got_pi = map { pair_key($res, $_) => 1 } @{ $feat->{pi_stacking} };
 	is_deeply([ sort keys %got_pi ], [ sort keys %want_pi ],
 		"$file: the same stacked pairs of rings as mdtraj");
+
+	# Backbone hydrogen bonds, against mdtraj's kabsch_sander.  Exact: over the
+	# real entries this was developed against -- 1A42, 1A22, 1AHW and 3AU6 --
+	# the two agree on which bonds exist and on their energies to 4e-5 kcal/mol,
+	# which is float32 rounding on mdtraj's side.  The only bonds not required
+	# to be here are the ones whose amide hydrogen mdtraj placed from a residue
+	# that is not peptide-bonded to the donor; see the block in Parser.xs.
+	{
+		my %index = map { $res->[$_]{chain} . '/' . $res->[$_]{key} => $_ } 0 .. $#$res;
+		my %got;
+		for my $b (@{ $feat->{hbonds} }) {
+			my $a = $index{"$b->{acceptor_chain}/$b->{acceptor_residue}"};
+			my $d = $index{"$b->{donor_chain}/$b->{donor_residue}"};
+			$got{"$a $d"} = $b->{energy} if defined $a && defined $d;
+		}
+		my ($n, $worst, @missing, @extra) = (0, 0);
+		for my $k (sort keys %want_hb) {
+			my ($e, $real) = @{ $want_hb{$k} };
+			if (!$real) {
+				push @extra, $k if exists $got{$k};
+				next;
+			}
+			unless (exists $got{$k}) { push @missing, $k; next }
+			$n++;
+			my $d = abs($got{$k} - $e);
+			$worst = $d if $d > $worst;
+		}
+		is_deeply(\@missing, [], "$file: every hydrogen bond mdtraj found is here");
+		is_deeply(\@extra, [],
+			"$file: and none whose hydrogen mdtraj built from an unbonded residue");
+		my @unknown = grep { !exists $want_hb{$_} } sort keys %got;
+		is_deeply(\@unknown, [], "$file: and none mdtraj did not find");
+		cmp_ok($worst, '<', 1e-4,
+			sprintf('%s: %d hydrogen bond energies, worst %.2e kcal/mol', $file, $n, $worst));
+	}
+
+	# Residue contacts, mdtraj's closest-heavy scheme.  Only the pairs mdtraj's
+	# `all' considers are frozen -- same chain, three or more apart in it -- so
+	# this checks that every one of those under the cutoff is here with the same
+	# distance, and that none over it is.  The neighbouring and cross-chain pairs
+	# this module also reports are not mdtraj's to have an opinion about.
+	{
+		my %got;
+		my %index = map { $res->[$_]{chain} . '/' . $res->[$_]{key} => $_ } 0 .. $#$res;
+		for my $ct (@{ $feat->{contacts} }) {
+			my @e = sort { $a <=> $b } $index{"$ct->{chain1}/$ct->{residue1}"},
+			                           $index{"$ct->{chain2}/$ct->{residue2}"};
+			$got{"$e[0] $e[1]"} = $ct->{distance};
+		}
+		my $cut = 4.5;   # structure_features' contact_distance default
+		my ($n, $worst) = (0, 0);
+		for my $k (sort keys %want_cont) {
+			my $want = $want_cont{$k};
+			if ($want <= $cut) {
+				unless (exists $got{$k}) {
+					fail("$file: residues $k are $want A apart and are not in the contacts");
+					next;
+				}
+				$n++;
+				my $d = abs($got{$k} - $want);
+				$worst = $d if $d > $worst;
+			} elsif (exists $got{$k}) {
+				fail("$file: residues $k are $want A apart and should not be a contact");
+			}
+		}
+		# a distance off float32 nanometre coordinates, as the disulfides are
+		cmp_ok($worst, '<', 1e-5,
+			sprintf('%s: %d contacts mdtraj also found, at the same distance (worst %.2e)',
+				$file, $n, $worst));
+	}
+
+	# Half-sphere exposure, Biopython's HSExposureCB.  Keyed on the residue the
+	# way this module keys one, so an insertion code is part of the name.
+	for my $k (sort keys %want_hse) {
+		my ($cid, $rk) = split /\|/, $k, 2;
+		my $c = $info->{chains}{ $cid eq '-' ? '' : $cid };
+		my $r = $c && $c->{residues}{$rk};
+		unless ($r) {
+			fail("$file: Biopython has a residue $k and this does not");
+			next;
+		}
+		is($r->{hse_up},   $want_hse{$k}[0], "$file: residue $k hse_up");
+		is($r->{hse_down}, $want_hse{$k}[1], "$file: residue $k hse_down");
+	}
+
+	# Torsion angles.  mdtraj computes a phi or a psi between whichever residues
+	# are next to each other in the file, so a chain with a gap in it gets one
+	# measured across the gap; this module asks first whether the two are
+	# peptide-bonded, at Biopython's PPBuilder radius.  So the frozen line
+	# carries mdtraj's angle and whether the link is real, and both halves are
+	# checked: the angle where it is, and no angle at all where it is not.
+	#
+	# The tolerance is on an angle derived from float32 nanometre coordinates,
+	# and an angle is a ratio of differences of them, so it loses more than a
+	# distance does: the largest disagreement over t/data is 2.5e-4 degrees, and
+	# the bound is 1e-3.
+	for my $k (sort keys %want_tors) {
+		my ($ri, $what) = split ' ', $k;
+		my ($value, $real, $defined) = @{ $want_tors{$k} };
+		my $r = $res->[$ri] or next;
+		my $got = $what =~ /\Achi([0-9])\z/
+		        ? ($r->{chi} ? $r->{chi}[$1 - 1] : undef)
+		        : $r->{$what};
+		if (!$real) {
+			ok(!defined $got,
+				"$file: residue $ri has no $what, because the residues it would span are not bonded");
+			next;
+		}
+		if (!$defined) {
+			ok(!defined $got,
+				"$file: residue $ri has no $what, because its four atoms are collinear");
+			next;
+		}
+		unless (defined $got) {
+			fail("$file: residue $ri has no $what and mdtraj measured one");
+			next;
+		}
+		# an angle wraps, so 180 and -180 are the same place
+		my $d = abs($got - $value);
+		$d = abs($d - 360) if $d > 180;
+		cmp_ok($d, '<', 1e-3, "$file: residue $ri $what");
+	}
+
+	# Each chain's surface on its own, which with the surface it has in the
+	# structure is what the chains bury between them.  Only PDB files carry
+	# these lines: see the head of features.py for why an mmCIF file has no
+	# author chain id for mdtraj to group by.
+	for my $cid (sort keys %want_alone) {
+		my ($n, $a32, $a64, $pt) = @{ $want_alone{$cid} };
+		my $c = $info->{chains}{ $cid eq '-' ? '' : $cid };
+		unless ($c) {
+			fail("$file: mdtraj has a chain '$cid' and this does not");
+			next;
+		}
+		cmp_ok(abs($c->{sasa_alone} - $a64), '<', $EXACT,
+			"$file: chain $cid on its own, against the float64 kernel");
+		cmp_ok(abs($c->{sasa_alone} - $a32), '<=', $pt + 1e-6 * $a32,
+			"$file: chain $cid on its own, within one point per atom of mdtraj");
+		cmp_ok(abs($c->{buried} - ($c->{sasa_alone} - $c->{sasa})), '<', 1e-9,
+			"$file: chain $cid buries what it lost");
+	}
+
+	# Secondary structure.  This is the one place the module does not reproduce
+	# its reference exactly, and the test says so in numbers rather than passing
+	# quietly: the assignment is the Kabsch-Sander dictionary built on the
+	# hydrogen bonds checked above, and it agrees with mdtraj's DSSP on 96.9% of
+	# residues eight-state and 98.2% three-state over five real entries.  The
+	# residual is almost all beta sheet extension -- mdtraj's implementation
+	# joins ladders across bulges, which is a rule past the 1983 paper's core
+	# definitions and is not implemented here.  See the head of the block in
+	# Parser.xs.
+	#
+	# The bound is 8% per structure, which is more than twice the worst observed
+	# (4.5% on 1AHW's eight-state) and would still catch a whole helix or strand
+	# going missing.  It is a bound on a known and documented shortfall, not a
+	# tolerance widened to make a failure go away.
+	if (%want_dssp) {
+		my ($n, $bad8, $bad3) = (0, 0, 0);
+		my %simple = (H => 'H', G => 'H', I => 'H', E => 'E', B => 'E',
+		              T => 'C', S => 'C', '_' => 'C');
+		for my $ri (sort { $a <=> $b } keys %want_dssp) {
+			my $want = $want_dssp{$ri};
+			next if $want eq 'NA';
+			my $r = $res->[$ri] or next;
+			my $got = defined $r->{ss} ? $r->{ss} : undef;
+			unless (defined $got) {
+				fail("$file: residue $ri has no secondary structure and mdtraj gave it $want");
+				next;
+			}
+			$got = '_' if $got eq ' ';
+			$n++;
+			$bad8++ if $got ne $want;
+			$bad3++ if ($simple{$got} || 'C') ne ($simple{$want} || 'C');
+			is($r->{ss_simple}, $simple{$got}, "$file: residue $ri three-state letter")
+				if $r->{ss_simple} ne ($simple{$got} || 'C');
+		}
+		if ($n) {
+			cmp_ok($bad8 / $n, '<', 0.08,
+				sprintf('%s: eight-state agrees with mdtraj on %.1f%% of %d residues',
+					$file, 100 * (1 - $bad8 / $n), $n));
+			cmp_ok($bad3 / $n, '<', 0.05,
+				sprintf('%s: three-state agrees on %.1f%%', $file, 100 * (1 - $bad3 / $n)));
+		}
+	}
+
+	# Disulfides.  The frozen answer is mdtraj's rule with its units made
+	# consistent, not a call into mdtraj: its own create_disulfide_bonds()
+	# compares angstrom positions with a 0.3 nm cutoff and so finds nothing on
+	# any file.  The head of this file and the block in Parser.xs say so at
+	# length; #sg_bonds_recorded in features.txt is what mdtraj's topology
+	# actually held, and it is zero for every structure here.
+	my %index = map { $res->[$_]{chain} . '/' . $res->[$_]{key} => $_ } 0 .. $#$res;
+	my %got_ss;
+	for my $bond (@{ $feat->{disulfides} }) {
+		my @e = sort { $a <=> $b } $index{"$bond->{chain1}/$bond->{residue1}"},
+		                           $index{"$bond->{chain2}/$bond->{residue2}"};
+		$got_ss{"$e[0] $e[1]"} = $bond->{distance};
+	}
+	is_deeply([ sort keys %got_ss ], [ sort keys %want_ss ],
+		"$file: the same disulfide bonds as mdtraj's rule");
+	# The distances themselves separately, because the frozen ones come off
+	# mdtraj's float32 nanometre coordinates.  The error is in the coordinates
+	# and not in the separation: a coordinate near 50 A is 5 nm, where a float32
+	# is spaced 6e-7 nm apart, so it carries about 6e-6 A of representation error
+	# and a distance built from two of them up to twice that.  The largest
+	# disagreement over t/data is 1.13e-6 A, on ss.pdb's second bond.
+	for my $k (sort keys %want_ss) {
+		next unless exists $got_ss{$k};
+		cmp_ok(abs($got_ss{$k} - $want_ss{$k}), '<', 1e-5,
+			"$file: disulfide $k is the same length");
+	}
 }
 
 for my $file (sort keys %$frozen) {
@@ -220,6 +448,44 @@ for my $file (sort grep { !defined $frozen->{$_} } keys %$frozen) {
 	my $info = structure_info(File::Spec->catfile($dir, $file));
 	lives_ok { structure_features($info) }
 		"$file: mdtraj refuses it; this does not die on it";
+}
+
+# ---- what the file says about its own disulfides -------------------------
+#
+# The other half of the comparison, and the half that comes from the file rather
+# than from another reader: ss.pdb is five cysteines of chain A of 1AHW, and the
+# entry declares all four of its bonds in SSBOND records.  Two of those four
+# residues are in this fixture twice over, as two bonds; the fixture's own
+# SSBOND records are not carried across by t/data/generate.pl, so what is
+# checked here is the geometry and the residue-level bookkeeping.
+{
+	my $info = structure_info(File::Spec->catfile($dir, 'ss.pdb'));
+	my $ss = $info->{features}{disulfides};
+	is(scalar @$ss, 2, 'ss.pdb: two disulfides');
+	my $c = $info->{chains}{A};
+	is_deeply([ map { $_->{disulfide} ? $_->{disulfide}[0]{residue} : undef }
+	            map { $c->{residues}{$_} } @{ $c->{residue_order} } ],
+	          [ '88', '23', '194', '134', undef ],
+		'each bonded cysteine names its partner, and the free one names nobody');
+	# 1AHW's SSBOND records give 2.05 and 2.03 A for these two, rounded to the
+	# two decimals the format allows; the coordinates give 2.011 and 2.041
+	for my $bond (@$ss) {
+		cmp_ok($bond->{distance}, '>', 1.9, 'a disulfide is about 2 A long');
+		cmp_ok($bond->{distance}, '<', 2.2, '... and not much more');
+	}
+	is(scalar @{ structure_disulfides($info) }, 2,
+		'structure_disulfides returns the same list');
+	# the cutoff is the whole of the rule, so shrinking it below a real bond
+	# length must find nothing
+	is_deeply(structure_disulfides($info, disulfide_distance => 1.9), [],
+		'and no bond is shorter than 1.9 A');
+	# and widening it sweeps in pairs that are nowhere near bonded.  The next
+	# two SG-SG separations after the two real bonds are 21.17 and 22.50 A,
+	# both to the free CYS 214, so 23 A is the cutoff that first admits them.
+	is(scalar @{ structure_disulfides($info, disulfide_distance => 21) }, 2,
+		'nothing between 2.04 and 21 A');
+	is(scalar @{ structure_disulfides($info, disulfide_distance => 23) }, 4,
+		'and a 23 A cutoff sweeps in the free cysteine twice over');
 }
 
 # ---- the sequence numbers, against Biopython -----------------------------

@@ -28,8 +28,10 @@ use Cwd 'abs_path';
 my $dir  = dirname(abs_path(__FILE__));
 my $py   = $ENV{STRUCTURE_INFO_PYTHON} || 'python3';
 my $dump = "$dir/features.py";
-system("$py -c 'import mdtraj, numpy' >/dev/null 2>&1") == 0
-	or die "$py cannot import mdtraj and numpy; set STRUCTURE_INFO_PYTHON\n";
+# Biopython as well as mdtraj: the half-sphere exposure is Bio.PDB's and mdtraj
+# has no equivalent of it.
+system("$py -c 'import mdtraj, numpy, Bio' >/dev/null 2>&1") == 0
+	or die "$py cannot import mdtraj, numpy and Bio; set STRUCTURE_INFO_PYTHON\n";
 
 opendir(my $dh, $dir);
 my @files = sort grep { /\.(?:pdb|ent|cif|mmcif)\z/ } readdir $dh;

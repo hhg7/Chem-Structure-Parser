@@ -96,7 +96,9 @@ my $chains_with_seqres = 0;
 my @over;
 for my $file (@files) {
 	my $name = (split m{/}, $file)[-1];
-	my $info = eval { structure_info($file) };
+	# features => 0: this loop is about reading the file, and the surface is
+	# five times the cost of the read.  The properties get their own pass below.
+	my $info = eval { structure_info($file, features => 0) };
 	if (!$info) {
 		fail("$name: $@");
 		next;
@@ -194,7 +196,7 @@ ok(@over <= $chains_with_seqres / 20,
 	for my $file (@files[0 .. ($#files > 20 ? 20 : $#files)]) {
 		my $name = (split m{/}, $file)[-1];
 		my ($stem) = $name =~ /\A(?:pdb)?([0-9a-z]{4})[.]/i or next;
-		my $info = structure_info($file);
+		my $info = structure_info($file, features => 0);
 		next unless defined $info->{header}{id_code} && length $info->{header}{id_code};
 		$named++;
 		is($info->{id}, uc $stem, "$name: the id in HEADER matches the file name");
@@ -222,8 +224,8 @@ ok(@over <= $chains_with_seqres / 20,
 	for my $file (@some) {
 		my $name = (split m{/}, $file)[-1];
 		my $info = structure_info($file);
-		my $f = structure_features($info);
-		next unless $f->{n_atoms};
+		my $f = $info->{features};
+		next unless $f && $f->{n_atoms};
 		$checked_features++;
 
 		my ($atoms, $chains, $worst) = (0, 0, 0);
@@ -285,6 +287,70 @@ ok(@over <= $chains_with_seqres / 20,
 				if $s->{plane_angle} < $lo - 1e-9 || $s->{plane_angle} > $hi + 1e-9;
 		}
 	}
+	# --- the disulfides the coordinates show, against the ones the file
+	#     declares in its SSBOND records ---------------------------------------
+	#
+	# Two independent answers to the same question, one computed here and one
+	# written by the depositor, so a disagreement is a fact about the entry
+	# rather than a failure of either.  On the default spread all 18 entries
+	# that have disulfides agree; over a wider sweep of PDBbind they agree on 21
+	# of 22, and the one that does not is 1A4K, a Fab present in the file twice,
+	# whose SSBOND records cover one copy and whose coordinates show both.  That
+	# is why this is counted across the corpus the way the SEQRES check above
+	# is, rather than asserted per file.
+	#
+	# The declared length is also worth reading: SSBOND carries the distance the
+	# depositor measured, to two decimals, so where both name the same pair the
+	# two numbers can be compared outright.
+	{
+		# @differ last, and declared on its own: an array in the middle of a list
+		# assignment swallows every value after it
+		my ($entries, $paired, $worst) = (0, 0, 0);
+		my @differ;
+		# every file of the spread, not the twelve the surface uses: finding the
+		# disulfides touches the cysteines and nothing else, so it costs about
+		# what reading the file costs and the corpus is worth having whole
+		for my $file (@files) {
+			my $name = (split m{/}, $file)[-1];
+			my $info = eval { structure_info($file, features => 0) } or next;
+			my $found = structure_disulfides($info);
+			my $said  = $info->{ssbond} || [];
+			next unless @$found || @$said;
+			$entries++;
+			my %got = map { join('|', sort("$_->{chain1}/$_->{residue1}",
+			                               "$_->{chain2}/$_->{residue2}")) => $_->{distance} }
+			          @$found;
+			my %want;
+			for my $b (@$said) {
+				my $k = join('|', sort("$b->{chain1}/$b->{resseq1}",
+				                       "$b->{chain2}/$b->{resseq2}"));
+				$want{$k} = $b->{length};
+			}
+			push @differ, sprintf('%s: found %d, declared %d', $name,
+				scalar keys %got, scalar keys %want)
+				unless join(',', sort keys %got) eq join(',', sort keys %want);
+			for my $k (keys %want) {
+				next unless exists $got{$k} && defined $want{$k} && $want{$k} > 0;
+				$paired++;
+				my $d = abs($got{$k} - $want{$k});
+				$worst = $d if $d > $worst;
+			}
+		}
+		diag("computed and declared disulfides differ: $_") for @differ;
+		ok(@differ <= $entries / 5,
+			sprintf('the disulfides found match the ones declared in all but a few entries (%d of %d)',
+				scalar @differ, $entries));
+		# SSBOND writes the length in two decimals, so rounding alone allows
+		# 0.005 A, and the observed worst over the spread is 0.0055 A across 82
+		# bonds -- a whisker past rounding, which is what refinement does.  The bound
+		# is 0.01, one further step, because a re-refined entry can carry a
+		# length measured before the last round of refinement; anything past
+		# that would mean the two are measuring different atoms.
+		cmp_ok($worst, '<', 0.01,
+			sprintf('and where both name a bond, the lengths agree (%d bonds, worst %.4f A)',
+				$paired, $worst));
+	}
+
 	ok($checked_features > 0, 'the physical properties were computed on real structures');
 	diag("computed the properties of $checked_features structures, "
 	   . "$n_ring_pairs stacked ring pairs between them");

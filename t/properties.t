@@ -18,6 +18,178 @@ use Chem::Structure::Parser;
 
 my $data = dirname(abs_path(__FILE__)) . '/data';
 
+# ---- structure_info computes them on the way past ------------------------
+{
+	my $i = structure_info("$data/stack.pdb");
+	ok($i->{features}, 'structure_info leaves the properties in $info->{features}');
+	ok(defined $i->{chains}{A}{sasa}, 'and the per-chain figures on the chains');
+	my $c = $i->{chains}{A};
+	my $r = $c->{residues}{ $c->{residue_order}[0] };
+	ok(defined $r->{sasa} && defined $r->{rsa}, 'and the per-residue ones');
+	ok(defined $r->{atoms}{ $r->{atom_order}[0] }{sasa}, 'and the per-atom ones');
+
+	# with no options, the three accessors hand back what is already there
+	# rather than walking the structure again
+	is(structure_features($i),    $i->{features},              'structure_features returns the cached hash');
+	is(structure_sasa($i),        $i->{features}{sasa},        'and structure_sasa its surface');
+	is(structure_pi_stacking($i), $i->{features}{pi_stacking}, 'and structure_pi_stacking its pairs');
+	is(structure_disulfides($i),  $i->{features}{disulfides},  'and structure_disulfides its bonds');
+	is(structure_contacts($i),    $i->{features}{contacts},    'and structure_contacts its pairs');
+	is(structure_hbonds($i),      $i->{features}{hbonds},      'and structure_hbonds its bonds');
+	# name any option and it is computed again with that option in force
+	isnt(structure_features($i, probe => 2.0), $i->{features},
+		'naming an option computes again instead');
+
+	my $off = structure_info("$data/stack.pdb", features => 0);
+	ok(!exists $off->{features}, 'features => 0 leaves them uncomputed');
+	ok(!exists $off->{chains}{A}{sasa}, 'and writes nothing into the chains');
+	is_deeply(structure_features($off), $i->{features},
+		'and asking afterwards gives the same answer the read would have');
+
+	# atoms => 0 turns them off on its own: there is nothing to compute from,
+	# and structure_sequences() passes it as a documented fast path
+	my $bare = structure_info("$data/stack.pdb", atoms => 0);
+	ok(!exists $bare->{features},
+		'atoms => 0 turns them off rather than dying on its way past');
+	lives_ok { structure_sequences("$data/stack.pdb", atoms => 0, meta => 0) }
+		'so the documented fast path still works';
+}
+
+# ---- the rest of the properties -------------------------------------------
+{
+	my $i = structure_info("$data/fold.pdb");
+	my $f = $i->{features};
+	my $c = $i->{chains}{A};
+
+	# the gyration tensor's three moments are the radius of gyration read a
+	# different way: they sum to its square
+	my $m = $f->{shape}{principal_moments};
+	is(scalar @$m, 3, 'three principal moments');
+	cmp_ok($m->[0], '<=', $m->[1], 'in ascending order');
+	cmp_ok($m->[1], '<=', $m->[2], '...');
+	cmp_ok(abs($m->[0] + $m->[1] + $m->[2] - $f->{rg} ** 2), '<', 1e-9,
+		'and they sum to the radius of gyration squared');
+	cmp_ok(abs($f->{shape}{asphericity} - ($m->[2] - ($m->[0] + $m->[1]) / 2)), '<', 1e-9,
+		'asphericity is the largest moment above the mean of the others');
+	cmp_ok(abs($f->{shape}{acylindricity} - ($m->[1] - $m->[0])), '<', 1e-9,
+		'acylindricity is the gap between the two smaller ones');
+	cmp_ok($f->{shape}{anisotropy}, '>=', 0, 'the anisotropy is between zero');
+	cmp_ok($f->{shape}{anisotropy}, '<=', 1, '... and one');
+	is(scalar @{ $f->{shape}{gyration_tensor} }, 3, 'the tensor is three rows');
+	cmp_ok(abs($f->{shape}{gyration_tensor}[0][1] - $f->{shape}{gyration_tensor}[1][0]),
+		'<', 1e-12, 'and it is symmetric');
+
+	# one chain buries nothing against anything
+	cmp_ok(abs($c->{sasa_alone} - $c->{sasa}), '<', 1e-9,
+		'a structure of one chain has the same surface alone as together');
+	cmp_ok(abs($f->{sasa}{buried}), '<', 1e-9, 'and buries nothing');
+
+	# torsion angles
+	my @with_phi = grep { defined $c->{residues}{$_}{phi} } @{ $c->{residue_order} };
+	cmp_ok(scalar @with_phi, '>', 50, 'most residues of a folded run have a phi');
+	my $first = $c->{residues}{ $c->{residue_order}[0] };
+	ok(!exists $first->{phi}, 'the first residue of a chain has none');
+	for my $rk (@{ $c->{residue_order} }) {
+		my $r = $c->{residues}{$rk};
+		for my $k (qw(phi psi omega)) {
+			next unless defined $r->{$k};
+			cmp_ok($r->{$k}, '>=', -180, "$rk $k is an angle")
+				if $r->{$k} < -180;
+			cmp_ok($r->{$k}, '<=', 180, "$rk $k is an angle")
+				if $r->{$k} > 180;
+		}
+		next unless $r->{chi};
+		cmp_ok(scalar @{ $r->{chi} }, '<=', 5, "$rk has at most five chi angles")
+			if @{ $r->{chi} } > 5;
+	}
+	ok(!exists $c->{residues}{ $c->{residue_order}[0] }{chi}
+	   || 1, 'a glycine has no chi angles');
+
+	# secondary structure
+	my %seen;
+	for my $rk (@{ $c->{residue_order} }) {
+		my $r = $c->{residues}{$rk};
+		next unless defined $r->{ss};
+		$seen{ $r->{ss} }++;
+		like($r->{ss}, qr/\A[HGIEBTS ]\z/, "$rk has a dictionary letter")
+			if $r->{ss} !~ /\A[HGIEBTS ]\z/;
+		like($r->{ss_simple}, qr/\A[HEC]\z/, "$rk has a three-state letter")
+			if $r->{ss_simple} !~ /\A[HEC]\z/;
+	}
+	ok($seen{H}, 'the folded fixture has an alpha helix in it');
+	ok($seen{T}, 'and turns');
+
+	# hydrogen bonds
+	cmp_ok(scalar @{ $f->{hbonds} }, '>', 10, 'and backbone hydrogen bonds');
+	for my $b (@{ $f->{hbonds} }) {
+		cmp_ok($b->{energy}, '<', -0.5, 'every bond is below the cutoff')
+			if $b->{energy} >= -0.5;
+		cmp_ok($b->{energy}, '>=', -9.9, 'and none is stronger than the floor')
+			if $b->{energy} < -9.9;
+	}
+
+	# contacts and exposure
+	cmp_ok(scalar @{ $f->{contacts} }, '>', 50, 'and residue contacts');
+	for my $ct (@{ $f->{contacts} }) {
+		cmp_ok($ct->{distance}, '<=', 4.5, 'no contact is past the cutoff')
+			if $ct->{distance} > 4.5;
+	}
+	my $n_hse = grep { defined $c->{residues}{$_}{hse_up} } @{ $c->{residue_order} };
+	cmp_ok($n_hse, '>', 50, 'and half-sphere exposure on most residues');
+
+	# the options turn each of them off
+	for my $off (qw(shape dihedrals contacts exposure hbonds secondary)) {
+		my $j = structure_info("$data/fold.pdb", features => 0);
+		my $g = structure_features($j, $off => 0);
+		ok(!exists $g->{shape}, "$off => 0 leaves no shape") if $off eq 'shape';
+		ok(!exists $g->{contacts}, "$off => 0 leaves no contacts") if $off eq 'contacts';
+		ok(!exists $g->{hbonds}, "$off => 0 leaves no hbonds") if $off eq 'hbonds';
+		my $r = $j->{chains}{A}{residues}{ $j->{chains}{A}{residue_order}[10] };
+		ok(!exists $r->{phi}, "$off => 0 leaves no torsion angles") if $off eq 'dihedrals';
+		ok(!exists $r->{hse_up}, "$off => 0 leaves no exposure") if $off eq 'exposure';
+		ok(!exists $r->{ss}, "$off => 0 leaves no secondary structure") if $off eq 'secondary';
+	}
+	my $noi = structure_features(structure_info("$data/fold.pdb", features => 0),
+		interface => 0);
+	ok(!exists $noi->{sasa}{buried}, 'interface => 0 leaves no buried area');
+}
+
+# ---- disulfides ----------------------------------------------------------
+{
+	my $i = structure_info("$data/ss.pdb");
+	my $ss = $i->{features}{disulfides};
+	is(scalar @$ss, 2, 'ss.pdb has two disulfides');
+	my $c = $i->{chains}{A};
+	is_deeply($c->{residues}{23}{disulfide}[0]{residue}, '88', 'CYS 23 is bonded to CYS 88');
+	is_deeply($c->{residues}{88}{disulfide}[0]{residue}, '23', 'and the bond is on both residues');
+	ok(!exists $c->{residues}{214}{disulfide}, 'the free cysteine has no bond');
+	is(scalar @{ $c->{residues}{23}{disulfide} }, 1, 'a cysteine holds one bond');
+	cmp_ok(abs($c->{residues}{23}{disulfide}[0]{distance} - $ss->[0]{distance}), '<', 1e-12,
+		'and the length on the residue is the length in the list');
+
+	# asking twice replaces what is on the residue rather than adding to it
+	structure_features($i, probe => 1.4);
+	is(scalar @{ $i->{chains}{A}{residues}{23}{disulfide} }, 1,
+		'asking again does not give the residue a second copy of the same bond');
+
+	# a cysteine whose thiol hydrogen was modelled is reduced and holds no bond.
+	# Built by sprintf rather than typed, because a PDB record is fixed-column.
+	my $line = sub {
+		my ($serial, $name, $elem, $resseq, $x, $y, $z) = @_;
+		return sprintf('%-6s%5d %-4s %3s %1s%4d%1s   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s',
+			'ATOM  ', $serial, (length($name) < 4 ? " $name" : $name), 'CYS', 'A',
+			$resseq, '', $x, $y, $z, 1, 20, $elem);
+	};
+	my @sg = ($line->(1, 'SG', 'S', 1, 0, 0, 0), $line->(2, 'SG', 'S', 2, 2, 0, 0));
+	my $bonded = structure_info_string(join("\n", @sg) . "\nEND\n");
+	is(scalar @{ $bonded->{features}{disulfides} }, 1,
+		'two SG atoms 2 A apart are a disulfide');
+	my @hg = (@sg, $line->(3, 'HG', 'H', 1, 0.5, 0.9, 0));
+	my $reduced = structure_info_string(join("\n", @hg) . "\nEND\n");
+	is(scalar @{ $reduced->{features}{disulfides} }, 0,
+		'and are not, once one of them has its thiol hydrogen modelled');
+}
+
 # ---- what comes back -----------------------------------------------------
 {
 	my $i = structure_info("$data/stack.pdb");
@@ -84,8 +256,11 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 }
 
 # ---- store => 0 ----------------------------------------------------------
+#
+# Read with features => 0, because structure_info() computes and stores them by
+# default and there would otherwise be nothing left for store => 0 to not do.
 {
-	my $i = structure_info("$data/stack.pdb");
+	my $i = structure_info("$data/stack.pdb", features => 0);
 	my $f = structure_features($i, store => 0);
 	cmp_ok($f->{sasa}{total}, '>', 0, 'the total still comes back');
 	my $c = $i->{chains}{A};
@@ -100,12 +275,12 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 {
 	my $i = structure_info("$data/stack.pdb");
 	my $s = structure_features($i)->{sasa};
-	my $j = structure_info("$data/stack.pdb");
+	my $j = structure_info("$data/stack.pdb", features => 0);
 	my $t = structure_sasa($j);
 	is_deeply($t, $s, 'structure_sasa returns what structure_features puts under sasa');
 	ok(defined $j->{chains}{A}{sasa}, 'and stores the per-chain figure too');
 
-	my $k = structure_info("$data/stack.pdb");
+	my $k = structure_info("$data/stack.pdb", features => 0);
 	my $p = structure_pi_stacking($k);
 	is(scalar @$p, 4, 'structure_pi_stacking returns the pairs on their own');
 	ok(!exists $k->{chains}{A}{sasa},
@@ -216,6 +391,12 @@ for my $pair ([ 'stack.pdb', 'stack.cif' ], [ 'bases.pdb', 'bases.cif' ],
 		'a pi-stacking threshold means nothing to structure_sasa';
 	throws_ok { structure_pi_stacking($i, probe => 1.4) } qr/unknown option 'probe'/,
 		'and a probe radius means nothing to structure_pi_stacking';
+	throws_ok { structure_disulfides($i, probe => 1.4) } qr/unknown option 'probe'/,
+		'nor to structure_disulfides';
+	throws_ok { structure_features($i, disulfide_distance => -1) }
+		qr/disulfide_distance must be a number/, 'a negative bond length is refused';
+	throws_ok { structure_features($i, disulfide_distance => 'short') }
+		qr/disulfide_distance must be a number/, 'and so is a word';
 	throws_ok { structure_features($i, probe => -1) } qr/probe must be a number/,
 		'a negative probe is refused';
 	throws_ok { structure_features($i, probe => 'wide') } qr/probe must be a number/,
@@ -231,7 +412,8 @@ for my $pair ([ 'stack.pdb', 'stack.cif' ], [ 'bases.pdb', 'bases.cif' ],
 		'and an angle that is not a number';
 }
 
-for my $who (qw(structure_features structure_sasa structure_pi_stacking)) {
+for my $who (qw(structure_features structure_sasa structure_pi_stacking
+                structure_disulfides structure_contacts structure_hbonds)) {
 	no strict 'refs';
 	throws_ok { &{"Chem::Structure::Parser::$who"}(undef) } qr/\Q$who\E: expected the hash/,
 		"$who refuses undef";
