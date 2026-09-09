@@ -69,7 +69,7 @@ for my $file (@ARGV) {
 			print join("\t", qw(id file n_atoms mass rg rg_mass sasa apolar polar
 			                    hydropathy aromatic_fraction gc_fraction
 			                    purine_fraction n_pi_stacking n_disulfides
-			                    n_base_pairs)), "\n";
+			                    n_base_pairs n_base_stacks stacked)), "\n";
 		}
 		print join("\t",
 			$info->{id} // '',
@@ -90,6 +90,9 @@ for my $file (@ARGV) {
 			scalar @{ $f->{pi_stacking} },
 			scalar @{ $f->{disulfides} },
 			scalar @{ $f->{base_pairs} },
+			scalar @{ $f->{base_stacks} },
+			# and how many of those cleared the paper's 50%
+			scalar(grep { $_->{stacked} } @{ $f->{base_stacks} }),
 		), "\n";
 		next;
 	}

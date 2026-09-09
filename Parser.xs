@@ -3395,6 +3395,469 @@ static AV *base_pairs(pTHX_ structset *CSP_RESTRICT s, NV hb, NV stagger, bool s
 	return out;
 }
 
+/*Base stacking, scored the way Condon's tetramer benchmark scores it.
+
+base_pairs() above answers whether two bases lie side by side in a plane; this
+answers the other question a nucleic acid poses, which is whether one base lies
+on the face of another.  pi_stacking() answers a version of it too, but as a
+yes/no over a ring's centroid and normal, with mdtraj's thresholds; this is the
+question asked the way the RNA literature asks it -- three geometric variables
+and one number between -100% and 100% built out of them -- so that a caller can
+see how stacked a pair is rather than only that it passed.
+
+Provenance.  The definition and every constant below are
+
+  Condon, D E; Kennedy, S D; Mort, B C; Kierzek, R; Yildirim, I; Turner, D H
+  (2015) "Stacking in RNA: NMR of Four Tetramers Benchmark Molecular
+  Dynamics", J Chem Theory Comput 11(6):2729-2742, doi:10.1021/ct501025q,
+  section 2.4 "Criteria for Stacking", equations 9 and 10 and Figures 4 and 5,
+
+and the implementation those numbers were produced with, which is the author's
+own PDB_stacker (https://github.com/hhg7/PDB_stacker, pdb_stacking.pl).  The
+paper is the definition of record and the script is what was run; where the two
+disagree the script is what the published percentages mean, and each such place
+is marked below with the measurement that settles it.  The measurement is
+Figure 4, which is the one worked example either gives: residues 13 (C) and 14
+(G) of chain B of PDB entry 157D, for which the caption reports d0 = 4.5 A,
+omega = 40.7 degrees and Xi = 17.3 degrees.  Those residues are t/data/aform.pdb
+and t/stacking.t is where the three numbers are checked.
+
+**The base's frame.**  Each base gets a centre of mass over the heavy atoms
+listed in nucbase_of() and two vectors a and b from that centre to two named
+atoms far apart on the ring, chosen so that the pair spans the base and so that
+out-of-plane distortion moves the cross product as little as possible.  a x b
+and b x a are the base's two normal vectors, one above the plane and one below;
+which is which is arbitrary and nothing here depends on it, because every
+quantity below is a minimum over the two.
+
+The normals are *not* normalised, and that is load-bearing rather than an
+oversight: |a x b| is the d1 of equation 9, so the length of the cross product
+enters omega as a lever arm.  It has units of area and is used as a length,
+which is what the reference implementation does and what the published angles
+were computed with.
+
+**The three variables**, for an ordered pair of bases (the 5' one first):
+
+  d0     the distance between the two centres of mass.
+  omega  "oh-mega", for overlap: the angle at the 5' centre of mass in the
+         triangle whose sides are d0, d1 = |a x b| of the 5' base, and d2, the
+         distance from the tip of whichever of the 5' base's two normals lands
+         nearer to the 3' base's centre of mass.  Equation 9, by the law of
+         cosines.  It is small when the 3' base sits over the 5' base's face
+         and large when it sits beside it, like the angle between the steps of
+         a staircase.
+  Xi     the angle between the two bases' normal vectors, 0 when the planes are
+         parallel.  Equation 10 and Figure 5: Xi near 0 is a parallel stack and
+         Xi near 90 a T-shape, which is a different interaction and is scored
+         negative rather than dropped.
+
+**Which base is the 5' one.**  omega is not symmetric -- it is measured from
+one base's normal against the other's centre of mass -- so the pair has to be
+ordered.  The order is the order the file lists the two residues in, which for
+a strand written 5' to 3' as the formats and the archive write it is the
+chemical order.  Two bases in different chains have no 5'/3' relation at all;
+there the order is the chain order, and the reported omega is the one measured
+from the base the pair names first.
+
+**Where this departs from the paper's text, and why.**
+
+  - Equation 10 as printed is min(arcsin(|(a5 x b5) x (a3 x b3)| / ...),
+    arcsin(|(a5 x b5) x (b3 x a3)| / ...)).  The two arguments differ only in
+    the sign of the second cross product, so the two arcsines are equal and the
+    minimum is a formality; and taken literally the expression is the angle
+    between the two normals with no reference to where the bases are.  The
+    script instead compares the 5' base's normal with the 3' base's normal
+    *translated so that both are drawn from the 5' base's centre of mass* --
+    its comment says "pretend that both vectors are centered on the 5'
+    nucleotide's Center of Mass" -- and takes the smaller of the two answers
+    the 3' base's two normals give.  On the Figure 4 pair the printed equation
+    gives 9.5 degrees and the script gives 17.31; the caption says 17.3, so the
+    script is what Xi means and is what is implemented here.
+  - Guanine's centre of mass is taken over ten atoms and not eleven: N2, the
+    exocyclic amino nitrogen, is not in the script's list, though adenine's N6
+    and cytosine's N4 are in theirs.  It reads like an omission, but it is the
+    omission the published numbers were computed with -- on the Figure 4 pair
+    including N2 gives d0 = 4.77 A and omega = 43.56 degrees against the
+    caption's 4.5 and 40.7, and leaving it out gives 4.53 and 40.74.
+  - Criterion I in the paper's text puts the distance knee at 3.5 A ("If
+    d0 <= 3.5 A, the stacking score is incremented +1"); the script's
+    $DISTANCE_MIN is 4.  4 is used here, again because it is the number behind
+    the published percentages.  It is not an option: the two cutoffs that
+    decide whether a pair is reported at all are options below, and the shape
+    of the ramp between them is the definition.
+  - The masses are this module's own standard atomic weights, from
+    elem_prop_of(), where the script uses the mass numbers 12, 14 and 16.  One
+    mass table in the file is worth more than agreement in the last place the
+    difference reaches: on the Figure 4 pair the two centres of mass differ by
+    enough to move d0 from 4.528 A to 4.529 A, and omega and Xi not at all to
+    two decimal places.
+
+**What it does not do.**  A base whose letter is not one of the six below, or
+that is missing any atom the letter's entry names, contributes no frame and so
+appears in no pair -- the same rule rings_find() applies to an incomplete ring.
+That covers a 4-thiouridine, whose O4 is a sulphur, as well as a base whose
+density ran out; no geometry is invented for either.*/
+
+/*The distance beyond which two bases are not stacked, from CCSD(T) calculations
+on stacked uracil and adenine dimers -- the paper's criterion I, citing its
+references 63 and 45.  This and the angle below are defaults: the caller's two
+cutoffs are what base_stacks() builds its grid on and scores against.*/
+#define CSP_STACK_DIST 5.0
+//the angle beyond which they are not stacked either, and Xi is not computed;
+//criterion II, chosen there from X-ray statistics
+#define CSP_STACK_OMEGA 50.0
+//the knees of the two ramps: full marks at or below these, falling to nothing
+//at the cutoffs above.  PDB_stacker's $DISTANCE_MIN and $OMEGA_MIN.
+#define CSP_STACK_DIST_KNEE  4.0
+#define CSP_STACK_OMEGA_KNEE 25.0
+//Xi above this is a T-shape rather than a stack, and flips the score's sign.
+//The paper's "45.0 < chi < 135.0" over an angle its own equation confines to
+//0..90, so only the lower bound can ever be reached.
+#define CSP_STACK_T 45.0
+
+typedef struct {
+	const char *const *atom;  //the heavy atoms the centre of mass is taken over
+	unsigned short int n;     //how many
+	const char *a, *b;        //the two atoms the normal's cross product is built from
+} nucbase_def;
+
+/*Adenine's ten heavy atoms, guanine's ten (see N2, above), cytosine's eight and
+uracil's eight, exactly as PDB_stacker's %atoms lists them.  Every name in every
+list begins with the atom's element, which is what lets the masses be looked up
+from the first byte alone; that is true of these fourteen names and is not a
+general fact about PDB atom names.*/
+static const char *const base_ade[10] = {
+	"N1", "C2", "N3", "C4", "C5", "C6", "N6", "N7", "C8", "N9"
+};
+static const char *const base_gua[10] = {
+	"N1", "C2", "N3", "C4", "C5", "C6", "O6", "N7", "C8", "N9"
+};
+static const char *const base_cyt[8] = {
+	"N1", "C2", "O2", "N3", "C4", "N4", "C5", "C6"
+};
+static const char *const base_ura[8] = {
+	"N1", "C2", "O2", "N3", "C4", "O4", "C5", "C6"
+};
+
+/*The frame for a base, by the single-letter code res_lookup() gave its residue,
+or false for a letter that names no base this can build one for.
+
+Six letters out of the four entries.  Inosine has guanine's ring and guanine's
+O6 and simply has no N2, so the ten atoms guanine is measured over are ten
+inosine also has; thymine is uracil with a methyl on C5, and takes uracil's
+eight, which leaves C7 out of the centre of mass exactly as guanine's N2 is left
+out.  N -- the archive's unknown nucleotide -- names no base and gets none.
+
+Every modified base res_lookup() spells reaches its parent's entry through its
+letter: a pseudouridine is measured as a uridine, a 7-methylguanosine as a
+guanosine, and so on, which is right as long as the modification leaves the
+named atoms where they were.  Where it does not, the atom is missing under that
+name and the base is dropped rather than mismeasured.*/
+static bool nucbase_of(char one, const nucbase_def *CSP_RESTRICT *CSP_RESTRICT out)
+{
+	//the two vectors are the paper's: (CoM -> C8, CoM -> N6) for adenine,
+	//(CoM -> C8, CoM -> O6) for guanine, (CoM -> O2, CoM -> N4) for cytosine
+	//and (CoM -> O2, CoM -> O4) for uracil
+	static const nucbase_def defs[4] = {
+		{ base_ade, 10, "C8", "N6" },
+		{ base_gua, 10, "C8", "O6" },
+		{ base_cyt,  8, "O2", "N4" },
+		{ base_ura,  8, "O2", "O4" }
+	};
+	switch (one) {
+		case 'A': *out = &defs[0]; return TRUE;
+		case 'G': case 'I': *out = &defs[1]; return TRUE;
+		case 'C': *out = &defs[2]; return TRUE;
+		case 'U': case 'T': *out = &defs[3]; return TRUE;
+		default:  *out = NULL;     return FALSE;
+	}
+}
+
+typedef struct {
+	NV cx, cy, cz; //centre of mass over the base's heavy atoms
+	NV nx, ny, nz; //a x b, the normal above the plane; NOT a unit vector
+	NV nlen;       //|a x b|, which is the d1 of equation 9
+	UV res;        //which residue it belongs to
+	char one;      //A, C, G, I, T or U
+} nucbase_t; //nucbase_t and not stack_t: POSIX <signal.h> has that name
+
+/*Every base in the structure that has a frame, in walk order -- which is chain
+order and then the order the file listed the residues, so a lower index is the
+5' base of any pair drawn from one strand.*/
+static UV stacks_find(pTHX_ structset *CSP_RESTRICT s, nucbase_t *CSP_RESTRICT *CSP_RESTRICT out)
+{
+	nucbase_t *b = NULL;
+	UV n = 0, r;
+	*out = NULL;
+	if (s->n_res == 0) return 0;
+	Newx(b, s->n_res, nucbase_t);
+	for (r = 0; r < s->n_res; r++) {
+		const nucbase_def *def;
+		HV *atoms;
+		NV cx = 0.0, cy = 0.0, cz = 0.0, tot = 0.0;
+		NV ax, ay, az, bx, by, bz, wx, wy, wz, wl;
+		unsigned short int i;
+		bool whole = TRUE;
+		if (s->res_type[r] != RT_NUC) continue;
+		if (!nucbase_of(s->res_one[r], &def)) continue;
+		atoms = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
+		if (!atoms) continue;
+		//summed as it goes: unlike rings_find(), which needs its first two
+		//atoms again to take the plane from, nothing here looks at an atom a
+		//second time -- a and b are fetched by name below
+		for (i = 0; i < def->n; i++) {
+			elem_prop ep;
+			NV px, py, pz;
+			if (!atom_xyz(aTHX_ atoms, def->atom[i], &px, &py, &pz)
+			 || !elem_prop_of(def->atom[i], 1, &ep) || !(ep.mass > 0.0)) {
+				whole = FALSE;
+				break;
+			}
+			cx += ep.mass * px; cy += ep.mass * py; cz += ep.mass * pz;
+			tot += ep.mass;
+		}
+		//an incomplete base has no centre of mass to speak of, the same way an
+		//incomplete ring has no plane
+		if (!whole || !(tot > 0.0)) continue;
+		cx /= tot; cy /= tot; cz /= tot;
+		if (!atom_xyz(aTHX_ atoms, def->a, &ax, &ay, &az)) continue;
+		if (!atom_xyz(aTHX_ atoms, def->b, &bx, &by, &bz)) continue;
+		ax -= cx; ay -= cy; az -= cz;
+		bx -= cx; by -= cy; bz -= cz;
+		wx = ay * bz - az * by;
+		wy = az * bx - ax * bz;
+		wz = ax * by - ay * bx;
+		wl = nv_sqrt(wx * wx + wy * wy + wz * wz);
+		//a and b collinear with the centre of mass define no plane, and d1
+		//would be zero in the denominator of equation 9
+		if (!(wl > 0.0)) continue;
+		b[n].cx = cx; b[n].cy = cy; b[n].cz = cz;
+		b[n].nx = wx; b[n].ny = wy; b[n].nz = wz;
+		b[n].nlen = wl;
+		b[n].res = r;
+		b[n].one = s->res_one[r];
+		n++;
+	}
+	*out = b;
+	return n;
+}
+
+/*The stacking score, as a percentage: the paper's criteria I, II and III and
+PDB_stacker's stacking_score(), which award a point for the distance and a point
+for the overlap, flip the sign for a T-shape, and report the two points as
+100%.
+
+  d0    <= knee            1
+        knee < d0 <= cut   1 / (d0 - knee + 1)^3, the paper's "decreased as
+                           r^-3 from 1 to 0"
+  omega <= knee            1
+        knee < om <= cut   linear from 1 at the knee to 0 at the cutoff
+  Xi    > 45 degrees       the whole score is multiplied by -1
+
+Both cutoffs are the caller's, so that a caller who wants the paper's 3.5 A
+criterion or a different overlap limit has them; the knees are not.  A caller
+who moves a cutoff below its knee gets a ramp that never runs, which is the
+honest answer to the question asked rather than a croak.
+
+Reached only for a pair already inside both cutoffs, which is where the score
+is defined: outside them the paper does not compute the angles at all, and the
+score is 0 without being calculated.*/
+static NV stack_score(NV d0, NV omega, NV xi, NV dist_cut, NV omega_cut)
+{
+	NV score = 0.0;
+	if (d0 <= CSP_STACK_DIST_KNEE) {
+		score += 1.0;
+	} else if (d0 <= dist_cut) {
+		const NV t = d0 - CSP_STACK_DIST_KNEE + 1.0;
+		score += 1.0 / (t * t * t);
+	}
+	if (omega <= CSP_STACK_OMEGA_KNEE) {
+		score += 1.0;
+	} else if (omega <= omega_cut && omega_cut > CSP_STACK_OMEGA_KNEE) {
+		score += (omega_cut - omega) / (omega_cut - CSP_STACK_OMEGA_KNEE);
+	}
+	if (xi > CSP_STACK_T) score = -score;
+	return 100.0 * score / 2.0;
+}
+
+/*The partner half of one stack, pushed onto a base's own list, as bp_note()
+does for a pair.  The three variables go on with it, because a residue's own
+list is the only place a caller walking residues will look for them.
+
+Both residues get the same d0, omega, Xi and score -- they are the pair's, not
+either base's.  What differs is `side', which says which end of the pair this
+residue is: omega is measured from the 5' base against the 3' base's centre of
+mass, so a residue that reads its own list needs to know which one it was.*/
+static void stack_note(pTHX_ HV *CSP_RESTRICT res, HV *CSP_RESTRICT partner,
+                       const char *CSP_RESTRICT type, NV d0, NV omega,
+                       const NV *CSP_RESTRICT xi, NV score, bool five_prime)
+{
+	SV **slot = hv_fetch(res, "base_stack", 10, 0);
+	AV *list;
+	HV *e;
+	if (slot && *slot && SvROK(*slot) && SvTYPE(SvRV(*slot)) == SVt_PVAV) {
+		list = (AV *)SvRV(*slot);
+	} else {
+		list = newAV();
+		(void)hv_stores(res, "base_stack", newRV_noinc((SV *)list));
+	}
+	e = newHV();
+	pi_field(aTHX_ e, "chain", 5, partner, "chain", 5);
+	pi_field(aTHX_ e, "residue", 7, partner, "key", 3);
+	pi_field(aTHX_ e, "resname", 7, partner, "resname", 7);
+	(void)hv_stores(e, "type", newSVpv(type, 0));
+	(void)hv_stores(e, "distance", newSVnv(d0));
+	(void)hv_stores(e, "omega", newSVnv(omega));
+	if (xi) (void)hv_stores(e, "xi", newSVnv(*xi));
+	(void)hv_stores(e, "score", newSVnv(score));
+	//which end of the pair this residue is, because omega is measured from the
+	//5' base and means nothing read the other way round
+	(void)hv_stores(e, "side", newSVpv(five_prime ? "5'" : "3'", 0));
+	av_push(list, newRV_noinc((SV *)e));
+}
+
+/*base_stacks() -- d0, omega, Xi and the score for every pair of bases close
+enough for the paper to compute them.
+
+Every pair within the distance cutoff is reported, stacked or not, because the
+three variables are the answer and the score is a summary of them: a caller
+benchmarking a force field wants the pair that scored 12% as much as the one
+that scored 98%.  A pair whose omega is past its cutoff carries no Xi, which is
+criterion II -- "the base is not considered stacked and Xi is not computed" --
+and scores 0.
+
+The pairs come off the same centroid grid base_pairs() uses, on the centres of
+mass.*/
+static AV *base_stacks(pTHX_ structset *CSP_RESTRICT s, NV dist_cut, NV omega_cut,
+                       bool store)
+{
+	AV *out = newAV();
+	nucbase_t *bases = NULL;
+	NV *cx = NULL, *cy = NULL, *cz = NULL;
+	const NV to_deg = 180.0 / CSP_PI;
+	cell_grid g;
+	UV n, i;
+
+	n = stacks_find(aTHX_ s, &bases);
+	if (n < 2) { Safefree(bases); return out; }
+	Newx(cx, n, NV); Newx(cy, n, NV); Newx(cz, n, NV);
+	for (i = 0; i < n; i++) { cx[i] = bases[i].cx; cy[i] = bases[i].cy; cz[i] = bases[i].cz; }
+	/*Clear what an earlier call left behind, so that asking twice replaces the
+	answer rather than adding to it.  Which residues are candidates is decided
+	by the residue's name and its atoms alone, never by either cutoff, so these
+	are exactly the ones a previous call could have written to.*/
+	if (store)
+		for (i = 0; i < n; i++)
+			(void)hv_delete(s->res_hv[bases[i].res], "base_stack", 10, G_DISCARD);
+	grid_build(aTHX_ &g, cx, cy, cz, n, dist_cut);
+
+	for (i = 0; i < n; i++) {
+		UV bx, by, bz;
+		UV ci = grid_axis(cx[i] - g.x0, g.cell, g.nx);
+		UV cj = grid_axis(cy[i] - g.y0, g.cell, g.ny);
+		UV ck = grid_axis(cz[i] - g.z0, g.cell, g.nz);
+		UV ax0 = ci ? ci - 1 : 0, ax1 = (ci + 1 < g.nx) ? ci + 1 : g.nx - 1;
+		UV ay0 = cj ? cj - 1 : 0, ay1 = (cj + 1 < g.ny) ? cj + 1 : g.ny - 1;
+		UV az0 = ck ? ck - 1 : 0, az1 = (ck + 1 < g.nz) ? ck + 1 : g.nz - 1;
+		for (bx = ax0; bx <= ax1; bx++)
+		for (by = ay0; by <= ay1; by++)
+		for (bz = az0; bz <= az1; bz++) {
+			UV cell = (bx * g.ny + by) * g.nz + bz, p;
+			for (p = g.start[cell]; p < g.start[cell + 1]; p++) {
+				UV j = g.idx[p];
+				NV vx, vy, vz, d0, d1, d2, cosw, omega, xi = 0.0, score;
+				bool have_xi = FALSE;
+				char tname[4];
+				HV *h;
+				unsigned short int k;
+				if (j <= i) continue; //each pair once, the earlier residue first
+				//two conformers of one residue are not two bases
+				if (bases[i].res == bases[j].res) continue;
+				vx = cx[j] - cx[i]; vy = cy[j] - cy[i]; vz = cz[j] - cz[i];
+				d0 = nv_sqrt(vx * vx + vy * vy + vz * vz);
+				if (d0 > dist_cut || !(d0 > 0.0)) continue;
+				/*d2: the 5' base's two normals are its centre of mass plus and
+				minus a x b, and the one that lands nearer the 3' base's centre
+				of mass is the one equation 9 wants -- the base has two faces
+				and the 3' base is over one of them.*/
+				d1 = bases[i].nlen;
+				d2 = 0.0;
+				for (k = 0; k < 2; k++) {
+					const NV sign = k ? -1.0 : 1.0;
+					const NV ex = vx - sign * bases[i].nx;
+					const NV ey = vy - sign * bases[i].ny;
+					const NV ez = vz - sign * bases[i].nz;
+					const NV e = nv_sqrt(ex * ex + ey * ey + ez * ez);
+					if (k == 0 || e < d2) d2 = e;
+				}
+				//equation 9, the law of cosines.  The cosine is clamped before
+				//acos() sees it for the reason vec_angle_capped() clamps its
+				//own: a value a fraction of an ulp outside [-1, 1] is a NaN
+				//that would travel all the way out to the caller.
+				cosw = (d0 * d0 + d1 * d1 - d2 * d2) / (2.0 * d0 * d1);
+				if (cosw > 1.0) cosw = 1.0; else if (cosw < -1.0) cosw = -1.0;
+				omega = nv_acos(cosw) * to_deg;
+				if (omega <= omega_cut) {
+					/*equation 10 as PDB_stacker computes it: the 3' base's
+					normal is redrawn from the 5' base's centre of mass, so the
+					vector compared is (CoM3 - CoM5) +/- n3, and the smaller of
+					the two answers is Xi.  atan2(|u x v|, |u . v|) rather than
+					the arcsine the paper prints: it is the same angle for
+					vectors this cannot fold past 90 degrees, and it keeps its
+					precision near 0, which is where a good stack sits and where
+					an arcsine of a quotient near 0 has the least of it.*/
+					for (k = 0; k < 2; k++) {
+						const NV sign = k ? -1.0 : 1.0;
+						const NV ux = bases[i].nx, uy = bases[i].ny, uz = bases[i].nz;
+						const NV wx2 = vx + sign * bases[j].nx;
+						const NV wy2 = vy + sign * bases[j].ny;
+						const NV wz2 = vz + sign * bases[j].nz;
+						const NV qx = uy * wz2 - uz * wy2;
+						const NV qy = uz * wx2 - ux * wz2;
+						const NV qz = ux * wy2 - uy * wx2;
+						const NV cr = nv_sqrt(qx * qx + qy * qy + qz * qz);
+						const NV dp = ux * wx2 + uy * wy2 + uz * wz2;
+						NV t;
+						if (!(nv_fabs(dp) > 0.0) && !(cr > 0.0)) continue;
+						t = nv_atan2(cr, nv_fabs(dp)) * to_deg;
+						if (!have_xi || t < xi) { xi = t; have_xi = TRUE; }
+					}
+				}
+				score = have_xi ? stack_score(d0, omega, xi, dist_cut, omega_cut) : 0.0;
+				//named in the order it is reported, so the two letters and the
+				//two resname fields read the same way round
+				tname[0] = bases[i].one; tname[1] = '-';
+				tname[2] = bases[j].one; tname[3] = '\0';
+				h = newHV();
+				(void)hv_stores(h, "type", newSVpvn(tname, 3));
+				pi_field(aTHX_ h, "chain1", 6, s->res_hv[bases[i].res], "chain", 5);
+				pi_field(aTHX_ h, "residue1", 8, s->res_hv[bases[i].res], "key", 3);
+				pi_field(aTHX_ h, "resname1", 8, s->res_hv[bases[i].res], "resname", 7);
+				pi_field(aTHX_ h, "chain2", 6, s->res_hv[bases[j].res], "chain", 5);
+				pi_field(aTHX_ h, "residue2", 8, s->res_hv[bases[j].res], "key", 3);
+				pi_field(aTHX_ h, "resname2", 8, s->res_hv[bases[j].res], "resname", 7);
+				(void)hv_stores(h, "distance", newSVnv(d0));
+				(void)hv_stores(h, "omega", newSVnv(omega));
+				if (have_xi) (void)hv_stores(h, "xi", newSVnv(xi));
+				(void)hv_stores(h, "score", newSVnv(score));
+				(void)hv_stores(h, "stacked", newSViv(score > 50.0 ? 1 : 0));
+				av_push(out, newRV_noinc((SV *)h));
+				if (store) {
+					stack_note(aTHX_ s->res_hv[bases[i].res], s->res_hv[bases[j].res],
+					           tname, d0, omega, have_xi ? &xi : NULL, score, TRUE);
+					tname[0] = bases[j].one; tname[2] = bases[i].one;
+					stack_note(aTHX_ s->res_hv[bases[j].res], s->res_hv[bases[i].res],
+					           tname, d0, omega, have_xi ? &xi : NULL, score, FALSE);
+				}
+			}
+		}
+	}
+	grid_free(aTHX_ &g);
+	Safefree(cx); Safefree(cy); Safefree(cz);
+	Safefree(bases);
+	return out;
+}
+
 /*Disulfide bonds, found by geometry.
 
 $info->{ssbond} is what the file *says* -- an SSBOND record, or an mmCIF
@@ -4716,6 +5179,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	AV *pi = NULL;
 	AV *ss = NULL;
 	AV *bp = NULL;
+	AV *bs = NULL;
 	AV *cont = NULL;
 	AV *hb = NULL;
 	const bool want_sasa  = opt_bool(aTHX_ o, "sasa", TRUE);
@@ -4724,6 +5188,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	const bool want_pi   = opt_bool(aTHX_ o, "pi_stacking", TRUE);
 	const bool want_ss   = opt_bool(aTHX_ o, "disulfides", TRUE);
 	const bool want_bp   = opt_bool(aTHX_ o, "base_pairs", TRUE);
+	const bool want_bs   = opt_bool(aTHX_ o, "base_stacks", TRUE);
 	const bool want_tors = opt_bool(aTHX_ o, "dihedrals", TRUE);
 	const bool want_cont = opt_bool(aTHX_ o, "contacts", TRUE);
 	const bool want_hse  = opt_bool(aTHX_ o, "exposure", TRUE);
@@ -4898,6 +5363,16 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 		sv_2mortal((SV *)bp);
 	}
 
+	if (want_bs) {
+		const NV dc = opt_nv(aTHX_ o, "base_stack_distance", CSP_STACK_DIST);
+		const NV oc = opt_nv(aTHX_ o, "base_stack_omega", CSP_STACK_OMEGA);
+		if (dc <= 0.0) croak("%s: base_stack_distance must be a positive number", who);
+		if (oc < 0.0 || oc > 180.0)
+			croak("%s: base_stack_omega must be between 0 and 180", who);
+		bs = base_stacks(aTHX_ &s, dc, oc, store);
+		sv_2mortal((SV *)bs);
+	}
+
 	//the result hash is built last, so that nothing between here and the return
 	//can croak with it half-filled and unreferenced
 	out = newHV();
@@ -4964,6 +5439,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	if (want_pi) (void)hv_stores(out, "pi_stacking", newRV_inc((SV *)pi));
 	if (want_ss) (void)hv_stores(out, "disulfides", newRV_inc((SV *)ss));
 	if (want_bp) (void)hv_stores(out, "base_pairs", newRV_inc((SV *)bp));
+	if (want_bs) (void)hv_stores(out, "base_stacks", newRV_inc((SV *)bs));
 	if (want_cont) (void)hv_stores(out, "contacts", newRV_inc((SV *)cont));
 	if (want_hb) (void)hv_stores(out, "hbonds", newRV_inc((SV *)hb));
 	LEAVE;

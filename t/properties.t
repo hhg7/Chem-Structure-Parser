@@ -35,6 +35,7 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 	is(structure_pi_stacking($i), $i->{features}{pi_stacking}, 'and structure_pi_stacking its pairs');
 	is(structure_disulfides($i),  $i->{features}{disulfides},  'and structure_disulfides its bonds');
 	is(structure_contacts($i),    $i->{features}{contacts},    'and structure_contacts its pairs');
+	is(structure_base_stacks($i), $i->{features}{base_stacks}, 'and structure_base_stacks its stacks');
 	is(structure_hbonds($i),      $i->{features}{hbonds},      'and structure_hbonds its bonds');
 	# name any option and it is computed again with that option in force
 	isnt(structure_features($i, probe => 2.0), $i->{features},
@@ -441,6 +442,19 @@ for my $pair ([ 'stack.pdb', 'stack.cif' ], [ 'bases.pdb', 'bases.cif' ],
 	throws_ok { structure_sasa($i, base_pair_hbond => 3.5) }
 		qr/unknown option 'base_pair_hbond'/,
 		'and a base pair threshold nothing to structure_sasa';
+	throws_ok { structure_features($i, base_stack_distance => 0) }
+		qr/base_stack_distance must be a positive number/,
+		'a stacking distance of zero is refused';
+	throws_ok { structure_features($i, base_stack_distance => 'near') }
+		qr/base_stack_distance must be a positive number/, 'and so is a word';
+	throws_ok { structure_features($i, base_stack_omega => 200) }
+		qr/base_stack_omega must be a number between 0 and 180/,
+		'an overlap angle over half a turn is refused, being an angle';
+	lives_ok { structure_features($i, base_stack_omega => 0) }
+		'but zero is allowed: it means the two bases must overlap exactly';
+	throws_ok { structure_sasa($i, base_stack_omega => 50) }
+		qr/unknown option 'base_stack_omega'/,
+		'and a stacking threshold nothing to structure_sasa';
 }
 
 # ---- the two base pair thresholds are the whole of the rule ---------------
@@ -501,7 +515,8 @@ for my $pair ([ 'stack.pdb', 'stack.cif' ], [ 'bases.pdb', 'bases.cif' ],
 }
 
 for my $who (qw(structure_features structure_sasa structure_pi_stacking
-                structure_disulfides structure_contacts structure_hbonds)) {
+                structure_disulfides structure_contacts structure_hbonds
+                structure_base_stacks)) {
 	no strict 'refs';
 	throws_ok { &{"Chem::Structure::Parser::$who"}(undef) } qr/\Q$who\E: expected the hash/,
 		"$who refuses undef";

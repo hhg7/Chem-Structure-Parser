@@ -221,6 +221,7 @@ ok(@over <= $chains_with_seqres / 20,
 	# atom's accessible sphere can be larger than this whatever it is made of
 	my $cap = 4 * atan2(1, 0) * 2 * (3.48 + 1.4) ** 2;
 	my ($n_ring_pairs, $checked_features, $n_puckers, $n_pairs) = (0, 0, 0, 0);
+	my $n_stacks = 0;
 	for my $file (@some) {
 		my $name = (split m{/}, $file)[-1];
 		my $info = structure_info($file);
@@ -342,6 +343,53 @@ ok(@over <= $chains_with_seqres / 20,
 			}
 		}
 
+		# The base stacks, on the same terms: the pair is inside both of the
+		# cutoffs it was found with, Xi is there exactly when the overlap angle
+		# is inside its own, the score is in the range the paper gives it, and
+		# both residues carry the stack.  Whether the numbers are right is
+		# t/stacking.t's question, against the paper's Figure 4.
+		{
+			my %res;
+			for my $cid (@{ $info->{chain_order} }) {
+				my $c = $info->{chains}{$cid};
+				$res{"$cid/$_"} = $c->{residues}{$_} for @{ $c->{residue_order} };
+			}
+			for my $s (@{ $f->{base_stacks} }) {
+				my $k1 = "$s->{chain1}/$s->{residue1}";
+				my $k2 = "$s->{chain2}/$s->{residue2}";
+				my $where = "$name: base stack $k1 $k2";
+				$n_stacks++;
+				die "$where: a base stacked on itself" if $k1 eq $k2;
+				die "$where: a separation of $s->{distance} A"
+					if $s->{distance} > 5.0;
+				die "$where: an overlap angle of $s->{omega} degrees"
+					if $s->{omega} < 0 || $s->{omega} > 180;
+				if ($s->{omega} <= 50) {
+					die "$where: inside the overlap cutoff and carries no Xi"
+						unless defined $s->{xi};
+					die "$where: a Xi of $s->{xi} degrees"
+						if $s->{xi} < 0 || $s->{xi} > 90;
+				} else {
+					die "$where: past the overlap cutoff and carries a Xi"
+						if exists $s->{xi};
+					die "$where: past the overlap cutoff and scores $s->{score}"
+						if $s->{score} != 0;
+				}
+				die "$where: a score of $s->{score}%"
+					if $s->{score} < -100 || $s->{score} > 100;
+				die "$where: stacked is $s->{stacked} at $s->{score}%"
+					unless $s->{stacked} == ($s->{score} > 50 ? 1 : 0);
+				for my $end ([ $k1, $s->{chain2}, $s->{residue2}, "5'" ],
+				             [ $k2, $s->{chain1}, $s->{residue1}, "3'" ]) {
+					my ($me, $yc, $yr, $side) = @$end;
+					die "$where: $me does not carry the stack, or not as the $side base"
+						unless grep { $_->{chain} eq $yc && $_->{residue} eq $yr
+						              && $_->{side} eq $side }
+						       @{ $res{$me}{base_stack} || [] };
+				}
+			}
+		}
+
 		for my $s (@{ $f->{pi_stacking} }) {
 			$n_ring_pairs++;
 			my $where = "$name: $s->{chain1}/$s->{residue1}/$s->{ring1}"
@@ -424,8 +472,8 @@ ok(@over <= $chains_with_seqres / 20,
 
 	ok($checked_features > 0, 'the physical properties were computed on real structures');
 	diag("computed the properties of $checked_features structures, "
-	   . "$n_ring_pairs stacked ring pairs, $n_puckers sugar puckers and "
-	   . "$n_pairs base pairs between them");
+	   . "$n_ring_pairs stacked ring pairs, $n_puckers sugar puckers, "
+	   . "$n_pairs base pairs and $n_stacks base stacks between them");
 }
 
 diag("checked $checked structures");

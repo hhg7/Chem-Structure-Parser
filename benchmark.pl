@@ -181,6 +181,11 @@ timeit('structure_disulfides alone', sub {
 	structure_disulfides($i);
 	return $i->{stats}{n_atoms};
 });
+timeit('structure_base_stacks alone', sub {
+	my $i = structure_info($_[0], meta => 0, features => 0);
+	structure_base_stacks($i, store => 0);
+	return $i->{stats}{n_atoms};
+});
 
 # --- the same surface, in pure Perl ---------------------------------------
 #

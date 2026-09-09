@@ -110,8 +110,9 @@ proportional to the number of atoms.  Measured: 6,432 atoms in 0.16 s and 16,399
 in 0.40 s, which is 25 and 24 microseconds an atom -- flat, where a scan would
 have cost the larger one two and a half times as much per atom.  `t/features.t`
 is what says the two find the *same* neighbours: mdtraj's scan is exhaustive,
-and every atom's surface matches it.  The same grid answers five other
-questions -- ring centroids, sulphurs, CA atoms, heavy atoms, contacts -- and
+and every atom's surface matches it.  The same grid answers six other
+questions -- ring centroids, base centroids, sulphurs, CA atoms, heavy atoms,
+contacts -- and
 the bridge search in the secondary structure avoids one entirely by reading its
 candidates out of the hydrogen bond list, which is linear in the bonds where the
 obvious search is quadratic in the residues.
@@ -126,3 +127,14 @@ took out.
 The hydropathy and the aromatic fraction are the exception and are in Perl: they
 read a sequence string the chain already carries, which is a few hundred
 characters and no per-atom work at all.
+
+**Base stacking is in C for the grid rather than for the arithmetic.**  The
+Condon score is a dozen floating point operations per pair, and it is the *pairs*
+that are the work: 1JJ2, the large ribosomal subunit, has 2,872 nucleotides in
+14,702 residues, and comparing every base with every other would be four million
+pairs to reject.  Off the same grid the whole thing -- every base's centre of
+mass and normal, then d0, omega, Xi and the score for the 2,853 pairs that are
+within 5 A -- is 0.046 s, measured over three runs on a warm cache with
+`store => 0`.  PDB_stacker, which is the Perl this is a translation of, is the
+other end of that trade: it reads one tetramer per file and compares its four
+bases pairwise, where a scan is the right answer and a grid would be overhead.

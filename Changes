@@ -87,6 +87,36 @@ Revision history for Chem-Structure-Parser
      than tuned away.  base_pair_hbond and base_pair_stagger move the two
      thresholds; base_pairs => 0 skips the work.
 
+   - new: structure_base_stacks(), how stacked every nearby pair of
+     nucleobases is, on the three variables the RNA literature scores stacking
+     with -- d0 between the two bases' centres of mass, the overlap angle
+     omega, and Xi between the two bases' normals -- and as one score from
+     -100% to 100% built out of them.  base_stack goes onto both residues, as
+     base_pair does, and says which end of the pair each of them is, because
+     omega is measured from the 5' base and is not the same number read the
+     other way round.
+
+     The definition and every constant are Condon, D E; Kennedy, S D; Mort,
+     B C; Kierzek, R; Yildirim, I; Turner, D H (2015) "Stacking in RNA: NMR of
+     Four Tetramers Benchmark Molecular Dynamics", J Chem Theory Comput
+     11(6):2729-2742, section 2.4, and the implementation its numbers came out
+     of, which is the same authors' PDB_stacker.  Figure 4 of the paper works
+     the three variables on residues 13 and 14 of 157D and reports 4.5 A,
+     40.7 degrees and 17.3 degrees; this answers 4.5286, 40.7402 and 17.3071,
+     and t/stacking.t holds it there against the new t/data/aform.pdb, which
+     is those residues as deposited.  That one pair also settles the three
+     places where the paper's text and its authors' code disagree -- how
+     equation 10 is read, whether guanine's N2 is in its centre of mass, and
+     whether the distance knee is 3.5 A or 4 -- each of which is marked in
+     Parser.xs with the measurement that decides it.
+
+     Every base the module names is covered, DNA and RNA and the modified
+     spellings alike: a PSU is measured as a uridine and a 7MG as a guanosine,
+     through four sets of atoms serving the six letters A, C, G, I, T and U.
+     A base missing one of the atoms its entry names is in no pair rather than
+     measured wrong.  base_stack_distance and base_stack_omega move the two
+     cutoffs; base_stacks => 0 skips the work.
+
  - a torsion angle and a Kabsch-Sander amide hydrogen are no longer measured
    across a chain break.  mdtraj takes the residue before this one to be
    whichever came before it in the file and computes a phi, or places a

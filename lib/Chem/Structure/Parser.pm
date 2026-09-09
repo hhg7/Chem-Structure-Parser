@@ -16,7 +16,7 @@ our @EXPORT_OK = qw(
 	structure_atoms structure_residues structure_ligands structure_sequences
 	chain_sequence structure_summary is_single_ion
 	structure_features structure_sasa structure_pi_stacking structure_disulfides
-	structure_base_pairs structure_contacts structure_hbonds
+	structure_base_pairs structure_base_stacks structure_contacts structure_hbonds
 	aa3to1 aa1to3 res1 res_type formats h
 );
 our @EXPORT = @EXPORT_OK;
@@ -367,6 +367,7 @@ my %FEATURE_DEFAULT = (
 	pi_stacking => 1,     # look for stacked aromatic rings
 	disulfides  => 1,     # look for SG-SG pairs close enough to be bonded
 	base_pairs  => 1,     # look for Watson-Crick and wobble base pairs
+	base_stacks => 1,     # score how far every nearby pair of bases is stacked
 	interface   => 1,     # also run the surface on each chain alone, for the buried area
 	shape       => 1,     # the gyration tensor and the descriptors built from it
 	dihedrals   => 1,     # phi, psi, omega and chi1..chi5, onto each residue
@@ -415,6 +416,15 @@ my %FEATURE_DEFAULT = (
 	# candidate that is not a pair is at 3.5144 A and 2.6983 A
 	base_pair_hbond    => 3.5, # angstrom: the longest hydrogen bond a pair may have
 	base_pair_stagger  => 2.6, # angstrom: the furthest out of plane it may be
+	# the two cutoffs of the stacking criteria of Condon et al. (2015), section
+	# 2.4: bases further apart than the first are not stacked and their angles
+	# are not computed, and a pair whose overlap angle is past the second is not
+	# stacked and has no Xi.  Both are the paper's, which took the distance from
+	# CCSD(T) calculations on uracil and adenine dimers and the angle from X-ray
+	# statistics.  The knees of the two ramps between them are the definition
+	# rather than a threshold, and are constants in Parser.xs.
+	base_stack_distance => 5.0, # angstrom: the furthest apart two centres of mass may be
+	base_stack_omega    => 50,  # degrees: the largest overlap angle that is a stack
 );
 
 # which of those each function takes.  A geometry threshold passed to
@@ -428,6 +438,7 @@ my @PI_OPT   = qw(
 );
 my @SS_OPT   = qw(store disulfide_distance);
 my @BP_OPT   = qw(store base_pair_hbond base_pair_stagger);
+my @BS_OPT   = qw(store base_stack_distance base_stack_omega);
 my @TORS_OPT = qw(store peptide_bond phosphodiester_bond);
 my @CONT_OPT = qw(store contact_distance);
 my @HB_OPT   = qw(peptide_bond);
@@ -467,6 +478,14 @@ sub _feature_options {
 	die "$who: base_pair_stagger must be a number and must not be negative, "
 	  . "not '$o{base_pair_stagger}'"
 		unless $o{base_pair_stagger} =~ /\A[0-9]*\.?[0-9]+\z/;
+	die "$who: base_stack_distance must be a positive number, "
+	  . "not '$o{base_stack_distance}'"
+		unless $o{base_stack_distance} =~ /\A[0-9]*\.?[0-9]+\z/
+		    && $o{base_stack_distance} > 0;
+	die "$who: base_stack_omega must be a number between 0 and 180, "
+	  . "not '$o{base_stack_omega}'"
+		unless $o{base_stack_omega} =~ /\A[0-9]*\.?[0-9]+\z/
+		    && $o{base_stack_omega} <= 180;
 	return \%o;
 }
 
@@ -477,9 +496,10 @@ sub _feature_options {
 sub _all_features {
 	my ($info, $who) = @_;
 	my $o = _feature_options({}, $who,
-		[ qw(sasa pi_stacking disulfides base_pairs shape dihedrals contacts
-		     exposure hbonds secondary),
-		  @SASA_OPT, @PI_OPT, @SS_OPT, @BP_OPT, @TORS_OPT, @CONT_OPT, @HB_OPT ]);
+		[ qw(sasa pi_stacking disulfides base_pairs base_stacks shape dihedrals
+		     contacts exposure hbonds secondary),
+		  @SASA_OPT, @PI_OPT, @SS_OPT, @BP_OPT, @BS_OPT, @TORS_OPT, @CONT_OPT,
+		  @HB_OPT ]);
 	my $f = _features($info, $o, $who);
 	_sequence_features($info, $f, 1);
 	return $f;
@@ -496,9 +516,10 @@ sub structure_features {
 	_check_info($info, 'structure_features');
 	return $info->{features} if !%opt && $info->{features};
 	my $o = _feature_options(\%opt, 'structure_features',
-		[ qw(sasa pi_stacking disulfides base_pairs shape dihedrals contacts
-		     exposure hbonds secondary),
-		  @SASA_OPT, @PI_OPT, @SS_OPT, @BP_OPT, @TORS_OPT, @CONT_OPT, @HB_OPT ]);
+		[ qw(sasa pi_stacking disulfides base_pairs base_stacks shape dihedrals
+		     contacts exposure hbonds secondary),
+		  @SASA_OPT, @PI_OPT, @SS_OPT, @BP_OPT, @BS_OPT, @TORS_OPT, @CONT_OPT,
+		  @HB_OPT ]);
 	my $f = _features($info, $o, 'structure_features');
 	_sequence_features($info, $f, $o->{store});
 	return $f;
@@ -514,6 +535,7 @@ sub structure_sasa {
 	$o->{pi_stacking} = 0;
 	$o->{disulfides}  = 0;
 	$o->{base_pairs}  = 0;
+	$o->{base_stacks} = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 0;
@@ -533,6 +555,7 @@ sub structure_pi_stacking {
 	$o->{pi_stacking} = 1;
 	$o->{disulfides}  = 0;
 	$o->{base_pairs}  = 0;
+	$o->{base_stacks} = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 0;
@@ -553,6 +576,7 @@ sub structure_contacts {
 	$o->{pi_stacking} = 0;
 	$o->{disulfides}  = 0;
 	$o->{base_pairs}  = 0;
+	$o->{base_stacks} = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 1;
@@ -568,8 +592,8 @@ sub structure_hbonds {
 	_check_info($info, 'structure_hbonds');
 	return $info->{features}{hbonds} if !%opt && $info->{features};
 	my $o = _feature_options(\%opt, 'structure_hbonds', \@HB_OPT);
-	$o->{$_} = 0 for qw(sasa pi_stacking disulfides base_pairs shape dihedrals
-	                    contacts exposure secondary);
+	$o->{$_} = 0 for qw(sasa pi_stacking disulfides base_pairs base_stacks shape
+	                    dihedrals contacts exposure secondary);
 	$o->{hbonds} = 1;
 	return _features($info, $o, 'structure_hbonds')->{hbonds};
 }
@@ -584,6 +608,7 @@ sub structure_disulfides {
 	$o->{pi_stacking} = 0;
 	$o->{disulfides}  = 1;
 	$o->{base_pairs}  = 0;
+	$o->{base_stacks} = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 0;
@@ -603,6 +628,7 @@ sub structure_base_pairs {
 	$o->{pi_stacking} = 0;
 	$o->{disulfides}  = 0;
 	$o->{base_pairs}  = 1;
+	$o->{base_stacks} = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 0;
@@ -610,6 +636,26 @@ sub structure_base_pairs {
 	$o->{hbonds}      = 0;
 	$o->{secondary}   = 0;
 	return _features($info, $o, 'structure_base_pairs')->{base_pairs};
+}
+
+# structure_base_stacks($info, %opt) -- how stacked every nearby pair of bases is.
+sub structure_base_stacks {
+	my ($info, %opt) = @_;
+	_check_info($info, 'structure_base_stacks');
+	return $info->{features}{base_stacks} if !%opt && $info->{features};
+	my $o = _feature_options(\%opt, 'structure_base_stacks', \@BS_OPT);
+	$o->{sasa}        = 0;
+	$o->{pi_stacking} = 0;
+	$o->{disulfides}  = 0;
+	$o->{base_pairs}  = 0;
+	$o->{base_stacks} = 1;
+	$o->{shape}       = 0;
+	$o->{dihedrals}   = 0;
+	$o->{contacts}    = 0;
+	$o->{exposure}    = 0;
+	$o->{hbonds}      = 0;
+	$o->{secondary}   = 0;
+	return _features($info, $o, 'structure_base_stacks')->{base_stacks};
 }
 
 # The two sequence-level numbers, per protein chain and over the structure.
@@ -3110,6 +3156,10 @@ C<structure_features()> yourself.
   <td>the arrayref <code>structure_base_pairs()</code> returns</td>
 </tr>
 <tr>
+  <td><code>base_stacks</code></td>
+  <td>the arrayref <code>structure_base_stacks()</code> returns</td>
+</tr>
+<tr>
   <td><code>contacts</code></td>
   <td>the arrayref <code>structure_contacts()</code> returns</td>
 </tr>
@@ -3175,6 +3225,11 @@ surface than its neighbours in the archive unless they are taken out.
   <td><code>base_pairs</code></td>
   <td>1</td>
   <td>look for Watson-Crick and wobble base pairs</td>
+</tr>
+<tr>
+  <td><code>base_stacks</code></td>
+  <td>1</td>
+  <td>score how far every nearby pair of bases is stacked</td>
 </tr>
 <tr>
   <td><code>interface</code></td>
@@ -3285,6 +3340,16 @@ surface than its neighbours in the archive unless they are taken out.
   <td><code>base_pair_stagger</code></td>
   <td>2.6</td>
   <td>and the furthest one base may sit out of the other's plane</td>
+</tr>
+<tr>
+  <td><code>base_stack_distance</code></td>
+  <td>5.0</td>
+  <td>the furthest apart two stacked bases' centres of mass may be, angstrom</td>
+</tr>
+<tr>
+  <td><code>base_stack_omega</code></td>
+  <td>50</td>
+  <td>and the largest overlap angle that is still a stack, degrees</td>
 </tr>
 <tr>
   <td><code>contact_distance</code></td>
@@ -3928,6 +3993,277 @@ here is the double helix, not the whole of RNA structure. C<t/data/wobble.pdb>
 holds one of the others — the U2647·G2673 pair 1MSY's annotation records and
 cannot classify — and this leaves it alone, which is the test that it does.
 
+=head2 structure_base_stacks
+
+ for my $s (@{ structure_base_stacks($info) }) {
+     printf "%s%s %s - %s%s %s  d0 %.2f  omega %.1f  Xi %.1f  %.0f%%\n",
+         $s->{chain1}, $s->{residue1}, $s->{resname1},
+         $s->{chain2}, $s->{residue2}, $s->{resname2},
+         $s->{distance}, $s->{omega}, $s->{xi}, $s->{score};
+ }
+ # B13 C - B14 G  d0 4.53  omega 40.7  Xi 17.3   33%
+ # B14 G - B15 C  d0 3.94  omega 23.3  Xi  7.8  100%
+ # B15 C - B16 G  d0 4.34  omega 36.1  Xi 17.1   48%
+ # B16 G - B17 A  d0 4.34  omega 34.8  Xi 13.9   51%
+ # B17 A - B18 A  d0 3.91  omega 29.3  Xi 18.0   91%
+
+ $info->{chains}{B}{residues}{14}{base_stack};
+ # [ { chain => 'B', residue => '13', resname => 'C', type => 'G-C',
+ #     distance => 4.5286, omega => 40.740, xi => 17.307,
+ #     score => 32.518, side => "3'" },
+ #   { chain => 'B', residue => '15', resname => 'C', type => 'G-C',
+ #     distance => 3.9353, omega => 23.292, xi => 7.833,
+ #     score => 100, side => "5'" } ]
+
+(C<t/data/aform.pdb>, six nucleotides of 157D.)
+
+How stacked every nearby pair of nucleobases is, on the three variables the RNA
+literature scores stacking with — the distance d0 between the two bases, the
+overlap angle ω, and the angle Ξ between their planes — and as one score built
+out of them. Like the base pairs this is geometry rather than anything the file
+declares, and each stack is written onto both of its residues as well as
+returned.
+
+The definition is section 2.4 of
+
+ Condon, D E; Kennedy, S D; Mort, B C; Kierzek, R; Yildirim, I;
+ Turner, D H (2015) "Stacking in RNA: NMR of Four Tetramers Benchmark
+ Molecular Dynamics", J Chem Theory Comput 11(6):2729-2742,
+ doi:10.1021/ct501025q
+
+which is where the criteria, the thresholds and the score come from; the
+implementation its numbers were produced with is the same authors'
+L<PDB_stacker|https://github.com/hhg7/PDB_stacker>. The paper benchmarks AMBER
+force fields by comparing four RNA tetramers against NMR, and these three
+numbers are how it decides which bases a simulation had stacked.
+
+=head3 The three variables
+
+Each base gets a centre of mass over its heavy atoms and two vectors C<a> and C<b>
+from there to two atoms far apart on the ring, chosen so that the pair spans the
+base and out-of-plane distortion moves their cross product as little as
+possible. C<a> × C<b> and C<b> × C<a> are the base's two normal vectors, one above
+the plane and one below.
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>key</th>
+  <th>what it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>distance</code></td>
+  <td>d0, between the two bases' centres of mass, angstrom</td>
+</tr>
+<tr>
+  <td><code>omega</code></td>
+  <td>ω, "oh-mega" for overlap: how far the 3' base sits off the 5' base's face, degrees</td>
+</tr>
+<tr>
+  <td><code>xi</code></td>
+  <td>Ξ, the angle between the two bases' normals: 0 is parallel, 90 a T-shape, degrees</td>
+</tr>
+<tr>
+  <td><code>score</code></td>
+  <td>the three of them as one percentage, -100 to 100</td>
+</tr>
+<tr>
+  <td><code>stacked</code></td>
+  <td>1 when <code>score</code> is over 50, which is what the paper calls stacked</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+ω is the angle at the 5' base's centre of mass in the triangle whose sides are
+d0, the length of that base's normal vector, and the distance from the tip of
+whichever of its two normals lands nearer the 3' base's centre of mass. It is
+small when one base sits over the other's face and large when it sits beside it
+— the angle between the steps of a staircase. Ξ tells a parallel stack from a
+T-shape, which is a different interaction and scores negative rather than being
+dropped.
+
+The pair is ordered, because ω is measured from one base and not the other. The
+5' base is the one the file lists first, which along a strand written 5' to 3' —
+as both formats and the archive write one — is the chemical order. Two bases in
+different chains have no 5'/3' relation at all, and there the order is the chain
+order. Each residue's own C<base_stack> entry says which end of the pair it is,
+in C<side>, so that a residue's ω can be read the right way round.
+
+=head3 The score
+
+Two points, one for the distance and one for the overlap, reported as a
+percentage of two:
+
+=over
+
+=item * d0 at or under 4 Å scores 1, and falls off as r^-3 from there to the
+C<base_stack_distance> cutoff;
+
+=item * ω at or under 25 degrees scores 1, and falls linearly to 0 at the
+C<base_stack_omega> cutoff;
+
+=item * Ξ over 45 degrees multiplies the whole thing by -1, which is a T-shape rather
+than a stack.
+
+=back
+
+Every pair inside C<base_stack_distance> is reported, stacked or not, because the
+three variables are the answer and the score is a summary of them: a run of
+tetramer snapshots wants the pair that scored 12% as much as the one that scored
+98%. A pair whose ω is past C<base_stack_omega> carries no C<xi> — the paper does
+not compute it there — and scores 0.
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>option</th>
+  <th>default</th>
+  <th>what it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>base_stack_distance</code></td>
+  <td>5.0</td>
+  <td>the furthest apart two centres of mass may be, angstrom</td>
+</tr>
+<tr>
+  <td><code>base_stack_omega</code></td>
+  <td>50</td>
+  <td>the largest overlap angle that is still a stack, degrees</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+Both are the paper's, which took the distance from CCSD(T) calculations on
+stacked uracil and adenine dimers and the angle from X-ray statistics. The two
+knees between them — 4 Å and 25 degrees — are the shape of the score rather than
+a threshold, and are not options.
+
+=head3 Which bases
+
+Every residue this module gives a single-letter code of C<A>, C<C>, C<G>, C<I>, C<T>
+or C<U> and calls a nucleotide, which is DNA and RNA alike and the sixty-odd
+spellings C<res1()> knows: a C<PSU> is measured as a uridine, a C<7MG> as a
+guanosine, a C<DA> and an C<A> the same way. Four sets of atoms serve the six
+letters — adenine's, guanine's (which inosine shares, having the same ring and
+the same O6), cytosine's and uracil's (which thymine shares) — and each names
+the two atoms its C<a> and C<b> run to:
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>base</th>
+  <th><code>a</code></th>
+  <th><code>b</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>A</td>
+  <td>C8</td>
+  <td>N6</td>
+</tr>
+<tr>
+  <td>G, I</td>
+  <td>C8</td>
+  <td>O6</td>
+</tr>
+<tr>
+  <td>C</td>
+  <td>O2</td>
+  <td>N4</td>
+</tr>
+<tr>
+  <td>U, T</td>
+  <td>O2</td>
+  <td>O4</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+A base missing any of the atoms its entry names has no frame and is in no pair,
+the same way an incomplete ring has no plane. That covers a C<4SU>, whose O4 is a
+sulphur, as well as a base whose density ran out; no geometry is invented for
+either.
+
+=head3 Against the paper's worked example
+
+Figure 4 of the paper illustrates the three variables on residues 13 (C) and 14
+(G) of chain B of 157D and reports d0 = 4.5 Å, ω = 40.7 degrees and Ξ = 17.3
+degrees. Those six residues are C<t/data/aform.pdb>, exactly as deposited, and
+C<t/stacking.t> checks this against all three: it answers 4.5286, 40.7402 and
+17.3071.
+
+That one pair is the whole of the cross-validation, and it settles more than it
+looks like. Three things about the definition are ambiguous on the printed page,
+and the caption picks one reading of each:
+
+=over
+
+=item * B<Equation 10> is a minimum of two arcsines that differ only in the sign of a
+cross product, so the two are equal and the minimum is a formality; and taken
+literally it is the angle between the two normals with no reference to where
+the bases are, which gives 9.5 degrees for this pair. C<PDB_stacker> instead
+compares the 5' base's normal with the 3' base's normal I<redrawn from the 5'
+base's centre of mass>, and takes the smaller of the two answers its two
+normals give. That gives 17.31 degrees, so that is what Ξ means here.
+
+=item * B<Guanine's centre of mass> is over ten atoms and not eleven: N2, the
+exocyclic amino nitrogen, is not in C<PDB_stacker>'s list, though adenine's N6
+and cytosine's N4 are in theirs. Including it gives d0 = 4.77 Å and ω = 43.56
+degrees against the caption's 4.5 and 40.7; leaving it out gives 4.53 and
+40.74.
+
+=item * B<The distance knee> is 3.5 Å in criterion I's text and 4 Å in
+C<PDB_stacker>'s C<$DISTANCE_MIN>. 4 is used, because it is the number the
+published percentages were computed with.
+
+=back
+
+Each of those is marked at the site in C<Parser.xs> with the measurement that
+settles it.
+
+=head3 What is not here
+
+Whether a stack is what holds a structure together. The score is a geometric
+summary and not an energy: two bases at 100% are stacked in the sense the paper
+counts stacks in an MD trajectory, which is what it was built to do. It says
+nothing about what that stack is worth in kcal/mol, and the paper's own point is
+that force fields which reproduce the geometry can still get the populations
+wrong.
+
+C<structure_pi_stacking()> is the other question about the same atoms: mdtraj's
+face-to-face and edge-to-face geometry over aromatic rings, ring by ring rather
+than base by base, and over the aromatic amino acids as well. It answers whether
+two rings are stacked; this answers how much.
+
 =head2 aa3to1
 
  aa3to1('ALA');    # 'A'
@@ -4110,6 +4446,11 @@ them where they are installed so the frozen answer cannot go stale.
   <td>base pairs</td>
   <td>Watson, J D; Crick, F H C (1953) <i>Nature</i> 171(4356):737-8; the pair types as numbered in Saenger, W (1984) <i>Principles of Nucleic Acid Structure</i>, ch. 6</td>
   <td>no implementation on hand: measured against the wwPDB's own <code>_ndb_struct_na_base_pair</code> annotation, which is 3DNA's, over forty entries</td>
+</tr>
+<tr>
+  <td>base stacking</td>
+  <td>Condon, D E; Kennedy, S D; Mort, B C; Kierzek, R; Yildirim, I; Turner, D H (2015) <i>J Chem Theory Comput</i> 11(6):2729-2742, section 2.4</td>
+  <td>the same authors' <code>PDB_stacker</code>, and the paper's own Figure 4 worked on 157D</td>
 </tr>
 <tr>
   <td>residue contacts</td>

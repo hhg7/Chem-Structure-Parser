@@ -19,7 +19,7 @@ for my $f (qw(
 	structure_atoms structure_residues structure_ligands structure_sequences
 	chain_sequence structure_summary is_single_ion
 	structure_features structure_sasa structure_pi_stacking structure_disulfides
-	structure_base_pairs structure_contacts structure_hbonds
+	structure_base_pairs structure_base_stacks structure_contacts structure_hbonds
 	aa3to1 aa1to3 res1 res_type formats h
 )) {
 	can_ok('Chem::Structure::Parser', $f);

@@ -385,14 +385,14 @@ for my $opt ([ { hydrogens => 0 },        'hydrogens => 0' ],
 # thought to check.  The stacked-ring list carries the depositor's chain ids and
 # residue keys, which is what makes it comparable at all: an mmCIF file's
 # label_asym_id would have named these chains something else.
-for my $stem (qw(mini stack bases rna duplex wobble nmr bare)) {
+for my $stem (qw(mini stack bases rna aform duplex wobble nmr bare)) {
 	my $pdb = structure_features(structure_info("$data/$stem.pdb"));
 	my $cif = structure_features(structure_info("$data/$stem.cif"));
 	is_deeply($cif, $pdb, "$stem: the two formats give the same physical properties");
 }
 
 # and what was written into the structures matches down to the atom
-for my $stem (qw(mini stack bases rna duplex wobble)) {
+for my $stem (qw(mini stack bases rna aform duplex wobble)) {
 	my $pdb = structure_info("$data/$stem.pdb");
 	my $cif = structure_info("$data/$stem.cif");
 	structure_features($_) for $pdb, $cif;

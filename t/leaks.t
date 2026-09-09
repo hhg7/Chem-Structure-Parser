@@ -199,6 +199,21 @@ no_leaks_ok { structure_info("$data/fold.cif") }
 	no_leaks_ok { structure_features($wob, base_pairs => 0) } 'or without them at all';
 	no_leaks_ok { structure_info("$data/wobble.cif") }
 		'nor the same duplex read as mmCIF';
+
+	# and the base stacks, which are the same shape again: a list of hashes per
+	# pair, a second list hung off each of the two residues, and two cutoffs
+	# either of which can leave a residue with nothing on it
+	my $afm = structure_info("$data/aform.pdb");
+	no_leaks_ok { structure_base_stacks($afm) } 'structure_base_stacks does not leak';
+	no_leaks_ok { structure_base_stacks($afm) for 1 .. 3 }
+		'nor does replacing every residue\'s base_stack list three times over';
+	no_leaks_ok { structure_base_stacks($afm, base_stack_distance => 3) }
+		'nor a cutoff that stacks nothing, which has to clear them instead';
+	no_leaks_ok { structure_base_stacks($afm, base_stack_omega => 30, store => 0) }
+		'nor a narrower one asked without storing, where no pair carries a Xi';
+	no_leaks_ok { structure_features($afm, base_stacks => 0) } 'or without them at all';
+	no_leaks_ok { structure_info("$data/aform.cif") }
+		'nor the same strand read as mmCIF';
 }
 
 #--------
