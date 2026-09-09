@@ -2,10 +2,45 @@ use strict;
 use warnings;
 use ExtUtils::MakeMaker;
 use Config;
+use File::Temp ();
+use File::Spec;
 
 # -std=gnu99 for the declarations-after-statements and // comments the XS uses;
 # only when the compiler is one that understands the flag.
 my $std = ($Config{gccversion} || $Config{cc} =~ /\b(?:g?cc|clang)\b/) ? ' -std=gnu99' : '';
+
+# Parser.xs wants the `l' suffixed libm functions on a long-double perl, so that
+# an NV is not silently computed at double precision and converted back -- see
+# the nv_* block at the head of the file.  They are C99, but some libms (the
+# thinner BSD ones especially) do not ship the whole set, so the set is
+# link-tested as a unit: all of it, or the module falls back to the double
+# functions, which costs accuracy on that perl and nothing else.  __float128
+# needs no probe -- quadmath.h and -lquadmath come with the quadmath perl
+# itself, and a double perl uses the unsuffixed functions it always had.
+#
+# Keep this list in step with the nv_* macros in Parser.xs: a macro with no
+# entry here is a function the probe never tested for, and the build breaks on
+# a machine nobody here owns.
+my $define = '';
+if ($Config{nvtype} eq 'long double') {
+	my $src = "#include <math.h>\n"
+	        . "int main(void) { long double x = 1.0L;\n"
+	        . "  volatile long double r = fabsl(x) + sqrtl(x) + acosl(x) + cosl(x) + sinl(x);\n"
+	        . "  return (int)r * 0; }\n";
+	my $dir = File::Temp::tempdir(CLEANUP => 1);
+	my $c   = File::Spec->catfile($dir, 'ldmath.c');
+	my $bin = File::Spec->catfile($dir, 'ldmath');
+	if (open my $fh, '>', $c) {
+		print {$fh} $src;
+		close $fh;
+		my $quiet = File::Spec->devnull;
+		$define = '-DCSP_HAVE_LONG_DOUBLE_MATH'
+			if system("$Config{cc}$std -o $bin $c -lm > $quiet 2> $quiet") == 0;
+	}
+	warn "Chem::Structure::Parser: this libm is missing some long double math\n"
+	   . "  functions; the feature calculations fall back to double precision.\n"
+		unless $define;
+}
 
 # MakeMaker's directory scan classifies .pm, .pl and .pod alike, so every
 # author-only helper in the distribution root -- test.all.perls.pl,
@@ -49,6 +84,8 @@ WriteMakefile(
 		'Test::Exception' => 0,
 	},
 	CCFLAGS => $Config{ccflags} . $std,
+	DEFINE  => $define,
+	LIBS    => ['-lm'],
 	OBJECT  => '$(O_FILES)',
 	test    => { TESTS => 't/*.t' },
 	clean   => { FILES => 'Chem-Structure-Parser-*' },

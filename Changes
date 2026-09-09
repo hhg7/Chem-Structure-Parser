@@ -1,6 +1,66 @@
 Revision history for Chem-Structure-Parser
 
 
+0.03 2026-09-08 CDT
+
+ - new: structure_features(), the physical properties of a structure in one
+   call -- solvent-accessible surface, radius of gyration, molecular weight,
+   centroid and centre of mass, mean Kyte-Doolittle hydropathy, the aromatic
+   fraction of the sequence, and the stacked pairs of aromatic rings.  One XS
+   walk of the structure serves all of them, because each has to touch every
+   atom and flattening a hash of chains of residues of atoms into coordinate
+   arrays is the expensive part.
+
+ - new: structure_sasa(), the solvent-accessible surface on its own, and
+   structure_pi_stacking(), the stacked ring pairs on their own.
+
+ - the per-atom, per-residue and per-chain results are written into the
+   structure beside the atom, residue and chain they belong to:
+   $info->{chains}{A}{sasa}, {residues}{54}{sasa}, {residues}{54}{rsa} --
+   the residue's surface as a fraction of the most it could have -- and
+   {residues}{54}{atoms}{CZ}{sasa}.  store => 0 leaves the structure alone
+   and returns the totals only.
+
+ - the arithmetic is a translation of somebody else's, and is tested against
+   it rather than against itself: the Shrake-Rupley surface, the van der
+   Waals radii, the atomic masses, the ring geometry and the radius of
+   gyration are mdtraj 1.11's, and the hydropathy and aromaticity scales are
+   Biopython's.  t/features.t compares every atom, every residue and every
+   stacked pair against what mdtraj answered for the structures in t/data,
+   frozen in t/data/features.txt, and re-runs mdtraj where it is installed so
+   the frozen answer cannot go stale.  Run in float64, mdtraj's own kernel
+   and this one agree on every atom to nine digits.
+
+ - the neighbour search is a uniform grid rather than the all-pairs scan
+   mdtraj uses, which is what makes the surface of a large entry finish: the
+   cost is flat at about 24 microseconds an atom from 6,000 atoms to 16,000,
+   where an all-pairs scan grows with the square.  Both find the same
+   neighbours, which is what the comparison above establishes.
+
+ - two departures from mdtraj, both deliberate and both documented where they
+   are made.  Its face-to-face centroid cutoff of 5.5 is nanometres in a
+   function whose other distances are nanometres -- 55 A, far enough that any
+   two rings in a small protein would qualify -- where ProLIF, which the
+   geometry comes from, has 5.5 A; face_distance defaults to 5.5 A and
+   face_distance => 55 gets mdtraj's number.  And compute_rg(traj, masses)
+   weights distances by mass but measures them from the geometric centroid;
+   rg_mass measures from the centre of mass, while rg keeps mdtraj's
+   equal-weight default, where the two centres coincide.
+
+ - a ligand contributes no aromatic rings.  Finding one means perceiving its
+   bonds, which this module does not do -- it reads no CONECT record and
+   guesses no bond -- so structure_pi_stacking() says so rather than quietly
+   finding nothing.
+
+ - structure.info.pl gains --features, one tab separated row of properties per
+   structure, and --stacks, one row per stacked pair.
+
+ - the release notes are no longer generated from README.md.  They lived in
+   three places at once -- the README, the module's POD and this file -- and
+   the POD copy was a hundred and fifty lines of history in the middle of the
+   reference documentation.  This file is now written by hand and md2pod.pl
+   only checks it.
+
 0.02 2026-08-22 CDT
 
  - Fix for Windows: https://www.cpantesters.org/cpan/report/960c8de0-8001-1014-8897-e6a949c55ebf

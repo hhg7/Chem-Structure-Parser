@@ -71,3 +71,50 @@ it takes from the name — so the symbol is put back into IUPAC's case once,
 where it is settled, and a zinc reads back as `Zn` whichever road it took.
 Only the 118 named elements are corrected: a field that spells no element is
 left as the file wrote it rather than dressed up as one.
+
+# What the physical properties cost
+
+`benchmark.pl` measures these too, on the same 200 structures from PDBbind
+v2020, best of three:
+
+    structure_info                           6.12 s     173,000 atoms/s
+    structure_features                      32.10 s      33,000 atoms/s
+    structure_sasa alone                    32.00 s      33,000 atoms/s
+    structure_pi_stacking alone              6.99 s     152,000 atoms/s
+
+So the surface is five times the cost of reading the file, and everything else
+put together is almost free next to it -- the ring geometry adds about 15% to a
+read. That ratio is what decided where the work goes.
+
+**The surface is the one place the C is not competing with a plausible Perl.**
+960 sphere points per atom, each tested against that atom's neighbours, is
+between one and ten million distance comparisons for a small protein.
+`benchmark.pl` writes that loop out in Perl -- the same one mdtraj's kernel is,
+neighbours by brute force and then points against neighbours -- and runs both
+on the smallest structure of the set: 0.02 s against 1.95 s, a hundred times,
+for the same 5661.25 A^2 to the last bit. In Perl the whole set would be an
+hour.
+
+Two things about the C are worth knowing, because they are where an
+implementation of this is usually wrong or slow:
+
+**The neighbour search is a grid, not a scan.** mdtraj compares every atom with
+every other, which is fine for the few thousand atoms of an MD frame and is not
+fine for a 400,000-atom entry -- 1.6e11 comparisons. A grid of cells one cutoff
+wide gives the same neighbour set from the 27 cells around each atom, in time
+proportional to the number of atoms. Measured: 6,432 atoms in 0.16 s and 16,399
+in 0.40 s, which is 25 and 24 microseconds an atom -- flat, where a scan would
+have cost the larger one two and a half times as much per atom. `t/features.t`
+is what says the two find the *same* neighbours: mdtraj's scan is exhaustive,
+and every atom's surface matches it.
+
+**One walk, not four.** The structure is a hash of chains of residues of atoms
+and the arithmetic wants flat coordinate arrays, so `structure_features()`
+flattens it once and hands the arrays to the surface, the radius of gyration,
+the mass and the ring geometry in turn. Doing that in Perl, or once per
+calculation, would rebuild the coordinate section -- which is the mistake the
+second round of the parse benchmark found and took out.
+
+The hydropathy and the aromatic fraction are the exception and are in Perl: they
+read a sequence string the chain already carries, which is a few hundred
+characters and no per-atom work at all.

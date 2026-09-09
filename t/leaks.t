@@ -108,6 +108,42 @@ no_leaks_ok { structure_info("$data/empty.cif") } 'nor does an empty one';
 }
 
 #--------
+# the physical properties
+#
+# Every one of these allocates on its own account -- the coordinate arrays, the
+# grid, the sphere points, the neighbour list -- and hands back a hash of hashes
+# built from scratch, so both halves of the usual XS mistake are available here.
+# The store => 1 form also writes into a structure that already exists, which is
+# the case where an SV is overwritten rather than created.
+#--------
+{
+	my $info = structure_info("$data/stack.pdb");
+	no_leaks_ok { structure_features($info) } 'structure_features does not leak';
+	no_leaks_ok { structure_features($info, store => 0) }
+		'nor does it with nothing written back';
+	no_leaks_ok { structure_sasa($info) }        'structure_sasa does not leak';
+	no_leaks_ok { structure_pi_stacking($info) } 'structure_pi_stacking does not leak';
+	no_leaks_ok { structure_features($info, sasa => 0) }
+		'nor does asking for only half of it';
+	no_leaks_ok { structure_features($info, pi_stacking => 0) } 'or the other half';
+	no_leaks_ok { eval { structure_features($info, probe => -1) } }
+		'a refused option does not leak';
+	no_leaks_ok { eval { structure_features({ chains => {} }) } }
+		'nor does a structure with nothing in it';
+}
+{
+	# the croak path with the arrays already allocated: read without atom
+	# hashes, so set_build() has filled its buffers before it gives up
+	my $bare = structure_info("$data/stack.pdb", atoms => 0);
+	no_leaks_ok { eval { structure_features($bare) } }
+		'giving up on a structure read with atoms => 0 frees what was allocated first';
+}
+no_leaks_ok { structure_features(structure_info("$data/empty.pdb")) }
+	'an empty structure does not leak';
+no_leaks_ok { structure_features(structure_info("$data/bases.cif")) }
+	'nor does an mmCIF one with rings in it';
+
+#--------
 # no cycles: the whole structure must go away when the caller drops it
 #--------
 for my $stem (qw(mini.pdb mini.cif)) {
@@ -115,6 +151,9 @@ for my $stem (qw(mini.pdb mini.cif)) {
 	my $chain   = $info->{chains}{A};
 	my $residue = $info->{chains}{A}{residues}{6};
 	my $atom    = $info->{chains}{A}{residues}{6}{atoms}{CA};
+	# with the properties written into it too, in case one of them left a
+	# reference pointing back up the structure
+	structure_features($info);
 	weaken($chain);
 	weaken($residue);
 	weaken($atom);

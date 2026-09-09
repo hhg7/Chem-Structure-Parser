@@ -381,4 +381,26 @@ for my $opt ([ { hydrogens => 0 },        'hydrogens => 0' ],
 	}
 }
 
+# The physical properties are the coordinate half read a different way, so they
+# have to come out the same too -- and the whole hash, not the fields someone
+# thought to check.  The stacked-ring list carries the depositor's chain ids and
+# residue keys, which is what makes it comparable at all: an mmCIF file's
+# label_asym_id would have named these chains something else.
+for my $stem (qw(mini stack bases nmr bare)) {
+	my $pdb = structure_features(structure_info("$data/$stem.pdb"));
+	my $cif = structure_features(structure_info("$data/$stem.cif"));
+	is_deeply($cif, $pdb, "$stem: the two formats give the same physical properties");
+}
+
+# and what was written into the structures matches down to the atom
+for my $stem (qw(mini stack bases)) {
+	my $pdb = structure_info("$data/$stem.pdb");
+	my $cif = structure_info("$data/$stem.cif");
+	structure_features($_) for $pdb, $cif;
+	for my $cid (@{ $pdb->{chain_order} }) {
+		is_deeply($cif->{chains}{$cid}, $pdb->{chains}{$cid},
+			"$stem: chain $cid is identical with the surfaces filled in");
+	}
+}
+
 done_testing();

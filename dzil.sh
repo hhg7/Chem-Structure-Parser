@@ -2,9 +2,10 @@
 # dzil.sh -- build the release tarball.
 #
 # Adapted from ~/Scripts/stats/dzil.sh.  md2pod.pl runs first because the POD
-# half of lib/Chem/Structure/Parser.pm and the whole of Changes are generated
-# from README.md: building without it would ship the documentation as it was
-# before the last edit to the README.
+# half of lib/Chem/Structure/Parser.pm is generated from README.md: building
+# without it would ship the documentation as it was before the last edit to the
+# README.  It also runs changes_file_ok over Changes, which is written by hand,
+# so a release whose notes do not satisfy CPAN::Changes::Spec stops here.
 #
 # The tarball is listed rather than released.  What to look for is what
 # PruneFiles in dist.ini and MANIFEST.SKIP are there to keep out -- the XS build

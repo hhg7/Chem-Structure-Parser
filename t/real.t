@@ -202,5 +202,93 @@ ok(@over <= $chains_with_seqres / 20,
 	ok($named > 0, 'at least one file had an id to check');
 }
 
+# --- the physical properties, on real structures --------------------------
+#
+# What is checked here is what the file itself settles, in the spirit of the
+# rest of this file: a total that is the sum of its parts, a surface no atom can
+# exceed, a stacked pair that is inside the thresholds it was found by.  Whether
+# the numbers are *right* is t/features.t's question, and it asks mdtraj.
+#
+# A smaller spread than the reading above, because the surface is nine hundred
+# and sixty sphere points per atom and a real entry has tens of thousands of
+# atoms.
+{
+	my $want = $ENV{STRUCTURE_INFO_TEST_ALL} ? scalar @files : 12;
+	my @some = @files[0 .. ($want > @files ? $#files : $want - 1)];
+	# the largest van der Waals radius in the table is francium's 3.48 A, so no
+	# atom's accessible sphere can be larger than this whatever it is made of
+	my $cap = 4 * atan2(1, 0) * 2 * (3.48 + 1.4) ** 2;
+	my ($n_ring_pairs, $checked_features) = (0, 0);
+	for my $file (@some) {
+		my $name = (split m{/}, $file)[-1];
+		my $info = structure_info($file);
+		my $f = structure_features($info);
+		next unless $f->{n_atoms};
+		$checked_features++;
+
+		my ($atoms, $chains, $worst) = (0, 0, 0);
+		for my $cid (@{ $info->{chain_order} }) {
+			my $c = $info->{chains}{$cid};
+			$chains += $c->{sasa};
+			my $residues = 0;
+			for my $rk (@{ $c->{residue_order} }) {
+				my $r = $c->{residues}{$rk};
+				$residues += $r->{sasa};
+				my $sum = 0;
+				for my $an (@{ $r->{atom_order} }) {
+					my $a = $r->{atoms}{$an};
+					$worst = $a->{sasa} if $a->{sasa} > $worst;
+					$sum += $a->{sasa};
+					$atoms += $a->{sasa};
+				}
+				die "$name: residue $cid/$rk does not add up" if abs($sum - $r->{sasa}) > 1e-6;
+				next unless defined $r->{rsa};
+				# a residue cut off from its neighbours can beat the Gly-X-Gly
+				# maximum, but not by a factor of three
+				ok($r->{rsa} >= 0 && $r->{rsa} < 3,
+					"$name: $r->{resname} $rk has a believable relative accessibility")
+					if $r->{rsa} < 0 || $r->{rsa} >= 3;
+			}
+			die "$name: chain $cid does not add up" if abs($residues - $c->{sasa}) > 1e-5;
+		}
+		cmp_ok(abs($atoms - $f->{sasa}{total}) / ($f->{sasa}{total} || 1), '<', 1e-9,
+			"$name: the atoms account for the whole surface");
+		cmp_ok(abs($chains - $f->{sasa}{total}) / ($f->{sasa}{total} || 1), '<', 1e-9,
+			"$name: and so do the chains");
+		cmp_ok($worst, '<', $cap, "$name: no atom is larger than the largest sphere there is");
+		cmp_ok(abs($f->{sasa}{apolar} + $f->{sasa}{polar} - $f->{sasa}{total}), '<', 1e-6,
+			"$name: apolar plus polar is the total");
+		cmp_ok($f->{mass}, '>', 0, "$name: it weighs something");
+		cmp_ok($f->{rg}, '>', 0, "$name: and has a radius of gyration");
+		# half the longest side of the bounding box is a lower bound on the
+		# radius of gyration only for a shell, so use the diagonal as the upper
+		# one: no atom is further from the centroid than that
+		my $bb = $info->{stats}{bbox};
+		my $diag = sqrt(($bb->{xmax} - $bb->{xmin}) ** 2
+		              + ($bb->{ymax} - $bb->{ymin}) ** 2
+		              + ($bb->{zmax} - $bb->{zmin}) ** 2);
+		cmp_ok($f->{rg}, '<', $diag, "$name: which is smaller than the bounding box diagonal");
+
+		for my $s (@{ $f->{pi_stacking} }) {
+			$n_ring_pairs++;
+			my $where = "$name: $s->{chain1}/$s->{residue1}/$s->{ring1}"
+			          . " with $s->{chain2}/$s->{residue2}/$s->{ring2}";
+			# a pair of rings on one residue is fused, not stacked
+			isnt("$s->{chain1}/$s->{residue1}", "$s->{chain2}/$s->{residue2}",
+				"$where: two different residues")
+				if "$s->{chain1}/$s->{residue1}" eq "$s->{chain2}/$s->{residue2}";
+			my ($far, $lo, $hi) = $s->{type} eq 'face' ? (5.5, 0, 35) : (6.5, 50, 90);
+			ok($s->{distance} <= $far + 1e-9, "$where: inside its centroid cutoff")
+				if $s->{distance} > $far + 1e-9;
+			ok($s->{plane_angle} >= $lo - 1e-9 && $s->{plane_angle} <= $hi + 1e-9,
+				"$where: inside its plane angle range")
+				if $s->{plane_angle} < $lo - 1e-9 || $s->{plane_angle} > $hi + 1e-9;
+		}
+	}
+	ok($checked_features > 0, 'the physical properties were computed on real structures');
+	diag("computed the properties of $checked_features structures, "
+	   . "$n_ring_pairs stacked ring pairs between them");
+}
+
 diag("checked $checked structures");
 done_testing();

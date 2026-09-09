@@ -153,6 +153,108 @@ my $pps = timeit('pure Perl, and the same statistics', sub {
 	return $n;
 });
 
+# --- the physical properties ----------------------------------------------
+#
+# The surface is the expensive one: nine hundred and sixty sphere points per
+# atom, each tested against the atom's neighbours.  Timed over the same files so
+# that the cost can be read against the cost of reading them in the first place.
+my $feat = timeit('structure_features', sub {
+	my $i = structure_info($_[0], meta => 0);
+	structure_features($i);
+	return $i->{stats}{n_atoms};
+});
+timeit('structure_sasa alone', sub {
+	my $i = structure_info($_[0], meta => 0);
+	structure_sasa($i);
+	return $i->{stats}{n_atoms};
+});
+timeit('structure_pi_stacking alone', sub {
+	my $i = structure_info($_[0], meta => 0);
+	structure_pi_stacking($i);
+	return $i->{stats}{n_atoms};
+});
+
+# --- the same surface, in pure Perl ---------------------------------------
+#
+# One structure rather than the whole set: this is minutes per file, which is
+# the answer the comparison is for.  Written the obvious way, which is also the
+# way mdtraj's kernel is written -- every atom against every other for the
+# neighbours, then every sphere point against every neighbour.
+sub perl_sasa {
+	my ($info, $npts) = @_;
+	my (@x, @y, @z, @r);
+	my %vdw = (C => 1.70, N => 1.55, O => 1.52, S => 1.80, P => 1.80,
+	           H => 1.20, SE => 1.90, ZN => 1.39, FE => 2.00, MG => 0.86);
+	for my $cid (@{ $info->{chain_order} }) {
+		my $c = $info->{chains}{$cid};
+		for my $rk (@{ $c->{residue_order} }) {
+			my $res = $c->{residues}{$rk};
+			for my $an (@{ $res->{atom_order} }) {
+				my $a = $res->{atoms}{$an};
+				next unless defined $a->{x};
+				push @x, $a->{x}; push @y, $a->{y}; push @z, $a->{z};
+				my $v = $vdw{ uc($a->{element} || '') };
+				push @r, (defined $v ? $v : 2.0) + 1.4;
+			}
+		}
+	}
+	my $pi = 4 * atan2(1, 1);
+	my $inc = $pi * (3 - sqrt 5);
+	my $off = 2 / $npts;
+	my (@px, @py, @pz);
+	for my $i (0 .. $npts - 1) {
+		my $yy = $i * $off - 1 + $off / 2;
+		my $rr = sqrt(1 - $yy * $yy);
+		push @px, cos($i * $inc) * $rr;
+		push @py, $yy;
+		push @pz, sin($i * $inc) * $rr;
+	}
+	my $total = 0;
+	for my $i (0 .. $#x) {
+		my @nb;
+		for my $j (0 .. $#x) {
+			next if $i == $j;
+			my $s = $r[$i] + $r[$j];
+			my $d = ($x[$j] - $x[$i]) ** 2 + ($y[$j] - $y[$i]) ** 2 + ($z[$j] - $z[$i]) ** 2;
+			push @nb, $j if $d < $s * $s;
+		}
+		my $acc = 0;
+		POINT: for my $k (0 .. $npts - 1) {
+			my $qx = $x[$i] + $r[$i] * $px[$k];
+			my $qy = $y[$i] + $r[$i] * $py[$k];
+			my $qz = $z[$i] + $r[$i] * $pz[$k];
+			for my $j (@nb) {
+				my $d = ($qx - $x[$j]) ** 2 + ($qy - $y[$j]) ** 2 + ($qz - $z[$j]) ** 2;
+				next POINT if $d < $r[$j] * $r[$j];
+			}
+			$acc++;
+		}
+		$total += $acc * 4 * $pi / $npts * $r[$i] ** 2;
+	}
+	return $total;
+}
+
+{
+	# the smallest of the set, so the Perl version finishes
+	my ($small, $n_small);
+	for my $f (@files) {
+		my $i = structure_info($f, meta => 0);
+		next if defined $n_small && $i->{stats}{n_atoms} >= $n_small;
+		($small, $n_small) = ($i, $i->{stats}{n_atoms});
+	}
+	my $t0 = time;
+	my $c_area = structure_sasa($small)->{total};
+	my $c_time = time - $t0;
+	$t0 = time;
+	my $p_area = perl_sasa($small, 960);
+	my $p_time = time - $t0;
+	printf "\n  the smallest structure of the set, %d atoms:\n", $n_small;
+	printf "  %-38s %6.2f s   %38.2f A^2\n", 'structure_sasa', $c_time, $c_area;
+	printf "  %-38s %6.2f s   %38.2f A^2\n", 'the same surface, in pure Perl', $p_time, $p_area;
+	printf "  the C is %.0fx the Perl, and the two areas differ by %.3g A^2\n",
+		$p_time / ($c_time || 1e-9), abs($c_area - $p_area);
+}
+
 print <<"SUMMARY";
 
 The parse alone is @{[ sprintf '%.1f', $pp / $raw ]}x the same parse written in Perl.
@@ -163,4 +265,10 @@ doing a good deal more than either: the header records, SEQRES, the gaps
 between them and the coordinates, chain types, ligand and ion classification.
 What the C buys is the reading; building a hash of hashes out of what was read
 costs what it costs, in any language, because the hashes are the answer.
+
+structure_features() adds @{[ sprintf '%.1f', $feat / $xs ]}x the cost of reading the same files, and
+is the one part of the module where the C is not competing with a plausible
+Perl: nine hundred and sixty sphere points per atom against each of that atom's
+neighbours is a loop nobody would write in Perl twice, which is what the
+single-structure comparison above is there to show.
 SUMMARY

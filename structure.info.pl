@@ -6,6 +6,8 @@
 #     structure.info.pl --tsv   *.cif                 # one row per structure
 #     structure.info.pl --ligands *.pdb *.cif         # what is bound to what
 #     structure.info.pl --dump 1a22.ent.pdb           # the whole hash of hashes
+#     structure.info.pl --features *.pdb              # surface, size, hydropathy
+#     structure.info.pl --stacks 1a22.ent.pdb         # stacked aromatic rings
 #
 # PDB and mmCIF are read the same way and print the same thing, so a mixed
 # directory needs no sorting out first.
@@ -15,8 +17,10 @@ use warnings FATAL => 'all';
 use Getopt::Long;
 use Chem::Structure::Parser;
 
-my %opt = (fasta => 0, tsv => 0, ligands => 0, dump => 0, seqres => 0, chain => undef);
-GetOptions(\%opt, 'fasta', 'tsv', 'ligands', 'dump', 'seqres', 'chain=s', 'help')
+my %opt = (fasta => 0, tsv => 0, ligands => 0, dump => 0, seqres => 0,
+           features => 0, stacks => 0, chain => undef);
+GetOptions(\%opt, 'fasta', 'tsv', 'ligands', 'dump', 'seqres', 'features', 'stacks',
+           'chain=s', 'help')
 	or die "see --help\n";
 
 if ($opt{help} || !@ARGV) {
@@ -28,6 +32,8 @@ usage: structure.info.pl [options] file.pdb|file.cif ...
     --tsv        one tab separated row per structure
     --ligands    one row per bound heterogen
     --dump       the whole hash of hashes, via Data::Dumper
+    --features   one row per structure: surface, size, mass, hydropathy
+    --stacks     one row per stacked pair of aromatic rings
     --chain ID   only this chain
 
 With no option, prints a readable summary of each file.
@@ -50,6 +56,42 @@ for my $file (@ARGV) {
 		local $Data::Dumper::Sortkeys = 1;
 		local $Data::Dumper::Indent   = 1;
 		print Data::Dumper::Dumper($info);
+		next;
+	}
+
+	if ($opt{features}) {
+		my $f = structure_features($info);
+		unless ($header_printed++) {
+			print join("\t", qw(id file n_atoms mass rg rg_mass sasa apolar polar
+			                    hydropathy aromatic_fraction n_pi_stacking)), "\n";
+		}
+		print join("\t",
+			$info->{id} // '',
+			$file,
+			$f->{n_atoms},
+			sprintf('%.1f', $f->{mass}),
+			(defined $f->{rg}      ? sprintf('%.2f', $f->{rg})      : ''),
+			(defined $f->{rg_mass} ? sprintf('%.2f', $f->{rg_mass}) : ''),
+			sprintf('%.1f', $f->{sasa}{total}),
+			sprintf('%.1f', $f->{sasa}{apolar}),
+			sprintf('%.1f', $f->{sasa}{polar}),
+			(defined $f->{hydropathy}        ? sprintf('%.4f', $f->{hydropathy})        : ''),
+			(defined $f->{aromatic_fraction} ? sprintf('%.4f', $f->{aromatic_fraction}) : ''),
+			scalar @{ $f->{pi_stacking} },
+		), "\n";
+		next;
+	}
+
+	if ($opt{stacks}) {
+		for my $s (@{ structure_pi_stacking($info) }) {
+			next if defined $opt{chain}
+			        && $s->{chain1} ne $opt{chain} && $s->{chain2} ne $opt{chain};
+			printf "%s\t%s\t%s %s%s ring %s\t%s %s%s ring %s\t%.2f\t%.1f\n",
+				$info->{id} // '', $s->{type},
+				$s->{chain1}, $s->{resname1}, $s->{residue1}, $s->{ring1},
+				$s->{chain2}, $s->{resname2}, $s->{residue2}, $s->{ring2},
+				$s->{distance}, $s->{plane_angle};
+		}
 		next;
 	}
 

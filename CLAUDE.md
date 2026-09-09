@@ -6,31 +6,47 @@ implementations. Where the two files differ, this one is right *here*. The
 comment doctrine in `~/.claude/CLAUDE.md` applies unchanged, with the local
 specifics at the foot of this file.
 
-## Never write release notes
+## Release notes go in `Changes`, and Claude writes them too
 
-The release notes are the maintainer's, and are not Claude's to write — not
-even to add an entry for work Claude just did, and not even when asked to
-"update the changelog" as part of a larger task. When a change would normally
-warrant one, say so in the reply and leave the wording to the maintainer.
+`Changes` is a hand-written file in the form `CPAN::Changes::Spec` asks for, and
+it is the only copy of the release notes. Editing it is ordinary work: when a
+change would normally warrant an entry, write one, in the same edit as the
+change it describes. `md2pod.pl` no longer generates it and will not overwrite
+it — it only runs `changes_file_ok` over it, so a release whose notes do not
+satisfy the spec is still not built.
 
-There are two files to keep away from, because there are two copies of the
-notes:
+It used to be generated, from a `# Changes` section in README.md, which meant
+the notes existed three times over: in the README, in the module's POD, and in
+`Changes`. The README section is gone and the POD is a hundred and fifty lines
+shorter for it. There is nothing to keep in step any more — there is one file.
 
-- **`Changes` is generated.** `md2pod.pl` writes it from README.md's
-  `# Changes` section, in the form `CPAN::Changes::Spec` asks for, and the next
-  run overwrites whatever is in it. So a hand edit there is lost work, not just
-  a rule broken. Do not create, edit, append to, or revert it: no `Edit`, no
-  `Write`, no `sed -i`/`perl -pi`, no `git checkout`/`git revert` that touches
-  it, no patch that includes it.
-- **README.md's `# Changes` section is the source those notes are written in**,
-  and the same rule covers it. Editing the README elsewhere — a function's
-  documentation, an example, a new section — is ordinary work; editing that one
-  section is not.
+What an entry looks like, which is what the spec wants and what the existing
+entries do:
+
+- a release is `<version> <date> TZ` at column 0 (`0.02 2026-08-22 CDT`).
+- each item is ` - ` and one space of hanging indent for its continuation
+  lines.
+- **every version needs a date, including the one being worked on.**
+  `changes_file_ok` reports `No date for version 0.03 (line 3)` and fails, and
+  it runs on every `md2pod.pl` — so an undated heading breaks regenerating the
+  documentation, not just building a release. Date it the day it is written and
+  correct the date if it slips.
+- the version at the top of `Changes` is the one `lib/Chem/Structure/Parser.pm`
+  declares. `dist.ini` takes the distribution's version from the module
+  (`[VersionFromModule]`), so a `Changes` naming a version the module does not
+  is a release whose notes are about something else. Bumping `$VERSION` is the
+  maintainer's call: ask before adding a heading for a version that does not
+  exist yet.
+
+Write what changed and why it matters to somebody using the module, not what
+files were touched. Do not rewrite or reword entries for releases that are
+already out: those are what the archive says shipped.
 
 ## The documentation is generated from README.md
 
-README.md is the single source. `md2pod.pl` (run it directly, or through
-`./dzil.sh`, which runs it first) produces three things from it:
+README.md is the single source for the documentation. `md2pod.pl` (run it
+directly, or through `./dzil.sh`, which runs it first) produces two things from
+it:
 
 - the POD half of `lib/Chem/Structure/Parser.pm` — everything after the `1;`
   line is replaced, so **never hand-edit the POD**; edit README.md and
@@ -40,19 +56,20 @@ README.md is the single source. `md2pod.pl` (run it directly, or through
   `.gitignore` has it, and `MY::libscan` in `Makefile.PL` drops root-level
   `*.pod` and `*.pl` so `make install` does not scatter it (and a
   `Chem::Structure::read.me` man page) into `site_perl`.
-- `Changes`, from the `# Changes` section, as above.
 
-Both `pod_file_ok` on the module and `changes_file_ok` on `Changes` run before
-`md2pod.pl` exits; a release that fails either is not built. The script is
-adapted from `~/Scripts/stats/md2pod.pl`, which is where its workarounds are
-explained — take a fix to a conversion bug back there too.
+`pod_file_ok` on the module and `changes_file_ok` on the hand-written `Changes`
+both run before `md2pod.pl` exits; a release that fails either is not built. The
+script is adapted from `~/Scripts/stats/md2pod.pl`, which is where its
+workarounds are explained — take a fix to a conversion bug back there too. The
+one place the two have diverged is `Changes`: that copy still generates it from
+its README, and this one does not.
 
 README.md follows the conventions of `~/Scripts/stats/README.md`, and
 `md2pod.pl` is written against them:
 
-- Code and output are **4-space indented blocks**, never ``` fences. The
-  Changes generator reads a fence, but the POD converter reformats prose it
-  mistakes for a list, so indented is the form that survives both.
+- Code and output are **4-space indented blocks**, never ``` fences: the POD
+  converter reformats prose it mistakes for a list, and an indented block is
+  what survives it.
 - `#` for a top-level section, `##` for one function, `###` for a subsection
   inside it. `h()` shows a function's section by looking its `=head2` up in the
   module's own POD, and `_pod_sections()` keeps only names in `@EXPORT_OK` — so
@@ -60,13 +77,8 @@ README.md follows the conventions of `~/Scripts/stats/README.md`, and
   heading anywhere else must not be spelled like one.
 - Options and record mappings are GFM tables; `md2pod.pl` turns each into an
   `=begin html` block, because POD has no table.
-- A release in `# Changes` is `## <version> <date> TZ` (`## 0.01 2026-08-21
-  CDT`), then paragraphs at column 0 — one paragraph becomes one ` - ` bullet.
-  `###` inside a release becomes a `[group]` and `####` a `- group:`. A version
-  with no date makes `changes_file_ok` fail, and `md2pod.pl` says which heading
-  to fix.
-- `# COPYRIGHT AND LICENSE` is the last section: it is where the Changes
-  generator stops reading.
+- `# COPYRIGHT AND LICENSE` is the last section, and there is no `# Changes`
+  section: the release notes are in `Changes`, as above.
 
 ## The two formats must return the same structure
 

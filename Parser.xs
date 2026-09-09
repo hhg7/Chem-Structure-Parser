@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <math.h>
 /*Chem::Structure::Parser -- the parts of reading a PDB file worth doing in C.
 
 A PDB file is one record per line with every field at a fixed column range
@@ -65,6 +66,50 @@ it.*/
 #  define CSP_RESTRICT
 #endif
 #endif
+
+/*Width-correct libm for NV.
+
+C has no type-generic <math.h>: sqrt(), cos() and acos() are declared to take a
+double, so calling one with an NV on a long-double or __float128 build converts
+the argument down, computes at 53 bits of mantissa and converts back.  Nothing
+warns and nothing fails to compile; the answer is simply less accurate than the
+perl running it.  So every NV-valued libm call in this file goes through the
+nv_* macros below, which paste on the suffix for the width NV actually is: none
+for double, `l' for long double, `q' for __float128 (perl.h has already included
+<quadmath.h> by this point, and the quadmath perl's $Config{perllibs} already
+carries -lquadmath, so the q functions need nothing at link time).
+
+The long-double row is conditional because the `l' variants are C99 but not
+universally present -- some BSD libms are thin on them.  Makefile.PL link-tests
+the set and defines CSP_HAVE_LONG_DOUBLE_MATH only when every one resolves;
+without it this falls back to the double functions, which costs accuracy on a
+long-double perl and nothing else.
+
+This layer is the same one Stats::LikeR carries, cut down to the five functions
+the feature calculations below need.  Adding a sixth means adding it to the
+Makefile.PL probe in the same edit, or the probe passes on a libm that does not
+have it and the build breaks on a machine nobody here owns.*/
+#if defined(USE_QUADMATH)
+#  define CSP_NVFN(base) base ## q
+#elif defined(USE_LONG_DOUBLE) && defined(CSP_HAVE_LONG_DOUBLE_MATH)
+#  define CSP_NVFN(base) base ## l
+#else
+#  define CSP_NVFN(base) base
+#endif
+#define nv_fabs(x) CSP_NVFN(fabs)(x)
+#define nv_sqrt(x) CSP_NVFN(sqrt)(x)
+#define nv_acos(x) CSP_NVFN(acos)(x)
+#define nv_cos(x)  CSP_NVFN(cos)(x)
+#define nv_sin(x)  CSP_NVFN(sin)(x)
+
+/*pi at the full width of an NV.  A literal cannot supply this: an unsuffixed C
+floating constant is a double, so spelling the digits out would round pi to 53
+bits on a long-double or __float128 build, and the `L' / `Q' suffixes that would
+avoid that are per-build (and `Q' is a GNU extension).  acos(-1) is pi correctly
+rounded to the working width on every libm, and nv_acos() picks the right
+width's acos.  M_PI is not used: it is not in C89 or C99, MSVC hides it behind
+_USE_MATH_DEFINES, and where it exists it is a double.*/
+#define CSP_PI nv_acos((NV)-1.0)
 
 /*residue table.  One table serves aa3to1(), res1() and res_type(), so the
 three can never disagree about what a residue is.  Keyed on the three-byte
@@ -1865,6 +1910,1257 @@ static bool chain_is_single_ion(pTHX_ HV *CSP_RESTRICT c)
 	return av_len((AV *)SvRV(*p)) == 0;
 }
 
+/*Physical properties of a structure.
+
+Everything from here to the MODULE line answers questions about a structure
+that has already been read: how much of it the solvent can touch, how big it
+is, how heavy it is, and which of its aromatic rings are stacked on each
+other.  None of it is part of the parse -- it is asked for by name, on an
+$info that already exists -- but all of it has to touch every atom, so by the
+rule in notes.txt it belongs here rather than in Perl.
+
+The walk is the reason.  A structure is a hash of chains of residues of atoms,
+and the calculations below want it as flat arrays of coordinates: doing that
+in Perl would mean building a second copy of the coordinate section, which is
+the mistake the second round of benchmarking found and took out.  set_build()
+walks the hash once into four NV arrays and hands them to whichever of the
+calculations were asked for, so a caller who wants all of them pays for one
+walk.
+
+Provenance -- every number below came from somebody else's implementation, and
+the tests compare against those implementations rather than against this one:
+
+  SASA          Shrake, A; Rupley, JA (1973) J Mol Biol 79(2):351-71, as
+                mdtraj 1.11's mdtraj.geometry.shrake_rupley (sasa.py and the
+                C kernel behind mdtraj.geometry._geometry._sasa): golden
+                section spiral sphere points, a probe rolled over the van der
+                Waals surface, the accessible fraction of each atom's points.
+  vdW radii     mdtraj's _ATOMIC_RADII (mdtraj/geometry/sasa.py), which is
+                Bondi, A (1964) J Phys Chem 68:441 as extended by Mantina, M
+                et al. (2009) J Phys Chem A 113:5806, with Shannon, R D (1976)
+                Acta Cryst A32:751 ionic radii substituted for the ions that
+                are always ionised in a biophysical setting (Li Na K Cs Be Mg
+                Ca Ba Cl), and 2.0 A for an element with no measured value.
+  masses        mdtraj/core/element.py.  The five elements it names no mass
+                for are marked below.
+  pi-stacking   mdtraj.geometry.pi_stacking (mdtraj/geometry/pi_stacking.py),
+                which is itself ProLIF's FaceToFace and EdgeToFace geometry.
+  max ASA       Tien, M Z; Meyer, A G; Sydykova, D K; Spielman, S J; Wilke, C O
+                (2013) PLoS ONE 8(11):e80635, Table 1, the "Theoretical"
+                column, for the relative accessibility of a residue.
+
+mdtraj works in nanometres and float32; this file works in angstrom and NV,
+which is what the PDB and mmCIF formats are written in and what the rest of
+the module already returns.  The formulae are the same ones -- an area is
+4*pi*r^2 times the accessible fraction whichever unit r is in -- so the answers
+agree to the width of a float32, which is what t/features.t measures rather
+than assumes.*/
+
+/*elem_prop_of() -- the van der Waals radius and standard atomic weight of an
+element symbol, or false for a field that spells no element.
+
+Keyed the way elem_case() is, on the symbol's one or two bytes packed into a
+U32 and upper-cased first, so that a symbol arriving as "ZN", "Zn" or "zn" is
+one lookup.  The four heaviest are spelled Nh, Mc, Ts and Og -- IUPAC's 2016
+names, which is what elem_case() puts in an $info -- where mdtraj's tables
+still carry the placeholder Uut, Uup, Uus and Uuo.*/
+typedef struct {
+	NV vdw;  //van der Waals radius, angstrom
+	NV mass; //standard atomic weight, dalton; 0.0 where mdtraj names none
+	U32 key; //the symbol packed and upper-cased, so a caller can ask which it was
+} elem_prop;
+
+//mdtraj's own fallback: "Where no van der Waals value is known, a default of
+//2 angstroms is used"
+#define CSP_VDW_DEFAULT 2.0
+
+static bool elem_prop_of(const char *CSP_RESTRICT s, STRLEN len,
+                         elem_prop *CSP_RESTRICT out)
+{
+	//initialised because the compiler cannot see that every case assigns and
+	//the default returns; the values are never the ones used
+	NV r = CSP_VDW_DEFAULT, m = 0.0;
+	U32 key;
+	while (len && (*s == ' ' || *s == '\t')) { s++; len--; }
+	while (len && (s[len - 1] == ' ' || s[len - 1] == '\t')) len--;
+	if (len == 0 || len > 2) return FALSE;
+	key = (len == 1)
+	    ? K2((unsigned char)toupper((unsigned char)s[0]), 0)
+	    : K2((unsigned char)toupper((unsigned char)s[0]),
+	         (unsigned char)toupper((unsigned char)s[1]));
+	switch (key) {
+		case K2('B',0):       r =   1.92; m = 10.8117;     break;
+		case K2('C',0):       r =   1.70; m = 12.01078;    break;
+		case K2('F',0):       r =   1.47; m = 18.99840325; break;
+		case K2('H',0):       r =   1.20; m = 1.007947;    break;
+		case K2('I',0):       r =   1.98; m = 126.904473;  break;
+		case K2('K',0):       r =   1.38; m = 39.09831;    break;
+		case K2('N',0):       r =   1.55; m = 14.00672;    break;
+		case K2('O',0):       r =   1.52; m = 15.99943;    break;
+		case K2('P',0):       r =   1.80; m = 30.9737622;  break;
+		case K2('S',0):       r =   1.80; m = 32.0655;     break;
+		case K2('U',0):       r =   1.86; m = 238.028913;  break;
+		case K2('V',0):       r =   2.00; m = 50.94151;    break;
+		case K2('W',0):       r =   2.00; m = 183.841;     break;
+		case K2('Y',0):       r =   2.00; m = 88.905852;   break;
+		case K2('A','C'):     r =   2.00; m = 227.0;       break;
+		case K2('A','G'):     r =   1.72; m = 107.86822;   break;
+		case K2('A','L'):     r =   1.84; m = 26.98153868; break;
+		case K2('A','M'):     r =   2.00; m = 243.0;       break;
+		case K2('A','R'):     r =   1.88; m = 39.9481;     break;
+		case K2('A','S'):     r =   1.85; m = 74.921602;   break;
+		case K2('A','T'):     r =   2.02; m = 210.0;       break;
+		case K2('A','U'):     r =   1.66; m = 196.9665694; break;
+		case K2('B','A'):     r =   1.49; m = 137.3277;    break;
+		case K2('B','E'):     r =   0.59; m = 9.0121823;   break;
+		case K2('B','H'):     r =   2.00; m = 264.0;       break;
+		case K2('B','I'):     r =   2.07; m = 208.980401;  break;
+		case K2('B','K'):     r =   2.00; m = 247.0;       break;
+		case K2('B','R'):     r =   1.85; m = 79.9041;     break;
+		case K2('C','A'):     r =   1.14; m = 40.0784;     break;
+		case K2('C','D'):     r =   1.58; m = 112.4118;    break;
+		case K2('C','E'):     r =   2.00; m = 140.1161;    break;
+		case K2('C','F'):     r =   2.00; m = 251.0;       break;
+		case K2('C','L'):     r =   1.81; m = 35.4532;     break;
+		case K2('C','M'):     r =   2.00; m = 247.0;       break;
+		case K2('C','N'):     r =   2.00; m = 0.0;         break;
+		case K2('C','O'):     r =   2.00; m = 58.9331955;  break;
+		case K2('C','R'):     r =   2.00; m = 51.99616;    break;
+		case K2('C','S'):     r =   1.67; m = 132.90545192; break;
+		case K2('C','U'):     r =   1.40; m = 63.5463;     break;
+		case K2('D','B'):     r =   2.00; m = 262.0;       break;
+		case K2('D','S'):     r =   2.00; m = 281.0;       break;
+		case K2('D','Y'):     r =   2.00; m = 162.5001;    break;
+		case K2('E','R'):     r =   2.00; m = 167.2593;    break;
+		case K2('E','S'):     r =   2.00; m = 252.0;       break;
+		case K2('E','U'):     r =   2.00; m = 151.9641;    break;
+		case K2('F','E'):     r =   2.00; m = 55.8452;     break;
+		case K2('F','L'):     r =   2.00; m = 0.0;         break;
+		case K2('F','M'):     r =   2.00; m = 257.0;       break;
+		case K2('F','R'):     r =   3.48; m = 223.0;       break;
+		case K2('G','A'):     r =   1.87; m = 69.7231;     break;
+		case K2('G','D'):     r =   2.00; m = 157.253;     break;
+		case K2('G','E'):     r =   2.11; m = 72.641;      break;
+		case K2('H','E'):     r =   1.40; m = 4.003;       break;
+		case K2('H','F'):     r =   2.00; m = 178.492;     break;
+		case K2('H','G'):     r =   1.55; m = 200.592;     break;
+		case K2('H','O'):     r =   2.00; m = 164.930322;  break;
+		case K2('H','S'):     r =   2.00; m = 269.0;       break;
+		case K2('I','N'):     r =   1.93; m = 114.8183;    break;
+		case K2('I','R'):     r =   2.00; m = 192.2173;    break;
+		case K2('K','R'):     r =   2.02; m = 83.7982;     break;
+		case K2('L','A'):     r =   2.00; m = 138.905477;  break;
+		case K2('L','I'):     r =   0.76; m = 6.9412;      break;
+		case K2('L','R'):     r =   2.00; m = 262.0;       break;
+		case K2('L','U'):     r =   2.00; m = 174.9671;    break;
+		case K2('L','V'):     r =   2.00; m = 0.0;         break;
+		case K2('M','C'):     r =   2.00; m = 288.0;       break;
+		case K2('M','D'):     r =   2.00; m = 258.0;       break;
+		case K2('M','G'):     r =   0.86; m = 24.30506;    break;
+		case K2('M','N'):     r =   2.00; m = 54.9380455;  break;
+		case K2('M','O'):     r =   2.00; m = 95.942;      break;
+		case K2('M','T'):     r =   2.00; m = 268.0;       break;
+		case K2('N','A'):     r =   1.02; m = 22.989769282; break;
+		case K2('N','B'):     r =   2.00; m = 92.906382;   break;
+		case K2('N','D'):     r =   2.00; m = 144.2423;    break;
+		case K2('N','E'):     r =   1.54; m = 20.17976;    break;
+		case K2('N','H'):     r =   2.00; m = 284.0;       break;
+		case K2('N','I'):     r =   1.63; m = 58.69342;    break;
+		case K2('N','O'):     r =   2.00; m = 259.0;       break;
+		case K2('N','P'):     r =   2.00; m = 237.0;       break;
+		case K2('O','G'):     r =   2.00; m = 0.0;         break;
+		case K2('O','S'):     r =   2.00; m = 190.233;     break;
+		case K2('P','A'):     r =   2.00; m = 231.035882;  break;
+		case K2('P','B'):     r =   2.02; m = 207.21;      break;
+		case K2('P','D'):     r =   1.63; m = 106.421;     break;
+		case K2('P','M'):     r =   2.00; m = 145.0;       break;
+		case K2('P','O'):     r =   1.97; m = 209.0;       break;
+		case K2('P','R'):     r =   2.00; m = 140.907652;  break;
+		case K2('P','T'):     r =   1.75; m = 195.0849;    break;
+		case K2('P','U'):     r =   2.00; m = 244.0;       break;
+		case K2('R','A'):     r =   2.83; m = 226.0;       break;
+		case K2('R','B'):     r =   3.03; m = 85.46783;    break;
+		case K2('R','E'):     r =   2.00; m = 186.2071;    break;
+		case K2('R','F'):     r =   2.00; m = 261.0;       break;
+		case K2('R','G'):     r =   2.00; m = 272.0;       break;
+		case K2('R','H'):     r =   2.00; m = 102.905502;  break;
+		case K2('R','N'):     r =   2.20; m = 222.018;     break;
+		case K2('R','U'):     r =   2.00; m = 101.072;     break;
+		case K2('S','B'):     r =   2.06; m = 121.7601;    break;
+		case K2('S','C'):     r =   2.11; m = 44.9559126;  break;
+		case K2('S','E'):     r =   1.90; m = 78.963;      break;
+		case K2('S','G'):     r =   2.00; m = 266.0;       break;
+		case K2('S','I'):     r =   2.10; m = 28.08553;    break;
+		case K2('S','M'):     r =   2.00; m = 150.362;     break;
+		case K2('S','N'):     r =   2.17; m = 118.7107;    break;
+		case K2('S','R'):     r =   2.49; m = 87.621;      break;
+		case K2('T','A'):     r =   2.00; m = 180.947882;  break;
+		case K2('T','B'):     r =   2.00; m = 158.925352;  break;
+		case K2('T','C'):     r =   2.00; m = 98.0;        break;
+		case K2('T','E'):     r =   2.06; m = 127.603;     break;
+		case K2('T','H'):     r =   2.00; m = 232.038062;  break;
+		case K2('T','I'):     r =   2.00; m = 47.8671;     break;
+		case K2('T','L'):     r =   1.96; m = 204.38332;   break;
+		case K2('T','M'):     r =   2.00; m = 168.934212;  break;
+		case K2('T','S'):     r =   2.00; m = 0.0;         break;
+		case K2('X','E'):     r =   2.16; m = 131.2936;    break;
+		case K2('Y','B'):     r =   2.00; m = 173.043;     break;
+		case K2('Z','N'):     r =   1.39; m = 65.4094;     break;
+		case K2('Z','R'):     r =   2.00; m = 91.2242;     break;
+		default: return FALSE; //not a symbol: the caller decides what to do
+	}
+	out->vdw  = r;
+	out->mass = m;
+	out->key  = key;
+	return TRUE;
+}
+
+/*max_asa[] -- the largest solvent-accessible surface a residue of each kind
+can have, in angstrom^2, indexed by its single-letter code less 'A'.
+
+Dividing a residue's SASA by this gives its relative accessibility, which is
+the number the buried/exposed question is actually asked of: 130 A^2 is most of
+an alanine and a sliver of a tryptophan.  The values are the "Theoretical"
+column of Table 1 of Tien et al. (2013) -- a Gly-X-Gly tripeptide extended to
+its maximum -- rather than the empirical column of the same table, because the
+empirical one is the largest value seen in a particular set of structures and
+so goes stale as the archive grows.
+
+0.0 means the letter has no value: the six ambiguity and placeholder codes
+(B J O U X Z), and the twenty letters that are not amino acid codes at all.
+A residue with no value gets no relative accessibility rather than a wrong
+one.*/
+static const NV max_asa[26] = {
+	129.0,   0.0, 167.0, 193.0, 223.0, 240.0, 104.0, 224.0, 197.0,   0.0, //A-J
+	236.0, 201.0, 224.0, 195.0,   0.0, 159.0, 225.0, 274.0, 155.0, 172.0, //K-T
+	  0.0, 174.0, 285.0,   0.0, 263.0,   0.0                              //U-Z
+};
+
+/*Aromatic rings, by residue name.
+
+A ring is a list of atom names, and the pi-stacking geometry needs it in a
+fixed order: mdtraj's compute_ring_normal() takes the plane's normal from the
+cross product of the first two atoms' offsets from the centroid, so two readers
+that list the same ring in a different order get normals that differ by
+whatever the ring departs from planarity in a real structure.  The order below
+is the one t/data/features.py hands mdtraj, which is what makes the two
+comparable.
+
+Only the residues whose ring is fixed by the format's own atom naming are
+here: the four aromatic amino acids and the nucleobases.  A ligand's rings
+would need bond perception, which this module does not do -- it never reads a
+CONECT record or guesses a bond -- so a ligand contributes no rings and
+structure_pi_stacking() says so rather than quietly finding none.
+
+HID/HIE/HIP and HSD/HSE/HSP are histidine under the names AMBER and CHARMM
+give its three protonation states; a structure that has been through either
+comes back with those spellings and the same five ring atoms.*/
+#define RING_MAX 6 //the most atoms any ring in the table below has
+
+typedef struct {
+	const char *const *atom; //ring atom names, normal taken from the first two
+	unsigned short int n;    //how many
+	char label;              //'6' six-membered, '5' five-membered
+} ring_def;
+
+static const char *const ring_phe[6] = { "CG", "CD1", "CD2", "CE1", "CE2", "CZ" };
+static const char *const ring_his[5] = { "CG", "ND1", "CE1", "NE2", "CD2" };
+static const char *const ring_trp5[5] = { "CG", "CD1", "NE1", "CE2", "CD2" };
+static const char *const ring_trp6[6] = { "CD2", "CE2", "CZ2", "CH2", "CZ3", "CE3" };
+static const char *const ring_pur6[6] = { "N1", "C2", "N3", "C4", "C5", "C6" };
+static const char *const ring_pur5[5] = { "C4", "C5", "N7", "C8", "N9" };
+static const char *const ring_pyr6[6] = { "N1", "C2", "N3", "C4", "C5", "C6" };
+
+static const ring_def rings_phe[1] = { { ring_phe, 6, '6' } };
+static const ring_def rings_his[1] = { { ring_his, 5, '5' } };
+static const ring_def rings_trp[2] = { { ring_trp6, 6, '6' }, { ring_trp5, 5, '5' } };
+static const ring_def rings_pur[2] = { { ring_pur6, 6, '6' }, { ring_pur5, 5, '5' } };
+static const ring_def rings_pyr[1] = { { ring_pyr6, 6, '6' } };
+
+//how many rings a residue name has, and where they are; 0 for everything else
+static unsigned short int ring_defs(U32 key, const ring_def *CSP_RESTRICT *out)
+{
+	switch (key) {
+		case K3('P','H','E'): case K3('T','Y','R'):
+			*out = rings_phe; return 1;
+		case K3('H','I','S'):
+		case K3('H','I','D'): case K3('H','I','E'): case K3('H','I','P'):
+		case K3('H','S','D'): case K3('H','S','E'): case K3('H','S','P'):
+			*out = rings_his; return 1;
+		case K3('T','R','P'):
+			*out = rings_trp; return 2;
+		//purines: adenine and guanine, DNA and RNA
+		case K3(' ',' ','A'): case K3(' ',' ','G'):
+		case K3(' ','D','A'): case K3(' ','D','G'):
+			*out = rings_pur; return 2;
+		//pyrimidines: cytosine, thymine and uracil, DNA and RNA
+		case K3(' ',' ','C'): case K3(' ',' ','T'): case K3(' ',' ','U'):
+		case K3(' ','D','C'): case K3(' ','D','T'): case K3(' ','D','U'):
+			*out = rings_pyr; return 1;
+		default: *out = NULL; return 0;
+	}
+}
+
+//hash field accessors, for walking an $info that Perl built
+static SV *hvf_sv(pTHX_ HV *CSP_RESTRICT h, const char *CSP_RESTRICT k, STRLEN klen)
+{
+	SV **p = hv_fetch(h, k, (I32)klen, 0);
+	return (p && *p && SvOK(*p)) ? *p : NULL;
+}
+
+static AV *hvf_av(pTHX_ HV *CSP_RESTRICT h, const char *CSP_RESTRICT k, STRLEN klen)
+{
+	SV *s = hvf_sv(aTHX_ h, k, klen);
+	return (s && SvROK(s) && SvTYPE(SvRV(s)) == SVt_PVAV) ? (AV *)SvRV(s) : NULL;
+}
+
+static HV *hvf_hv(pTHX_ HV *CSP_RESTRICT h, const char *CSP_RESTRICT k, STRLEN klen)
+{
+	SV *s = hvf_sv(aTHX_ h, k, klen);
+	return (s && SvROK(s) && SvTYPE(SvRV(s)) == SVt_PVHV) ? (HV *)SvRV(s) : NULL;
+}
+
+//the hash an array element refers to, or NULL if it is not a hash reference
+static HV *hvf_ent_hv(pTHX_ HV *CSP_RESTRICT h, SV *CSP_RESTRICT key)
+{
+	HE *e = hv_fetch_ent(h, key, 0, 0);
+	SV *v = e ? HeVAL(e) : NULL;
+	return (v && SvROK(v) && SvTYPE(SvRV(v)) == SVt_PVHV) ? (HV *)SvRV(v) : NULL;
+}
+
+/*The coordinate section of an $info, flattened.
+
+Atoms are in walk order, which is chain by chain, residue by residue and, inside
+a residue, the order the file wrote them: so a residue's atoms are one
+contiguous run and a chain's residues are another, and the roll-ups below are
+sums over ranges rather than lookups.  Same shape the parse itself hands back,
+for the same reason.*/
+typedef struct {
+	//per atom
+	NV *x, *y, *z;
+	NV *rad;      //van der Waals radius plus the probe, angstrom
+	NV *area;     //solvent-accessible surface, angstrom^2; NULL until computed
+	NV *mass;     //dalton; 0.0 for an atom whose element has no mass
+	unsigned char *apolar; //1 = carbon or sulphur, 0 = everything else
+	HV **atom_hv; //the atom hash the row was read from, for writing back
+	UV n_atom;
+	//per residue: the atom range [first, last)
+	HV **res_hv;
+	UV *res_first, *res_last;
+	char *res_one; //single-letter code, '\0' when the residue has none
+	unsigned char *res_type; //RT_*, for the questions only an amino acid answers
+	U32 *res_key;  //packed residue name, for ring_defs()
+	UV n_res;
+	//per chain: the residue range [first, last)
+	HV **chain_hv;
+	UV *chain_first, *chain_last;
+	UV n_chain;
+	//tallies gathered on the way past
+	NV mass_total;
+	UV n_no_element; //atoms whose element field spells no element
+} structset;
+
+static void set_free(pTHX_ structset *CSP_RESTRICT s)
+{
+	Safefree(s->x);        Safefree(s->y);         Safefree(s->z);
+	Safefree(s->rad);      Safefree(s->area);      Safefree(s->mass);
+	Safefree(s->apolar);   Safefree(s->atom_hv);
+	Safefree(s->res_hv);   Safefree(s->res_first); Safefree(s->res_last);
+	Safefree(s->res_one);  Safefree(s->res_type);  Safefree(s->res_key);
+	Safefree(s->chain_hv); Safefree(s->chain_first); Safefree(s->chain_last);
+	Zero(s, 1, structset);
+}
+
+/*set_build() -- walk an $info into the arrays above.
+
+Sized from what the structure already says about itself rather than by counting
+first: a chain's n_atoms counts records, so it is an upper bound on how many
+distinct atoms its residues hold (alternate conformers of one atom are one
+entry in the residue's atoms hash and several records), and the residue counts
+are exact.  One over-allocation, trimmed with Renew afterwards, against a
+second walk of the same hashes.
+
+Croaks rather than returning an empty set when there are atom records to be had
+and no atom hashes to read them from: that is a structure read with atoms => 0,
+and the only thing wrong with it is that nobody said so.*/
+static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
+                      NV probe, const char *CSP_RESTRICT who)
+{
+	AV *order = hvf_av(aTHX_ info, "chain_order", 11);
+	HV *chains = hvf_hv(aTHX_ info, "chains", 6);
+	UV cap_atom = 0, cap_res = 0, n_chain = 0;
+	SSize_t ci, nci;
+
+	Zero(s, 1, structset);
+	if (!order || !chains) return;
+	nci = av_len(order) + 1;
+
+	//first pass: the chains only, which is a few dozen fetches, for the sizes
+	for (ci = 0; ci < nci; ci++) {
+		SV **cs = av_fetch(order, ci, 0);
+		HV *c;
+		AV *ro;
+		SV *na;
+		if (!cs || !*cs || !SvOK(*cs)) continue;
+		c = hvf_ent_hv(aTHX_ chains, *cs);
+		if (!c) continue;
+		n_chain++;
+		ro = hvf_av(aTHX_ c, "residue_order", 13);
+		if (ro) cap_res += (UV)(av_len(ro) + 1);
+		na = hvf_sv(aTHX_ c, "n_atoms", 7);
+		if (na) cap_atom += SvUV(na);
+	}
+	if (n_chain == 0) return;
+
+	Newx(s->x,   cap_atom ? cap_atom : 1, NV);
+	Newx(s->y,   cap_atom ? cap_atom : 1, NV);
+	Newx(s->z,   cap_atom ? cap_atom : 1, NV);
+	Newx(s->rad, cap_atom ? cap_atom : 1, NV);
+	Newx(s->mass, cap_atom ? cap_atom : 1, NV);
+	Newx(s->apolar, cap_atom ? cap_atom : 1, unsigned char);
+	Newx(s->atom_hv, cap_atom ? cap_atom : 1, HV *);
+	Newx(s->res_hv,    cap_res ? cap_res : 1, HV *);
+	Newx(s->res_first, cap_res ? cap_res : 1, UV);
+	Newx(s->res_last,  cap_res ? cap_res : 1, UV);
+	Newx(s->res_one,   cap_res ? cap_res : 1, char);
+	Newx(s->res_type,  cap_res ? cap_res : 1, unsigned char);
+	Newx(s->res_key,   cap_res ? cap_res : 1, U32);
+	Newx(s->chain_hv,    n_chain, HV *);
+	Newx(s->chain_first, n_chain, UV);
+	Newx(s->chain_last,  n_chain, UV);
+
+	for (ci = 0; ci < nci; ci++) {
+		SV **cs = av_fetch(order, ci, 0);
+		HV *c;
+		AV *ro;
+		HV *residues;
+		SSize_t ri, nri;
+		if (!cs || !*cs || !SvOK(*cs)) continue;
+		c = hvf_ent_hv(aTHX_ chains, *cs);
+		if (!c) continue;
+		s->chain_hv[s->n_chain] = c;
+		s->chain_first[s->n_chain] = s->n_res;
+		ro = hvf_av(aTHX_ c, "residue_order", 13);
+		residues = hvf_hv(aTHX_ c, "residues", 8);
+		nri = (ro && residues) ? av_len(ro) + 1 : 0;
+		for (ri = 0; ri < nri; ri++) {
+			SV **rs = av_fetch(ro, ri, 0);
+			HV *r;
+			AV *ao;
+			HV *atoms;
+			SV *one;
+			SV *rn;
+			SSize_t ai, nai;
+			if (!rs || !*rs || !SvOK(*rs)) continue;
+			r = hvf_ent_hv(aTHX_ residues, *rs);
+			if (!r || s->n_res >= cap_res) continue;
+			s->res_hv[s->n_res] = r;
+			s->res_first[s->n_res] = s->n_atom;
+			one = hvf_sv(aTHX_ r, "one", 3);
+			if (one) {
+				STRLEN olen;
+				const char *op = SvPV_const(one, olen);
+				//a residue with no single-letter code has an empty string here,
+				//not a missing key, so length is what tells them apart
+				s->res_one[s->n_res] = (olen == 1) ? *op : '\0';
+			} else {
+				s->res_one[s->n_res] = '\0';
+			}
+			rn = hvf_sv(aTHX_ r, "resname", 7);
+			if (rn) {
+				STRLEN rl;
+				res_info ri;
+				const char *rp = SvPV_const(rn, rl);
+				s->res_key[s->n_res] = res_key(rp, rl);
+				s->res_type[s->n_res] = res_lookup(rp, rl, &ri) ? ri.type : RT_OTHER;
+			} else {
+				s->res_key[s->n_res] = 0;
+				s->res_type[s->n_res] = RT_OTHER;
+			}
+			ao = hvf_av(aTHX_ r, "atom_order", 10);
+			atoms = hvf_hv(aTHX_ r, "atoms", 5);
+			nai = (ao && atoms) ? av_len(ao) + 1 : 0;
+			for (ai = 0; ai < nai; ai++) {
+				SV **as = av_fetch(ao, ai, 0);
+				HV *a;
+				SV *xs, *ys, *zs, *es;
+				elem_prop ep;
+				unsigned char apolar;
+				if (!as || !*as || !SvOK(*as)) continue;
+				a = hvf_ent_hv(aTHX_ atoms, *as);
+				if (!a || s->n_atom >= cap_atom) continue;
+				xs = hvf_sv(aTHX_ a, "x", 1);
+				ys = hvf_sv(aTHX_ a, "y", 1);
+				zs = hvf_sv(aTHX_ a, "z", 1);
+				//an atom whose line was truncated before the coordinates has
+				//no position, and a position is what every one of these
+				//calculations is about; it is left out and counted nowhere
+				if (!xs || !ys || !zs) continue;
+				es = hvf_sv(aTHX_ a, "element", 7);
+				apolar = 0;
+				if (es) {
+					STRLEN el;
+					const char *ep_s = SvPV_const(es, el);
+					/*Carbon and sulphur are the apolar surface and everything
+					else is the polar one, which is the split Chothia, C (1974)
+					Nature 248:338 made when he first added a protein's buried
+					surface up.  Only the symbol decides it, so a sulphur that
+					is part of a sulphate counts as apolar here; a caller who
+					wants a chemistry-aware split has the per-atom areas.
+
+					Asked of the packed key rather than of the field, so that a
+					field written " C" or "c" answers the same as "C" -- the
+					same normalisation the radius lookup just did.*/
+					if (!elem_prop_of(ep_s, el, &ep)) {
+						ep.vdw = CSP_VDW_DEFAULT;
+						ep.mass = 0.0;
+						s->n_no_element++;
+					} else if (ep.key == K2('C', 0) || ep.key == K2('S', 0)) {
+						apolar = 1;
+					}
+				} else {
+					ep.vdw = CSP_VDW_DEFAULT;
+					ep.mass = 0.0;
+					s->n_no_element++;
+				}
+				s->x[s->n_atom] = SvNV(xs);
+				s->y[s->n_atom] = SvNV(ys);
+				s->z[s->n_atom] = SvNV(zs);
+				s->rad[s->n_atom] = ep.vdw + probe;
+				s->mass[s->n_atom] = ep.mass;
+				s->apolar[s->n_atom] = apolar;
+				s->mass_total += ep.mass;
+				s->atom_hv[s->n_atom] = a;
+				s->n_atom++;
+			}
+			s->res_last[s->n_res] = s->n_atom;
+			s->n_res++;
+		}
+		s->chain_last[s->n_chain] = s->n_res;
+		s->n_chain++;
+	}
+	if (s->n_atom == 0 && cap_atom > 0) {
+		set_free(aTHX_ s);
+		croak("%s: this structure has no atom hashes to work from; "
+		      "read it again without atoms => 0", who);
+	}
+	//give the over-allocation back before the calculations pile their own
+	//working arrays on top of it
+	if (s->n_atom < cap_atom && s->n_atom > 0) {
+		Renew(s->x, s->n_atom, NV);
+		Renew(s->y, s->n_atom, NV);
+		Renew(s->z, s->n_atom, NV);
+		Renew(s->rad, s->n_atom, NV);
+		Renew(s->mass, s->n_atom, NV);
+		Renew(s->apolar, s->n_atom, unsigned char);
+		Renew(s->atom_hv, s->n_atom, HV *);
+	}
+}
+
+/*A uniform grid over a set of points, for "which points are within cut of this
+one?".
+
+The Shrake-Rupley kernel asks that question once per atom and mdtraj answers it
+by comparing every atom against every other, which is fine for the few thousand
+atoms an MD frame holds and is not fine here: the largest entry in PDBbind
+v2020 is ~400,000 atoms, and 1.6e11 distance comparisons is not a wait anybody
+would sit through.  A grid of cells one cutoff wide gives the same neighbour
+set from the 27 cells around each atom, in time proportional to the number of
+atoms rather than its square.
+
+Same set, not a similar one: an atom is a neighbour when the distance is below
+the cutoff, and the cutoff is twice the largest radius, so every neighbour is
+inside the 27-cell block whatever the cell size is as long as it is at least
+the cutoff.  Which is why the loop that widens the cells to keep their number
+down is safe -- it can only make the block bigger.  The order neighbours come
+back in does change, and does not matter: the kernel asks whether any of them
+covers a point and stops at the first that does.
+
+The cell count is capped at eight per atom so that the grid cannot cost more
+memory than the coordinates it indexes -- a thin, extended structure in a large
+box would otherwise want more cells than there are atoms to put in them.*/
+typedef struct {
+	UV *start; //ncell + 1 offsets into idx
+	UV *idx;   //point indices, grouped by cell
+	NV cell;   //edge length, angstrom
+	NV x0, y0, z0;
+	UV nx, ny, nz;
+} cell_grid;
+
+static void grid_free(pTHX_ cell_grid *CSP_RESTRICT g)
+{
+	Safefree(g->start);
+	Safefree(g->idx);
+	Zero(g, 1, cell_grid);
+}
+
+//which cell along one axis a coordinate falls in, clamped to the grid.  Written
+//so that no non-finite value is ever cast to a UV, which is undefined
+//behaviour: a NaN fails `d > 0.0' and an infinity fails `k < n'.
+static UV grid_axis(NV d, NV cell, UV n)
+{
+	NV k;
+	if (n <= 1) return 0;
+	if (!(d > 0.0)) return 0;
+	k = d / cell;
+	if (!(k < (NV)n)) return n - 1;
+	return (UV)k; //truncation is floor here: k is positive
+}
+
+static void grid_build(pTHX_ cell_grid *CSP_RESTRICT g,
+                       const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y,
+                       const NV *CSP_RESTRICT z, UV n, NV cut)
+{
+	NV xmax, ymax, zmax, cells = 0.0;
+	UV i, ncell, c;
+	Zero(g, 1, cell_grid);
+	if (n == 0) return;
+	g->x0 = xmax = x[0];
+	g->y0 = ymax = y[0];
+	g->z0 = zmax = z[0];
+	for (i = 1; i < n; i++) {
+		if (x[i] < g->x0) g->x0 = x[i]; else if (x[i] > xmax) xmax = x[i];
+		if (y[i] < g->y0) g->y0 = y[i]; else if (y[i] > ymax) ymax = y[i];
+		if (z[i] < g->z0) g->z0 = z[i]; else if (z[i] > zmax) zmax = z[i];
+	}
+	g->cell = (cut > 0.0) ? cut : 1.0;
+	/*Widen the cells until there are at most eight per point.  Doubling, so a
+	box a kilometre across settles in a few dozen turns; the counter is there for
+	the case the extent is not a finite number at all, where the test below can
+	never come true and the grid falls back to a single cell.*/
+	{
+		unsigned short int turn;
+		NV ex = 0.0, ey = 0.0, ez = 0.0;
+		for (turn = 0; turn < 4096; turn++) {
+			ex = (xmax - g->x0) / g->cell;
+			ey = (ymax - g->y0) / g->cell;
+			ez = (zmax - g->z0) / g->cell;
+			cells = (ex + 1.0) * (ey + 1.0) * (ez + 1.0);
+			if (cells <= (NV)n * 8.0 + 1024.0) break;
+			g->cell *= 2.0;
+		}
+		//the cast is safe only under that test, which bounds each extent by the
+		//cell count it just passed
+		if (cells <= (NV)n * 8.0 + 1024.0) {
+			g->nx = (UV)ex + 1;
+			g->ny = (UV)ey + 1;
+			g->nz = (UV)ez + 1;
+		} else {
+			g->nx = g->ny = g->nz = 1;
+		}
+	}
+	ncell = g->nx * g->ny * g->nz;
+	Newxz(g->start, ncell + 1, UV);
+	Newx(g->idx, n, UV);
+	for (i = 0; i < n; i++) {
+		c = (grid_axis(x[i] - g->x0, g->cell, g->nx) * g->ny
+		   + grid_axis(y[i] - g->y0, g->cell, g->ny)) * g->nz
+		   + grid_axis(z[i] - g->z0, g->cell, g->nz);
+		g->start[c]++;
+	}
+	//counting sort: prefix the counts into starts, fill, then shift the ends
+	//back into starts, which is one array rather than a second cursor one
+	{
+		UV run = 0;
+		for (c = 0; c < ncell; c++) { UV t = g->start[c]; g->start[c] = run; run += t; }
+	}
+	for (i = 0; i < n; i++) {
+		c = (grid_axis(x[i] - g->x0, g->cell, g->nx) * g->ny
+		   + grid_axis(y[i] - g->y0, g->cell, g->ny)) * g->nz
+		   + grid_axis(z[i] - g->z0, g->cell, g->nz);
+		g->idx[g->start[c]++] = i;
+	}
+	for (c = ncell; c > 0; c--) g->start[c] = g->start[c - 1];
+	g->start[0] = 0;
+}
+
+/*sasa_sphere() -- n points spread over the unit sphere by the golden section
+spiral, which is what mdtraj's kernel uses.
+
+The spiral is cheap and very nearly even, which is all the algorithm needs: the
+area an atom contributes is 4*pi*r^2 times the fraction of its points that no
+other atom covers, and that fraction is only as good as the points are evenly
+spread.  mdtraj's own note says as much -- points that repelled each other to an
+energy minimum would be better and would cost more than the rest of the
+calculation.*/
+static void sasa_sphere(NV *CSP_RESTRICT pts, UV n)
+{
+	const NV inc = CSP_PI * (3.0 - nv_sqrt((NV)5.0));
+	const NV offset = 2.0 / (NV)n;
+	UV i;
+	for (i = 0; i < n; i++) {
+		NV y = (NV)i * offset - 1.0 + offset / 2.0;
+		NV t = 1.0 - y * y;
+		NV r = (t > 0.0) ? nv_sqrt(t) : 0.0; //the half-offset keeps |y| < 1; this is in
+		NV phi = (NV)i * inc;                //case rounding at n = 1 says otherwise
+		pts[3 * i]     = nv_cos(phi) * r;
+		pts[3 * i + 1] = y;
+		pts[3 * i + 2] = nv_sin(phi) * r;
+	}
+}
+
+/*sasa_compute() -- Shrake and Rupley, as mdtraj computes it.
+
+Each atom gets a sphere of npts points at its van der Waals radius plus the
+probe radius; a point is accessible when no other atom's sphere covers it; the
+atom's area is 4*pi*r^2 times the accessible fraction.
+
+Two departures from a literal transcription of mdtraj's kernel, neither of
+which changes an answer:
+
+The neighbour search is the grid above rather than a scan of every other atom.
+
+The distance test is squared -- d2 < (ri+rj)^2 rather than sqrt(d2) < ri+rj --
+which saves a square root per pair.  The two differ only for a pair whose
+separation is within an ulp of the sum of their radii, and a neighbour at
+exactly that separation covers none of the other's points: its sphere touches
+at one point and covers an open region of measure zero around it.
+
+The rotation of the neighbour list is mdtraj's and is kept: consecutive points
+on the spiral are close together, so the atom that covered the last one is the
+one most likely to cover this one, and starting the scan there rather than at
+the beginning is most of the kernel's speed.*/
+static void sasa_compute(pTHX_ structset *CSP_RESTRICT s, UV npts)
+{
+	const UV n = s->n_atom;
+	NV *CSP_RESTRICT pts = NULL;
+	UV *CSP_RESTRICT nbr = NULL;
+	//grown by doubling as needed; 64 covers every atom of a protein, where the
+	//neighbour count runs to the low tens, without a single reallocation
+	UV nbr_cap = 64;
+	cell_grid g;
+	NV rmax = 0.0, constant;
+	UV i;
+
+	Newxz(s->area, n ? n : 1, NV);
+	if (n == 0) return;
+	for (i = 0; i < n; i++) if (s->rad[i] > rmax) rmax = s->rad[i];
+	Newx(pts, npts * 3, NV);
+	sasa_sphere(pts, npts);
+	grid_build(aTHX_ &g, s->x, s->y, s->z, n, 2.0 * rmax);
+	Newx(nbr, nbr_cap, UV);
+	constant = 4.0 * CSP_PI / (NV)npts;
+
+	for (i = 0; i < n; i++) {
+		const NV xi = s->x[i], yi = s->y[i], zi = s->z[i], ri = s->rad[i];
+		UV n_nbr = 0, acc = 0, k_closest = 0, j;
+		UV cx = grid_axis(xi - g.x0, g.cell, g.nx);
+		UV cy = grid_axis(yi - g.y0, g.cell, g.ny);
+		UV cz = grid_axis(zi - g.z0, g.cell, g.nz);
+		UV ax0 = cx ? cx - 1 : 0, ax1 = (cx + 1 < g.nx) ? cx + 1 : g.nx - 1;
+		UV ay0 = cy ? cy - 1 : 0, ay1 = (cy + 1 < g.ny) ? cy + 1 : g.ny - 1;
+		UV az0 = cz ? cz - 1 : 0, az1 = (cz + 1 < g.nz) ? cz + 1 : g.nz - 1;
+		UV bx, by, bz;
+		for (bx = ax0; bx <= ax1; bx++)
+		for (by = ay0; by <= ay1; by++)
+		for (bz = az0; bz <= az1; bz++) {
+			UV c = (bx * g.ny + by) * g.nz + bz;
+			UV p;
+			for (p = g.start[c]; p < g.start[c + 1]; p++) {
+				UV a = g.idx[p];
+				NV dx, dy, dz, sum;
+				if (a == i) continue;
+				dx = s->x[a] - xi; dy = s->y[a] - yi; dz = s->z[a] - zi;
+				sum = ri + s->rad[a];
+				if (dx * dx + dy * dy + dz * dz >= sum * sum) continue;
+				if (n_nbr == nbr_cap) { nbr_cap *= 2; Renew(nbr, nbr_cap, UV); }
+				nbr[n_nbr++] = a;
+			}
+		}
+		for (j = 0; j < npts; j++) {
+			const NV px = xi + ri * pts[3 * j];
+			const NV py = yi + ri * pts[3 * j + 1];
+			const NV pz = zi + ri * pts[3 * j + 2];
+			bool open = TRUE;
+			UV k;
+			for (k = 0; k < n_nbr; k++) {
+				UV kp = k_closest + k;
+				UV a;
+				NV dx, dy, dz, ra;
+				if (kp >= n_nbr) kp -= n_nbr;
+				a = nbr[kp];
+				dx = px - s->x[a]; dy = py - s->y[a]; dz = pz - s->z[a];
+				ra = s->rad[a];
+				if (dx * dx + dy * dy + dz * dz < ra * ra) {
+					k_closest = kp;
+					open = FALSE;
+					break;
+				}
+			}
+			if (open) acc++;
+		}
+		s->area[i] = (NV)acc * constant * ri * ri;
+	}
+	Safefree(nbr);
+	Safefree(pts);
+	grid_free(aTHX_ &g);
+}
+
+/*Aromatic rings, found and given a plane.
+
+The centroid is the mean of the ring atoms' positions and the normal is the
+cross product of the first two atoms' offsets from it, normalised -- which is
+mdtraj's compute_centroid() and compute_ring_normal() exactly, including the
+part where only two of the ring's atoms decide the plane.  A ring in a real
+structure is not quite planar, so a least-squares plane through all six atoms
+would be a different vector; it would also be a different answer from the one
+the reference implementation gives, and the reference implementation is what
+this is tested against.
+
+The direction the normal points in is arbitrary -- it flips if the ring is
+listed the other way round -- and nothing below depends on it, because every
+angle is folded into 0..90 degrees before it is compared with anything.*/
+typedef struct {
+	NV cx, cy, cz; //centroid
+	NV nx, ny, nz; //unit normal
+	UV res;        //which residue it belongs to
+	char label;    //'6' or '5': the ring size, which is what names it
+} ring_t;
+
+//the coordinates of a named atom of a residue, false when the residue has no
+//atom of that name (a side chain modelled only as far as CB, most often)
+static bool ring_atom(pTHX_ HV *CSP_RESTRICT atoms, const char *CSP_RESTRICT name,
+                      NV *CSP_RESTRICT px, NV *CSP_RESTRICT py, NV *CSP_RESTRICT pz)
+{
+	STRLEN nlen = strlen(name);
+	SV **slot = hv_fetch(atoms, name, (I32)nlen, 0);
+	HV *a;
+	SV *xs, *ys, *zs;
+	if (!slot || !*slot || !SvROK(*slot) || SvTYPE(SvRV(*slot)) != SVt_PVHV) return FALSE;
+	a = (HV *)SvRV(*slot);
+	xs = hvf_sv(aTHX_ a, "x", 1);
+	ys = hvf_sv(aTHX_ a, "y", 1);
+	zs = hvf_sv(aTHX_ a, "z", 1);
+	if (!xs || !ys || !zs) return FALSE;
+	*px = SvNV(xs); *py = SvNV(ys); *pz = SvNV(zs);
+	return TRUE;
+}
+
+static UV rings_find(pTHX_ structset *CSP_RESTRICT s, ring_t *CSP_RESTRICT *out)
+{
+	ring_t *rings = NULL;
+	UV cap = 0, n = 0, r;
+	*out = NULL;
+	for (r = 0; r < s->n_res; r++) {
+		const ring_def *defs;
+		unsigned short int nd = ring_defs(s->res_key[r], &defs), d;
+		HV *atoms;
+		if (nd == 0) continue;
+		atoms = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
+		if (!atoms) continue;
+		for (d = 0; d < nd; d++) {
+			//the largest ring in the table is six-membered; the array is the
+			//size of the table's largest entry, not of anything the file says
+			NV px[RING_MAX], py[RING_MAX], pz[RING_MAX];
+			NV cx = 0.0, cy = 0.0, cz = 0.0, ux, uy, uz, vx, vy, vz, wx, wy, wz, wl;
+			unsigned short int i, na = defs[d].n;
+			bool whole = TRUE;
+			for (i = 0; i < na; i++) {
+				if (!ring_atom(aTHX_ atoms, defs[d].atom[i], &px[i], &py[i], &pz[i])) {
+					whole = FALSE;
+					break;
+				}
+				cx += px[i]; cy += py[i]; cz += pz[i];
+			}
+			if (!whole) continue; //an incomplete ring has no plane to speak of
+			cx /= (NV)na; cy /= (NV)na; cz /= (NV)na;
+			ux = px[0] - cx; uy = py[0] - cy; uz = pz[0] - cz;
+			vx = px[1] - cx; vy = py[1] - cy; vz = pz[1] - cz;
+			wx = uy * vz - uz * vy;
+			wy = uz * vx - ux * vz;
+			wz = ux * vy - uy * vx;
+			wl = nv_sqrt(wx * wx + wy * wy + wz * wz);
+			//three collinear points define no plane; a structure with two ring
+			//atoms deposited at the same position is the way that happens
+			if (!(wl > 0.0)) continue;
+			if (n == cap) {
+				cap = cap ? cap * 2 : 32;
+				Renew(rings, cap, ring_t);
+			}
+			rings[n].cx = cx; rings[n].cy = cy; rings[n].cz = cz;
+			rings[n].nx = wx / wl; rings[n].ny = wy / wl; rings[n].nz = wz / wl;
+			rings[n].res = r;
+			rings[n].label = defs[d].label;
+			n++;
+		}
+	}
+	*out = rings;
+	return n;
+}
+
+//the angle between two vectors, folded into 0..pi/2 -- mdtraj's compute_angles()
+//followed by its cap_angle(), which is how a plane's two-sided normal is made to
+//mean one thing.  The cosine is clamped before acos() sees it: a dot product of
+//two unit vectors can land a fraction of an ulp outside [-1, 1] and acos() of
+//that is a NaN, which numpy warns about and carries and this would not.
+static NV vec_angle_capped(NV ax, NV ay, NV az, NV bx, NV by, NV bz)
+{
+	NV la = nv_sqrt(ax * ax + ay * ay + az * az);
+	NV lb = nv_sqrt(bx * bx + by * by + bz * bz);
+	NV c, a;
+	if (!(la > 0.0) || !(lb > 0.0)) return -1.0; //no angle: the caller drops the pair
+	c = (ax * bx + ay * by + az * bz) / (la * lb);
+	if (c > 1.0) c = 1.0; else if (c < -1.0) c = -1.0;
+	a = nv_acos(c);
+	return (a > CSP_PI / 2.0) ? CSP_PI - a : a;
+}
+
+static NV det3(NV a, NV b, NV c, NV d, NV e, NV f, NV g, NV h, NV i)
+{
+	return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+}
+
+/*The distance from the nearer of two rings' centroids to the line where their
+planes meet -- mdtraj's calculate_intersection_point() followed by the two
+norms it is fed to.
+
+An edge-to-face stack is one ring pointing its edge at the other's face, and
+what tells it from two rings merely at right angles some way apart is that the
+line their planes share passes close to both of them.  Solving [n1; n2; n1xn2]
+p = [n1.c1, n2.c2, 0] puts p on that line, projecting c1 onto the line moves it
+to the nearest point, and the smaller of the two centroid distances from there
+is what gets compared with the radius.
+
+False when the planes are parallel and there is no line.  mdtraj tests the
+determinant against zero and lets a NaN fall through its threshold; this is
+only ever reached with the planes 50 degrees or more apart, where the
+determinant is |n1 x n2|^2 >= sin^2(50) = 0.587, so the test is a formality
+either way.*/
+static bool ring_intersect(const ring_t *CSP_RESTRICT a, const ring_t *CSP_RESTRICT b,
+                           NV *CSP_RESTRICT dmin)
+{
+	NV dx = a->ny * b->nz - a->nz * b->ny;
+	NV dy = a->nz * b->nx - a->nx * b->nz;
+	NV dz = a->nx * b->ny - a->ny * b->nx;
+	NV det = det3(a->nx, a->ny, a->nz, b->nx, b->ny, b->nz, dx, dy, dz);
+	NV o1, o2, px, py, pz, dl, vx, vy, vz, proj, ix, iy, iz, da, db;
+	if (nv_fabs(det) <= NV_EPSILON) return FALSE;
+	o1 = a->nx * a->cx + a->ny * a->cy + a->nz * a->cz;
+	o2 = b->nx * b->cx + b->ny * b->cy + b->nz * b->cz;
+	//Cramer's rule on [n_a; n_b; n_a x n_b] p = [o1, o2, 0]
+	px = det3(o1, a->ny, a->nz, o2, b->ny, b->nz, 0.0, dy, dz) / det;
+	py = det3(a->nx, o1, a->nz, b->nx, o2, b->nz, dx, 0.0, dz) / det;
+	pz = det3(a->nx, a->ny, o1, b->nx, b->ny, o2, dx, dy, 0.0) / det;
+	dl = nv_sqrt(dx * dx + dy * dy + dz * dz);
+	if (!(dl > 0.0)) return FALSE;
+	dx /= dl; dy /= dl; dz /= dl;
+	vx = a->cx - px; vy = a->cy - py; vz = a->cz - pz;
+	proj = dx * vx + dy * vy + dz * vz;
+	ix = px + dx * proj; iy = py + dy * proj; iz = pz + dz * proj;
+	da = nv_sqrt((a->cx - ix) * (a->cx - ix) + (a->cy - iy) * (a->cy - iy)
+	           + (a->cz - iz) * (a->cz - iz));
+	db = nv_sqrt((b->cx - ix) * (b->cx - ix) + (b->cy - iy) * (b->cy - iy)
+	           + (b->cz - iz) * (b->cz - iz));
+	*dmin = (da < db) ? da : db;
+	return TRUE;
+}
+
+/*Where a pair of rings has to be for the pair to count as stacked.
+
+Angles are radians here and degrees in the option hash, distances are angstrom
+here and nanometres in mdtraj.  The defaults Perl passes down are mdtraj's, in
+this file's units, with the one exception argued at the head of
+structure_pi_stacking() in the Perl: mdtraj's face-to-face centroid distance is
+5.5 in a function whose every other distance is nanometres, which is 55 A -- far
+enough that any two aromatic rings in a small protein would qualify.  ProLIF,
+which mdtraj's geometry is taken from, has 5.5 A, and mdtraj's three other
+distances are ProLIF's converted to nanometres.  So this takes 5.5 A as what
+was meant, and the option is there for a caller who wants the number mdtraj
+actually ships.*/
+typedef struct {
+	NV face_dist;                    //centroid separation, angstrom
+	NV face_plane_lo, face_plane_hi; //angle between the ring planes, radians
+	NV face_norm_lo, face_norm_hi;   //normal to centroid-to-centroid, radians
+	NV edge_dist;
+	NV edge_plane_lo, edge_plane_hi;
+	NV edge_norm_lo, edge_norm_hi;
+	NV edge_radius;                  //centroid to the planes' shared line, angstrom
+} pi_opt;
+
+//one field of the residue a ring sits in, copied into the interaction hash
+static void pi_field(pTHX_ HV *CSP_RESTRICT out, const char *CSP_RESTRICT key, STRLEN klen,
+                     HV *CSP_RESTRICT res, const char *CSP_RESTRICT from, STRLEN flen)
+{
+	SV *v = hvf_sv(aTHX_ res, from, flen);
+	(void)hv_store(out, key, (I32)klen, v ? newSVsv(v) : newSVpvn("", 0), 0);
+}
+
+/*pi_stacking() -- every stacked pair of rings in the structure.
+
+mdtraj asks the question of one named ligand group against one named receptor
+group; this asks it of every pair of rings in the structure, which is the same
+geometry run over a different set of pairs.  Two of them are dropped: a ring
+paired with itself, which mdtraj drops too because the vector between the two
+centroids is the zero vector and every angle taken from it is a NaN, and the
+two rings of one tryptophan or one purine, which mdtraj would happily call a
+face-to-face stack because they are coplanar and 1.2 A apart.  Two rings fused
+along a bond are one aromatic system, not two systems stacked.
+
+The pairs are found through the same grid the SASA uses, on the centroids: a
+structure with a few thousand aromatic rings has a few million pairs, and all
+but a handful of them are nowhere near each other.*/
+static AV *pi_stacking(pTHX_ structset *CSP_RESTRICT s, const pi_opt *CSP_RESTRICT po)
+{
+	AV *out = newAV();
+	ring_t *rings = NULL;
+	NV *cx = NULL, *cy = NULL, *cz = NULL;
+	NV cut = (po->face_dist > po->edge_dist) ? po->face_dist : po->edge_dist;
+	const NV to_deg = 180.0 / CSP_PI;
+	cell_grid g;
+	UV n, i;
+
+	n = rings_find(aTHX_ s, &rings);
+	if (n == 0) { Safefree(rings); return out; }
+	Newx(cx, n, NV); Newx(cy, n, NV); Newx(cz, n, NV);
+	for (i = 0; i < n; i++) { cx[i] = rings[i].cx; cy[i] = rings[i].cy; cz[i] = rings[i].cz; }
+	grid_build(aTHX_ &g, cx, cy, cz, n, cut);
+
+	for (i = 0; i < n; i++) {
+		UV bx, by, bz;
+		UV ci = grid_axis(cx[i] - g.x0, g.cell, g.nx);
+		UV cj = grid_axis(cy[i] - g.y0, g.cell, g.ny);
+		UV ck = grid_axis(cz[i] - g.z0, g.cell, g.nz);
+		UV ax0 = ci ? ci - 1 : 0, ax1 = (ci + 1 < g.nx) ? ci + 1 : g.nx - 1;
+		UV ay0 = cj ? cj - 1 : 0, ay1 = (cj + 1 < g.ny) ? cj + 1 : g.ny - 1;
+		UV az0 = ck ? ck - 1 : 0, az1 = (ck + 1 < g.nz) ? ck + 1 : g.nz - 1;
+		for (bx = ax0; bx <= ax1; bx++)
+		for (by = ay0; by <= ay1; by++)
+		for (bz = az0; bz <= az1; bz++) {
+			UV cell = (bx * g.ny + by) * g.nz + bz, p;
+			for (p = g.start[cell]; p < g.start[cell + 1]; p++) {
+				UV j = g.idx[p];
+				NV vx, vy, vz, d, plane, ang_i, ang_j, inter = 0.0;
+				bool face, edge = FALSE;
+				const char *kind;
+				HV *h;
+				if (j <= i) continue; //each pair once
+				if (rings[i].res == rings[j].res) continue; //fused, not stacked
+				vx = cx[j] - cx[i]; vy = cy[j] - cy[i]; vz = cz[j] - cz[i];
+				d = nv_sqrt(vx * vx + vy * vy + vz * vz);
+				if (d > cut) continue;
+				plane = vec_angle_capped(rings[i].nx, rings[i].ny, rings[i].nz,
+				                         rings[j].nx, rings[j].ny, rings[j].nz);
+				/*One capped angle serves for both of mdtraj's: it takes the
+				angle of each ring's normal against the vector from that ring to
+				the other, and the two vectors differ only in sign, which
+				cap_angle() folds away.*/
+				ang_i = vec_angle_capped(rings[i].nx, rings[i].ny, rings[i].nz, vx, vy, vz);
+				ang_j = vec_angle_capped(rings[j].nx, rings[j].ny, rings[j].nz, vx, vy, vz);
+				if (plane < 0.0 || ang_i < 0.0 || ang_j < 0.0) continue;
+				face = (d <= po->face_dist
+				     && plane >= po->face_plane_lo && plane <= po->face_plane_hi
+				     && ((ang_i >= po->face_norm_lo && ang_i <= po->face_norm_hi)
+				      || (ang_j >= po->face_norm_lo && ang_j <= po->face_norm_hi)));
+				if (!face) {
+					edge = (d <= po->edge_dist
+					     && plane >= po->edge_plane_lo && plane <= po->edge_plane_hi
+					     && ((ang_i >= po->edge_norm_lo && ang_i <= po->edge_norm_hi)
+					      || (ang_j >= po->edge_norm_lo && ang_j <= po->edge_norm_hi))
+					     && ring_intersect(&rings[i], &rings[j], &inter)
+					     && inter <= po->edge_radius);
+				}
+				if (!face && !edge) continue;
+				kind = face ? "face" : "edge";
+				h = newHV();
+				(void)hv_stores(h, "type", newSVpv(kind, 0));
+				pi_field(aTHX_ h, "chain1", 6, s->res_hv[rings[i].res], "chain", 5);
+				pi_field(aTHX_ h, "residue1", 8, s->res_hv[rings[i].res], "key", 3);
+				pi_field(aTHX_ h, "resname1", 8, s->res_hv[rings[i].res], "resname", 7);
+				(void)hv_stores(h, "ring1", newSVpvn(&rings[i].label, 1));
+				pi_field(aTHX_ h, "chain2", 6, s->res_hv[rings[j].res], "chain", 5);
+				pi_field(aTHX_ h, "residue2", 8, s->res_hv[rings[j].res], "key", 3);
+				pi_field(aTHX_ h, "resname2", 8, s->res_hv[rings[j].res], "resname", 7);
+				(void)hv_stores(h, "ring2", newSVpvn(&rings[j].label, 1));
+				(void)hv_stores(h, "distance", newSVnv(d));
+				(void)hv_stores(h, "plane_angle", newSVnv(plane * to_deg));
+				(void)hv_stores(h, "normal_angle1", newSVnv(ang_i * to_deg));
+				(void)hv_stores(h, "normal_angle2", newSVnv(ang_j * to_deg));
+				if (edge) (void)hv_stores(h, "intersect_distance", newSVnv(inter));
+				av_push(out, newRV_noinc((SV *)h));
+			}
+		}
+	}
+	grid_free(aTHX_ &g);
+	Safefree(cx); Safefree(cy); Safefree(cz);
+	Safefree(rings);
+	return out;
+}
+
+//an option that is a number, with the default the caller wrote down
+static NV opt_nv(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, NV dflt)
+{
+	SV *v = opt_get(aTHX_ o, k);
+	return v ? SvNV(v) : dflt;
+}
+
+//set_free() as a scope destructor, so that a croak between set_build() and the
+//end of features_do() -- which at this point can only be an allocation failing
+//-- does not walk off with the coordinate arrays
+static void set_free_cb(pTHX_ void *p)
+{
+	set_free(aTHX_ (structset *)p);
+}
+
+//degrees in the option hash, radians in the comparison
+static NV opt_rad(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, NV dflt_deg)
+{
+	return opt_nv(aTHX_ o, k, dflt_deg) * CSP_PI / 180.0;
+}
+
+/*features_do() -- one walk of the structure, every property that was asked for.
+
+The roll-ups are sums over the contiguous ranges set_build() left behind: a
+residue's atoms are one run and a chain's residues are another, so the
+per-residue and per-chain areas are the same loop the per-atom areas came out
+of rather than a second pass keyed on anything.
+
+What is written back into $info -- an atom's sasa, a residue's sasa and rsa, a
+chain's sasa -- is written here rather than returned and grafted on in Perl,
+for the reason the whole file exists: a 400,000-atom structure would otherwise
+mean 400,000 more SVs and a Perl loop to put them in place.*/
+static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
+                       const char *CSP_RESTRICT who)
+{
+	structset s;
+	HV *out;
+	HV *sasa_hv = NULL;
+	AV *pi = NULL;
+	const bool want_sasa = opt_bool(aTHX_ o, "sasa", TRUE);
+	const bool want_pi   = opt_bool(aTHX_ o, "pi_stacking", TRUE);
+	const bool store     = opt_bool(aTHX_ o, "store", TRUE);
+	const NV probe = opt_nv(aTHX_ o, "probe", 1.4);
+	const IV points = opt_iv(aTHX_ o, "points", 960);
+	NV total = 0.0, apolar = 0.0, mass_total = 0.0;
+	NV cx = 0.0, cy = 0.0, cz = 0.0, mx = 0.0, my = 0.0, mz = 0.0;
+	NV rg = 0.0, rg_mass = 0.0;
+	bool have_rg_mass = FALSE;
+	UV i, r, c;
+
+	if (probe < 0.0) croak("%s: probe must not be negative", who);
+	//The upper bound is memory, not accuracy: the sphere points are three NVs
+	//each, so ten million of them is 240 MB on a double perl and four times
+	//that on a quadmath one, for an atom whose area is one number.
+	if (points < 1 || points > 10000000)
+		croak("%s: points must be between 1 and 10000000", who);
+
+	ENTER;
+	Zero(&s, 1, structset);
+	SAVEDESTRUCTOR_X(set_free_cb, &s);
+	set_build(aTHX_ info, &s, probe, who);
+
+	if (want_sasa) {
+		sasa_compute(aTHX_ &s, (UV)points);
+		for (i = 0; i < s.n_atom; i++) {
+			total += s.area[i];
+			if (s.apolar[i]) apolar += s.area[i];
+			if (store) (void)hv_stores(s.atom_hv[i], "sasa", newSVnv(s.area[i]));
+		}
+		for (c = 0; c < s.n_chain; c++) {
+			NV c_area = 0.0;
+			for (r = s.chain_first[c]; r < s.chain_last[c]; r++) {
+				NV r_area = 0.0;
+				for (i = s.res_first[r]; i < s.res_last[r]; i++) r_area += s.area[i];
+				c_area += r_area;
+				if (!store) continue;
+				(void)hv_stores(s.res_hv[r], "sasa", newSVnv(r_area));
+				/*Relative accessibility, and only for an amino acid: the
+				single-letter codes of the nucleotides are amino acid codes
+				too, and dividing a guanine's area by glycine's maximum would
+				be a number rather than an answer.*/
+				if (s.res_type[r] == RT_AA && s.res_one[r] >= 'A' && s.res_one[r] <= 'Z') {
+					NV maxa = max_asa[s.res_one[r] - 'A'];
+					if (maxa > 0.0)
+						(void)hv_stores(s.res_hv[r], "rsa", newSVnv(r_area / maxa));
+				}
+			}
+			if (store) (void)hv_stores(s.chain_hv[c], "sasa", newSVnv(c_area));
+		}
+	}
+
+	/*Size and weight.  The unweighted radius of gyration is mdtraj's
+	compute_rg() with its default masses -- the root mean square distance from
+	the centroid -- and is comparable with it directly.  The mass-weighted one
+	is taken about the centre of mass, which is what the quantity means and is
+	not what mdtraj does: compute_rg(traj, masses=m) weights the distances by
+	mass but still measures them from the geometric centroid, so the two answers
+	differ by however far the two centres are apart.  t/features.t pins this one
+	against the corrected expression rather than against that call.*/
+	for (i = 0; i < s.n_atom; i++) {
+		cx += s.x[i]; cy += s.y[i]; cz += s.z[i];
+		mass_total += s.mass[i];
+		mx += s.mass[i] * s.x[i]; my += s.mass[i] * s.y[i]; mz += s.mass[i] * s.z[i];
+	}
+	if (s.n_atom) {
+		NV sum = 0.0;
+		cx /= (NV)s.n_atom; cy /= (NV)s.n_atom; cz /= (NV)s.n_atom;
+		for (i = 0; i < s.n_atom; i++) {
+			NV dx = s.x[i] - cx, dy = s.y[i] - cy, dz = s.z[i] - cz;
+			sum += dx * dx + dy * dy + dz * dz;
+		}
+		rg = nv_sqrt(sum / (NV)s.n_atom);
+	}
+	if (mass_total > 0.0) {
+		NV sum = 0.0;
+		mx /= mass_total; my /= mass_total; mz /= mass_total;
+		for (i = 0; i < s.n_atom; i++) {
+			NV dx = s.x[i] - mx, dy = s.y[i] - my, dz = s.z[i] - mz;
+			sum += s.mass[i] * (dx * dx + dy * dy + dz * dz);
+		}
+		rg_mass = nv_sqrt(sum / mass_total);
+		have_rg_mass = TRUE;
+	}
+
+	if (want_pi) {
+		pi_opt po;
+		po.face_dist     = opt_nv(aTHX_ o, "face_distance", 5.5);
+		po.face_plane_lo = opt_rad(aTHX_ o, "face_plane_min", 0.0);
+		po.face_plane_hi = opt_rad(aTHX_ o, "face_plane_max", 35.0);
+		po.face_norm_lo  = opt_rad(aTHX_ o, "face_normal_min", 0.0);
+		po.face_norm_hi  = opt_rad(aTHX_ o, "face_normal_max", 33.0);
+		po.edge_dist     = opt_nv(aTHX_ o, "edge_distance", 6.5);
+		po.edge_plane_lo = opt_rad(aTHX_ o, "edge_plane_min", 50.0);
+		po.edge_plane_hi = opt_rad(aTHX_ o, "edge_plane_max", 90.0);
+		po.edge_norm_lo  = opt_rad(aTHX_ o, "edge_normal_min", 0.0);
+		po.edge_norm_hi  = opt_rad(aTHX_ o, "edge_normal_max", 30.0);
+		po.edge_radius   = opt_nv(aTHX_ o, "edge_radius", 1.5);
+		pi = pi_stacking(aTHX_ &s, &po);
+		sv_2mortal((SV *)pi);
+	}
+
+	//the result hash is built last, so that nothing between here and the return
+	//can croak with it half-filled and unreferenced
+	out = newHV();
+	(void)hv_stores(out, "n_atoms",      newSVuv(s.n_atom));
+	(void)hv_stores(out, "n_residues",   newSVuv(s.n_res));
+	(void)hv_stores(out, "n_chains",     newSVuv(s.n_chain));
+	(void)hv_stores(out, "n_no_element", newSVuv(s.n_no_element));
+	(void)hv_stores(out, "mass",         newSVnv(mass_total));
+	if (s.n_atom) {
+		AV *ctr = newAV();
+		av_push(ctr, newSVnv(cx)); av_push(ctr, newSVnv(cy)); av_push(ctr, newSVnv(cz));
+		(void)hv_stores(out, "center", newRV_noinc((SV *)ctr));
+		(void)hv_stores(out, "rg", newSVnv(rg));
+	}
+	if (have_rg_mass) {
+		AV *com = newAV();
+		av_push(com, newSVnv(mx)); av_push(com, newSVnv(my)); av_push(com, newSVnv(mz));
+		(void)hv_stores(out, "center_of_mass", newRV_noinc((SV *)com));
+		(void)hv_stores(out, "rg_mass", newSVnv(rg_mass));
+	}
+	if (want_sasa) {
+		sasa_hv = newHV();
+		(void)hv_stores(sasa_hv, "total",  newSVnv(total));
+		(void)hv_stores(sasa_hv, "apolar", newSVnv(apolar));
+		(void)hv_stores(sasa_hv, "polar",  newSVnv(total - apolar));
+		(void)hv_stores(sasa_hv, "probe",  newSVnv(probe));
+		(void)hv_stores(sasa_hv, "points", newSVuv((UV)points));
+		(void)hv_stores(out, "sasa", newRV_noinc((SV *)sasa_hv));
+	}
+	if (want_pi) (void)hv_stores(out, "pi_stacking", newRV_inc((SV *)pi));
+	LEAVE;
+	return out;
+}
+
 MODULE = Chem::Structure::Parser		PACKAGE = Chem::Structure::Parser
 
 PROTOTYPES: DISABLE
@@ -2054,5 +3350,25 @@ is_single_ion(chain, id = &PL_sv_undef)
 		//a chain that was not given, not a chain hash passed on its own
 		if (items > 1 && !SvOK(id)) croak("is_single_ion: no chain given");
 		RETVAL = chain_is_single_ion(aTHX_ chain_arg(aTHX_ chain, id, "is_single_ion"));
+	OUTPUT:
+		RETVAL
+
+SV *
+_features(info, opts, who)
+	SV *info
+	SV *opts
+	SV *who
+	PREINIT:
+		HV *o = NULL;
+	CODE:
+		if (!SvROK(info) || SvTYPE(SvRV(info)) != SVt_PVHV)
+			croak("Chem::Structure::Parser: structure must be a hash reference");
+		if (SvOK(opts)) {
+			if (!SvROK(opts) || SvTYPE(SvRV(opts)) != SVt_PVHV)
+				croak("Chem::Structure::Parser: options must be a hash reference");
+			o = (HV *)SvRV(opts);
+		}
+		RETVAL = newRV_noinc((SV *)features_do(aTHX_ (HV *)SvRV(info), o,
+		                                       SvOK(who) ? SvPV_nolen(who) : "structure_features"));
 	OUTPUT:
 		RETVAL
