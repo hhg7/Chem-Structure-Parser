@@ -410,6 +410,94 @@ for my $pair ([ 'stack.pdb', 'stack.cif' ], [ 'bases.pdb', 'bases.cif' ],
 	lives_ok { structure_features($i, points => 1) } 'one sphere point is allowed';
 	throws_ok { structure_pi_stacking($i, face_plane_max => 'flat') } qr/face_plane_max must be a number/,
 		'and an angle that is not a number';
+	for my $bond (qw(peptide_bond phosphodiester_bond)) {
+		throws_ok { structure_features($i, $bond => 0) }
+			qr/\Q$bond\E must be a positive number/,
+			"a $bond of zero would link nothing and is refused";
+		throws_ok { structure_features($i, $bond => -1.5) }
+			qr/\Q$bond\E must be a positive number/, "and so is a negative $bond";
+		throws_ok { structure_features($i, $bond => 'short') }
+			qr/\Q$bond\E must be a positive number/, "and so is a word";
+	}
+	throws_ok { structure_sasa($i, phosphodiester_bond => 2.4) }
+		qr/unknown option 'phosphodiester_bond'/,
+		'a bond length means nothing to structure_sasa';
+	throws_ok { structure_features($i, base_pair_hbond => 0) }
+		qr/base_pair_hbond must be a positive number/,
+		'a hydrogen bond of zero length is refused';
+	throws_ok { structure_features($i, base_pair_hbond => -1) }
+		qr/base_pair_hbond must be a positive number/, 'and so is a negative one';
+	throws_ok { structure_features($i, base_pair_hbond => 'close') }
+		qr/base_pair_hbond must be a positive number/, 'and so is a word';
+	throws_ok { structure_features($i, base_pair_stagger => -0.5) }
+		qr/base_pair_stagger must be a number/,
+		'a negative stagger is refused, being a distance';
+	throws_ok { structure_features($i, base_pair_stagger => 'flat') }
+		qr/base_pair_stagger must be a number/, 'and so is a word';
+	lives_ok { structure_features($i, base_pair_stagger => 0) }
+		'but zero is allowed: it means the two bases must be exactly coplanar';
+	throws_ok { structure_base_pairs($i, probe => 1.4) } qr/unknown option 'probe'/,
+		'a probe radius means nothing to structure_base_pairs';
+	throws_ok { structure_sasa($i, base_pair_hbond => 3.5) }
+		qr/unknown option 'base_pair_hbond'/,
+		'and a base pair threshold nothing to structure_sasa';
+}
+
+# ---- the two base pair thresholds are the whole of the rule ---------------
+#
+# wobble.pdb is twelve nucleotides of 1MSY whose own annotation records six
+# pairs, five of them Watson-Crick or wobble.  Widening the hydrogen bond has
+# to reach the sixth and no further, and tightening the stagger has to lose the
+# stacked contacts first and the pairs only when nothing is left.
+{
+	my $i = structure_info("$data/wobble.pdb");
+	my @by_hbond = map { scalar @{ structure_base_pairs($i, base_pair_hbond => $_) } }
+	               (2.5, 3.0, 3.5, 5.3);
+	is_deeply(\@by_hbond, [ 0, 4, 5, 6 ],
+		'the pairs found rise with the hydrogen bond cutoff and stop at six');
+	my @by_stagger = map { scalar @{ structure_base_pairs($i, base_pair_stagger => $_) } }
+	                 (0, 0.3, 0.5, 1.0, 2.6, 10);
+	is_deeply(\@by_stagger, [ 0, 2, 4, 5, 5, 6 ],
+		'and with the stagger, up to the five that are really there');
+	# the sixth at ten angstrom is G2671 stacked on U2672: its two hydrogen
+	# bonds are 3.33 and 3.47 A, inside the cutoff, and it is 3.40 A out of
+	# plane, which is a helical rise and is the whole reason the stagger is
+	# tested at all
+	structure_features($i);
+}
+
+# ---- the phosphodiester cutoff is the whole of the linkage rule ----------
+#
+# alpha, epsilon and zeta each span two residues, so shrinking the cutoff below
+# a real O3'-to-P bond has to leave a chain with none of them and the
+# intra-residue torsions untouched.  The six bonds in duplex.pdb measure 1.5918
+# to 1.6037 A, so 1.5 A links nothing and 1.7 A links all six.
+{
+	my $i = structure_info("$data/duplex.pdb");
+	my @span = qw(alpha epsilon zeta);
+	my @own  = qw(beta gamma delta chi);
+	for my $case ([ 1.5, 0 ], [ 1.7, 1 ]) {
+		my ($cut, $want) = @$case;
+		structure_features($i, phosphodiester_bond => $cut);
+		my ($spanning, $inside) = (0, 0);
+		for my $cid (@{ $i->{chain_order} }) {
+			my $c = $i->{chains}{$cid};
+			for my $rk (@{ $c->{residue_order} }) {
+				my $r = $c->{residues}{$rk};
+				$spanning += grep { defined $r->{$_} } @span;
+				$inside   += grep { defined $r->{$_} } @own;
+			}
+		}
+		# eight residues could carry three each, but the two strands have four
+		# ends between them: A 3 has no alpha and A 6 no epsilon and no zeta,
+		# and the same on B, so six of the twenty-four never exist at all
+		is($spanning, $want ? 18 : 0,
+			"phosphodiester_bond => $cut: " . ($want ? 'every' : 'no')
+			. ' torsion that spans two residues');
+		is($inside, 32, "... and all thirty-two that do not, either way");
+	}
+	# and back to the default, so nothing after this sees the 1.7 A answer
+	structure_features($i);
 }
 
 for my $who (qw(structure_features structure_sasa structure_pi_stacking

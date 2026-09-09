@@ -6,8 +6,9 @@
 #     structure.info.pl --tsv   *.cif                 # one row per structure
 #     structure.info.pl --ligands *.pdb *.cif         # what is bound to what
 #     structure.info.pl --dump 1a22.ent.pdb           # the whole hash of hashes
-#     structure.info.pl --features *.pdb              # surface, size, hydropathy
+#     structure.info.pl --features *.pdb              # surface, size, composition
 #     structure.info.pl --stacks 1a22.ent.pdb         # stacked aromatic rings
+#     structure.info.pl --pairs 1bna.pdb              # Watson-Crick base pairs
 #
 # PDB and mmCIF are read the same way and print the same thing, so a mixed
 # directory needs no sorting out first.
@@ -18,9 +19,9 @@ use Getopt::Long;
 use Chem::Structure::Parser;
 
 my %opt = (fasta => 0, tsv => 0, ligands => 0, dump => 0, seqres => 0,
-           features => 0, stacks => 0, ss => 0, chain => undef);
+           features => 0, stacks => 0, ss => 0, pairs => 0, chain => undef);
 GetOptions(\%opt, 'fasta', 'tsv', 'ligands', 'dump', 'seqres', 'features', 'stacks',
-           'ss', 'chain=s', 'help')
+           'ss', 'pairs', 'chain=s', 'help')
 	or die "see --help\n";
 
 if ($opt{help} || !@ARGV) {
@@ -32,9 +33,11 @@ usage: structure.info.pl [options] file.pdb|file.cif ...
     --tsv        one tab separated row per structure
     --ligands    one row per bound heterogen
     --dump       the whole hash of hashes, via Data::Dumper
-    --features   one row per structure: surface, size, mass, hydropathy
+    --features   one row per structure: surface, size, mass, and the numbers
+                 the sequence answers -- hydropathy or G+C, as it has
     --stacks     one row per stacked pair of aromatic rings
     --ss         one row per disulfide, with what the file declares beside it
+    --pairs      one row per Watson-Crick or wobble base pair
     --chain ID   only this chain
 
 With no option, prints a readable summary of each file.
@@ -64,8 +67,9 @@ for my $file (@ARGV) {
 		my $f = $info->{features};
 		unless ($header_printed++) {
 			print join("\t", qw(id file n_atoms mass rg rg_mass sasa apolar polar
-			                    hydropathy aromatic_fraction n_pi_stacking
-			                    n_disulfides)), "\n";
+			                    hydropathy aromatic_fraction gc_fraction
+			                    purine_fraction n_pi_stacking n_disulfides
+			                    n_base_pairs)), "\n";
 		}
 		print join("\t",
 			$info->{id} // '',
@@ -79,8 +83,13 @@ for my $file (@ARGV) {
 			sprintf('%.1f', $f->{sasa}{polar}),
 			(defined $f->{hydropathy}        ? sprintf('%.4f', $f->{hydropathy})        : ''),
 			(defined $f->{aromatic_fraction} ? sprintf('%.4f', $f->{aromatic_fraction}) : ''),
+			# empty rather than zero for a structure with no nucleic acid in it,
+			# the way hydropathy is empty for one with no protein
+			(defined $f->{gc_fraction}     ? sprintf('%.4f', $f->{gc_fraction})     : ''),
+			(defined $f->{purine_fraction} ? sprintf('%.4f', $f->{purine_fraction}) : ''),
 			scalar @{ $f->{pi_stacking} },
 			scalar @{ $f->{disulfides} },
+			scalar @{ $f->{base_pairs} },
 		), "\n";
 		next;
 	}
@@ -101,6 +110,21 @@ for my $file (@ARGV) {
 			printf "%s\t%s\t%s\t%s\n", $info->{id} // '', $k,
 				(defined $found{$k} ? sprintf('%.3f', $found{$k}) : 'not found'),
 				(defined $said{$k}  ? $said{$k}                   : 'not declared');
+		}
+		next;
+	}
+
+	if ($opt{pairs}) {
+		for my $b (@{ structure_base_pairs($info) }) {
+			next if defined $opt{chain}
+			        && $b->{chain1} ne $opt{chain} && $b->{chain2} ne $opt{chain};
+			printf "%s\t%s\t%d\t%s %s%s\t%s %s%s\t%s\t%.2f\t%.1f\t%.2f\n",
+				$info->{id} // '', $b->{type}, $b->{saenger},
+				$b->{chain1}, $b->{resname1}, $b->{residue1},
+				$b->{chain2}, $b->{resname2}, $b->{residue2},
+				join(' ', map { sprintf '%s-%s %.2f', $_->{atom1}, $_->{atom2},
+				                        $_->{distance} } @{ $b->{hbonds} }),
+				$b->{distance}, $b->{plane_angle}, $b->{stagger};
 		}
 		next;
 	}

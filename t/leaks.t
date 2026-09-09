@@ -173,6 +173,33 @@ no_leaks_ok { structure_info("$data/ss.pdb") }
 }
 no_leaks_ok { structure_info("$data/fold.cif") }
 	'nor the same structure read as mmCIF';
+{
+	# the nucleic fixtures are where the torsion block writes a five-element
+	# array and three strings onto every residue, all of which a second call
+	# has to replace rather than add to
+	my $rna = structure_info("$data/rna.pdb");
+	no_leaks_ok { structure_features($rna) } 'an RNA structure does not leak';
+	no_leaks_ok { structure_features($rna) for 1 .. 3 }
+		'nor does replacing the nu list and the pucker names three times over';
+	no_leaks_ok { structure_features($rna, phosphodiester_bond => 1.2) }
+		'nor a torsion set built to a rule that links nothing';
+	no_leaks_ok { structure_info("$data/duplex.cif") }
+		'nor a B-DNA duplex read as mmCIF';
+
+	# and the base pairs, which build a list of hashes per pair and hang a
+	# second list off each of the two residues
+	my $wob = structure_info("$data/wobble.pdb");
+	no_leaks_ok { structure_base_pairs($wob) } 'structure_base_pairs does not leak';
+	no_leaks_ok { structure_base_pairs($wob) for 1 .. 3 }
+		'nor does replacing every residue\'s base_pair list three times over';
+	no_leaks_ok { structure_base_pairs($wob, base_pair_stagger => 0) }
+		'nor a rule that pairs nothing, which has to clear them instead';
+	no_leaks_ok { structure_base_pairs($wob, base_pair_hbond => 5.3, store => 0) }
+		'nor a wider one asked without storing';
+	no_leaks_ok { structure_features($wob, base_pairs => 0) } 'or without them at all';
+	no_leaks_ok { structure_info("$data/wobble.cif") }
+		'nor the same duplex read as mmCIF';
+}
 
 #--------
 # no cycles: the whole structure must go away when the caller drops it

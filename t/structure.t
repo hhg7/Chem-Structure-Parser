@@ -324,8 +324,9 @@ is(scalar @{ $info->{stats}{center} }, 3, 'and a centre');
 }
 
 #--------
-# pdb_info() is structure_info() with the format settled
+# naming the format, rather than letting it be detected
 #--------
-is_deeply(pdb_info("$data/mini.pdb"), $info, 'pdb_info: the same answer as structure_info');
+is_deeply(structure_info("$data/mini.pdb", format => 'pdb'), $info,
+	"format => 'pdb': the same answer as letting structure_info() detect it");
 
 done_testing();

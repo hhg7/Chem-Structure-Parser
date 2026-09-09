@@ -12,11 +12,11 @@ use Scalar::Util 'reftype';
 XSLoader::load('Chem::Structure::Parser', $VERSION);
 
 our @EXPORT_OK = qw(
-	structure_info structure_info_string pdb_info cif_info
+	structure_info structure_info_string
 	structure_atoms structure_residues structure_ligands structure_sequences
 	chain_sequence structure_summary is_single_ion
 	structure_features structure_sasa structure_pi_stacking structure_disulfides
-	structure_contacts structure_hbonds
+	structure_base_pairs structure_contacts structure_hbonds
 	aa3to1 aa1to3 res1 res_type formats h
 );
 our @EXPORT = @EXPORT_OK;
@@ -130,20 +130,6 @@ sub structure_info {
 		          ? "$NOT_YET{$fmt} is not implemented yet; formats read today: " . join(', ', sort keys %READER)
 		          : "unrecognized format '$fmt'; formats read today: " . join(', ', sort keys %READER));
 	return $reader->($file, $o);
-}
-
-# pdb_info($file, %opt) -- structure_info() with the format settled in advance.
-sub pdb_info {
-	my ($file, %opt) = @_;
-	return structure_info($file, %opt, format => 'pdb');
-}
-
-# cif_info($file, %opt) -- the same for mmCIF/PDBx.  Both of these exist for a
-# caller who already knows what they have; structure_info() works it out and
-# returns the same thing either way, so neither is the usual way in.
-sub cif_info {
-	my ($file, %opt) = @_;
-	return structure_info($file, %opt, format => 'mmcif');
 }
 
 # structure_info_string($text, %opt) -- the same, from a string already in hand.
@@ -306,15 +292,16 @@ sub structure_summary {
 #
 # Everything a structure is asked about after it has been read: how much of it
 # the solvent can touch, how big and how heavy it is, which of its aromatic
-# rings are stacked, and the two numbers a sequence alone answers -- its mean
-# hydropathy and how much of it is aromatic.
+# rings are stacked, and the numbers a sequence alone answers -- a protein's
+# mean hydropathy and aromatic fraction, a nucleic acid's G+C and purine
+# fractions.
 #
-# The first four are one XS call, because all four have to touch every atom and
-# the walk that flattens a hash of chains of residues of atoms into coordinate
-# arrays is the expensive part; asking for all of them costs one walk.  The
-# last two are here rather than there because they read a sequence string the
-# chain already carries, which is a few hundred characters and no per-atom work
-# at all.
+# The first three are one XS call, because all three have to touch every atom
+# and the walk that flattens a hash of chains of residues of atoms into
+# coordinate arrays is the expensive part; asking for all of them costs one
+# walk.  The sequence numbers are here rather than there because they read a
+# sequence string the chain already carries, which is a few hundred characters
+# and no per-atom work at all.
 #
 # Every number is checked against the implementation it came from, not against
 # this one.  t/features.t compares with mdtraj 1.11 and Biopython 1.87 -- live
@@ -346,6 +333,26 @@ my %KD = (
 # because there the question is about the ring rather than about the index.
 my %AROMATIC = map { $_ => 1 } qw(F W Y);
 
+# The bases that count towards a nucleic acid chain's composition, and the two
+# of them that are the G+C half of it.  Which letters count is
+# Bio.SeqUtils.gc_fraction() of Biopython 1.87 with its default
+# ambiguous => 'remove', which is what these fractions are compared against: it
+# divides the C and G by the C, G, A, T and U, so an ambiguous or unknown base
+# is in neither half rather than counted as something it is not.  That is the
+# same rule %KD applies to the amino acids it has no index for, for the same
+# reason.
+#
+# It leaves out I as well -- an inosine is a real base and not an ambiguity, but
+# it is not one of the five Biopython counts, and answering a different question
+# than the function this is checked against would be the worse trade.
+# base_counts is every letter, including those, so a caller can see what the
+# fractions left out.
+my %BASE   = map { $_ => 1 } qw(A C G T U);
+my %GC     = map { $_ => 1 } qw(C G);
+# adenine and guanine, the two-ring bases.  No Biopython function answers this
+# one; it is the same five-letter denominator with a different numerator.
+my %PURINE = map { $_ => 1 } qw(A G);
+
 # The options the three feature functions take, with what they mean and what
 # they default to.  This table is the one place the defaults are written down:
 # the XS carries the same numbers as a fallback, and never sees it, because
@@ -359,6 +366,7 @@ my %FEATURE_DEFAULT = (
 	sasa        => 1,     # compute the solvent-accessible surface
 	pi_stacking => 1,     # look for stacked aromatic rings
 	disulfides  => 1,     # look for SG-SG pairs close enough to be bonded
+	base_pairs  => 1,     # look for Watson-Crick and wobble base pairs
 	interface   => 1,     # also run the surface on each chain alone, for the buried area
 	shape       => 1,     # the gyration tensor and the descriptors built from it
 	dihedrals   => 1,     # phi, psi, omega and chi1..chi5, onto each residue
@@ -391,10 +399,22 @@ my %FEATURE_DEFAULT = (
 	# that still means two residues are joined, and so the largest one across
 	# which a phi or a psi means anything
 	peptide_bond       => 1.8, # angstrom
+	# the same question for a nucleic acid, and the same answer from the other
+	# half of gemmi's are_connected(): an O3'-to-P separation under 1.5 times
+	# the 1.6 A ideal bond, which is the largest one an alpha, an epsilon or a
+	# zeta may be measured across
+	phosphodiester_bond => 2.4, # angstrom
 	# the closest two heavy atoms of two residues may be and still count as a
 	# contact; 4.5 A is the usual convention and the option is there because
 	# there is no single right answer
 	contact_distance   => 4.5, # angstrom
+	# the two halves of the base pair rule, measured in Parser.xs's header
+	# comment for base_pairs() against the wwPDB's own annotation of forty
+	# entries: no annotated pair has a longer hydrogen bond than 3.4941 A or
+	# stands further out of its partner's plane than 2.5408 A, and the nearest
+	# candidate that is not a pair is at 3.5144 A and 2.6983 A
+	base_pair_hbond    => 3.5, # angstrom: the longest hydrogen bond a pair may have
+	base_pair_stagger  => 2.6, # angstrom: the furthest out of plane it may be
 );
 
 # which of those each function takes.  A geometry threshold passed to
@@ -407,7 +427,8 @@ my @PI_OPT   = qw(
 	edge_radius
 );
 my @SS_OPT   = qw(store disulfide_distance);
-my @TORS_OPT = qw(store peptide_bond);
+my @BP_OPT   = qw(store base_pair_hbond base_pair_stagger);
+my @TORS_OPT = qw(store peptide_bond phosphodiester_bond);
 my @CONT_OPT = qw(store contact_distance);
 my @HB_OPT   = qw(peptide_bond);
 
@@ -435,8 +456,17 @@ sub _feature_options {
 		unless $o{disulfide_distance} =~ /\A[0-9]*\.?[0-9]+\z/;
 	die "$who: peptide_bond must be a positive number, not '$o{peptide_bond}'"
 		unless $o{peptide_bond} =~ /\A[0-9]*\.?[0-9]+\z/ && $o{peptide_bond} > 0;
+	die "$who: phosphodiester_bond must be a positive number, "
+	  . "not '$o{phosphodiester_bond}'"
+		unless $o{phosphodiester_bond} =~ /\A[0-9]*\.?[0-9]+\z/
+		    && $o{phosphodiester_bond} > 0;
 	die "$who: contact_distance must be a positive number, not '$o{contact_distance}'"
 		unless $o{contact_distance} =~ /\A[0-9]*\.?[0-9]+\z/ && $o{contact_distance} > 0;
+	die "$who: base_pair_hbond must be a positive number, not '$o{base_pair_hbond}'"
+		unless $o{base_pair_hbond} =~ /\A[0-9]*\.?[0-9]+\z/ && $o{base_pair_hbond} > 0;
+	die "$who: base_pair_stagger must be a number and must not be negative, "
+	  . "not '$o{base_pair_stagger}'"
+		unless $o{base_pair_stagger} =~ /\A[0-9]*\.?[0-9]+\z/;
 	return \%o;
 }
 
@@ -447,9 +477,9 @@ sub _feature_options {
 sub _all_features {
 	my ($info, $who) = @_;
 	my $o = _feature_options({}, $who,
-		[ qw(sasa pi_stacking disulfides shape dihedrals contacts exposure hbonds
-		     secondary),
-		  @SASA_OPT, @PI_OPT, @SS_OPT, @TORS_OPT, @CONT_OPT, @HB_OPT ]);
+		[ qw(sasa pi_stacking disulfides base_pairs shape dihedrals contacts
+		     exposure hbonds secondary),
+		  @SASA_OPT, @PI_OPT, @SS_OPT, @BP_OPT, @TORS_OPT, @CONT_OPT, @HB_OPT ]);
 	my $f = _features($info, $o, $who);
 	_sequence_features($info, $f, 1);
 	return $f;
@@ -466,9 +496,9 @@ sub structure_features {
 	_check_info($info, 'structure_features');
 	return $info->{features} if !%opt && $info->{features};
 	my $o = _feature_options(\%opt, 'structure_features',
-		[ qw(sasa pi_stacking disulfides shape dihedrals contacts exposure hbonds
-		     secondary),
-		  @SASA_OPT, @PI_OPT, @SS_OPT, @TORS_OPT, @CONT_OPT, @HB_OPT ]);
+		[ qw(sasa pi_stacking disulfides base_pairs shape dihedrals contacts
+		     exposure hbonds secondary),
+		  @SASA_OPT, @PI_OPT, @SS_OPT, @BP_OPT, @TORS_OPT, @CONT_OPT, @HB_OPT ]);
 	my $f = _features($info, $o, 'structure_features');
 	_sequence_features($info, $f, $o->{store});
 	return $f;
@@ -483,6 +513,7 @@ sub structure_sasa {
 	$o->{sasa}        = 1;
 	$o->{pi_stacking} = 0;
 	$o->{disulfides}  = 0;
+	$o->{base_pairs}  = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 0;
@@ -501,6 +532,7 @@ sub structure_pi_stacking {
 	$o->{sasa}        = 0;
 	$o->{pi_stacking} = 1;
 	$o->{disulfides}  = 0;
+	$o->{base_pairs}  = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 0;
@@ -520,6 +552,7 @@ sub structure_contacts {
 	$o->{sasa}        = 0;
 	$o->{pi_stacking} = 0;
 	$o->{disulfides}  = 0;
+	$o->{base_pairs}  = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 1;
@@ -535,8 +568,8 @@ sub structure_hbonds {
 	_check_info($info, 'structure_hbonds');
 	return $info->{features}{hbonds} if !%opt && $info->{features};
 	my $o = _feature_options(\%opt, 'structure_hbonds', \@HB_OPT);
-	$o->{$_} = 0 for qw(sasa pi_stacking disulfides shape dihedrals contacts
-	                    exposure secondary);
+	$o->{$_} = 0 for qw(sasa pi_stacking disulfides base_pairs shape dihedrals
+	                    contacts exposure secondary);
 	$o->{hbonds} = 1;
 	return _features($info, $o, 'structure_hbonds')->{hbonds};
 }
@@ -550,6 +583,7 @@ sub structure_disulfides {
 	$o->{sasa}        = 0;
 	$o->{pi_stacking} = 0;
 	$o->{disulfides}  = 1;
+	$o->{base_pairs}  = 0;
 	$o->{shape}       = 0;
 	$o->{dihedrals}   = 0;
 	$o->{contacts}    = 0;
@@ -557,6 +591,25 @@ sub structure_disulfides {
 	$o->{hbonds}      = 0;
 	$o->{secondary}   = 0;
 	return _features($info, $o, 'structure_disulfides')->{disulfides};
+}
+
+# structure_base_pairs($info, %opt) -- the Watson-Crick and wobble base pairs.
+sub structure_base_pairs {
+	my ($info, %opt) = @_;
+	_check_info($info, 'structure_base_pairs');
+	return $info->{features}{base_pairs} if !%opt && $info->{features};
+	my $o = _feature_options(\%opt, 'structure_base_pairs', \@BP_OPT);
+	$o->{sasa}        = 0;
+	$o->{pi_stacking} = 0;
+	$o->{disulfides}  = 0;
+	$o->{base_pairs}  = 1;
+	$o->{shape}       = 0;
+	$o->{dihedrals}   = 0;
+	$o->{contacts}    = 0;
+	$o->{exposure}    = 0;
+	$o->{hbonds}      = 0;
+	$o->{secondary}   = 0;
+	return _features($info, $o, 'structure_base_pairs')->{base_pairs};
 }
 
 # The two sequence-level numbers, per protein chain and over the structure.
@@ -569,11 +622,36 @@ sub structure_disulfides {
 sub _sequence_features {
 	my ($info, $f, $store) = @_;
 	my ($sum, $scored, $arom, $len) = (0, 0, 0, 0);
+	my ($gc, $pur, $counted, $nlen) = (0, 0, 0, 0);
+	my %bases;
 	for my $cid (@{ $info->{chain_order} }) {
 		my $c = $info->{chains}{$cid};
-		next unless ($c->{type} || '') eq 'protein';
+		my $type = $c->{type} || '';
 		my $seq = $c->{sequence};
 		next unless defined $seq && length $seq;
+		if ($type eq 'dna' || $type eq 'rna') {
+			my ($cgc, $cpur, $cn, %cb) = (0, 0, 0);
+			for my $b (split //, uc $seq) {
+				$cb{$b}++;
+				next unless $BASE{$b};
+				$cgc++  if $GC{$b};
+				$cpur++ if $PURINE{$b};
+				$cn++;
+			}
+			$gc      += $cgc;
+			$pur     += $cpur;
+			$counted += $cn;
+			$nlen    += length $seq;
+			$bases{$_} += $cb{$_} for keys %cb;
+			next unless $store;
+			$c->{base_counts} = \%cb;
+			if ($cn) {
+				$c->{gc_fraction}     = $cgc / $cn;
+				$c->{purine_fraction} = $cpur / $cn;
+			}
+			next;
+		}
+		next unless $type eq 'protein';
 		my ($csum, $cn, $ca) = (0, 0, 0);
 		for my $aa (split //, uc $seq) {
 			$ca++ if $AROMATIC{$aa};
@@ -593,6 +671,16 @@ sub _sequence_features {
 	$f->{aromatic_fraction} = $arom / $len   if $len;
 	$f->{n_aromatic}        = $arom;
 	$f->{sequence_length}   = $len;
+	# the nucleic half, and only when there is one: a structure with no nucleic
+	# acid in it gets no gc_fraction rather than a zero that would read as a
+	# chain of nothing but A and T
+	if ($nlen) {
+		$f->{gc_fraction}       = $gc / $counted  if $counted;
+		$f->{purine_fraction}   = $pur / $counted if $counted;
+		$f->{n_gc}              = $gc;
+		$f->{nucleotide_length} = $nlen;
+		$f->{base_counts}       = \%bases;
+	}
 	return $f;
 }
 
@@ -2744,22 +2832,6 @@ say -- and C<total_atoms == n_atoms + n_skipped> however the options were set.
 2wy2 above, read with the default C<< model =E<gt> 1 >>, gives C<n_atoms> 6,432 and
 C<total_atoms> 411,648.
 
-=head2 pdb_info
-
- my $info = pdb_info($file, %options);
-
-C<structure_info()> with the format settled in advance. Use it when the file is
-known to be a PDB whatever it happens to be called.
-
-Telling it wrongly reads no atoms rather than dying, which is what forcing a
-format means; C<structure_info()> looks at the file and is the usual way in.
-
-=head2 cif_info
-
- my $info = cif_info($file, %options);
-
-The same for mmCIF/PDBx.
-
 =head2 structure_info_string
 
  my $info = structure_info_string($text, %options);
@@ -2887,6 +2959,7 @@ example at the top of this document is its output.
  $f->{aromatic_fraction};  # 0.1263    the F, W and Y share of it
  @{ $f->{pi_stacking} };   # the stacked pairs of aromatic rings
  @{ $f->{disulfides} };    # the SG-SG pairs close enough to be bonded
+ @{ $f->{base_pairs} };    # the Watson-Crick and wobble base pairs
 
 (1a22 again, the structure the summary at the top of this document is of.)
 
@@ -2922,13 +2995,31 @@ already are:
  $info->{chains}{A}{residues}{54}{n_contacts};      # 13
  $info->{chains}{A}{residues}{23}{disulfide};       # [ { chain, residue, distance } ]
 
+A nucleic acid chain answers a different set of the same questions, and 1bna —
+the Drew-Dickerson dodecamer, which is where B-DNA is usually quoted from — is
+what these are of:
+
+ $info->{chains}{A}{gc_fraction};                   # 0.6667   the C and G share of the strand
+ $info->{chains}{A}{purine_fraction};               # 0.5      ... and the A and G share
+ $info->{chains}{A}{base_counts};                   # { A => 2, C => 4, G => 4, T => 2 }
+ $info->{chains}{A}{residues}{6}{alpha};            # -73.3    degrees; and beta 179.7,
+ $info->{chains}{A}{residues}{6}{delta};            # 121.1    gamma 66.0, epsilon 173.7,
+ $info->{chains}{A}{residues}{6}{zeta};             # -88.5    the six backbone torsions
+ $info->{chains}{A}{residues}{6}{chi};              # -122.2   the glycosidic torsion
+ $info->{chains}{A}{residues}{6}{glycosidic};       # 'anti'   or 'syn'
+ $info->{chains}{A}{residues}{6}{nu};               # [ -48.1, 47.5, -29.9, 2.2, 29.0 ]
+ $info->{chains}{A}{residues}{6}{pucker};           # "C1'-exo"  which shape those make it
+ $info->{chains}{A}{residues}{6}{pucker_phase};     # 126.9    degrees, 0 to 360
+ $info->{chains}{A}{residues}{6}{pucker_amplitude}; # 49.8     how far from flat
+
 C<< store =E<gt> 0 >> turns that off and leaves C<$info> exactly as it was; the totals
 still come back. Asking twice replaces what was stored rather than adding to it,
 so a second call with a different probe radius leaves the second answer behind.
 
-Three of the properties are I<only> per-residue — the torsion angles, the
-half-sphere exposure and the secondary structure — so C<< store =E<gt> 0 >> does not
-compute them at all rather than computing them and dropping them on the floor.
+Three of the properties are I<only> per-residue — the torsion angles (both
+kinds), the half-sphere exposure and the secondary structure — so C<< store =E<gt> 0 >>
+does not compute them at all rather than computing them and dropping them on the
+floor.
 C<structure_info()> always stores, so this is only reachable by calling
 C<structure_features()> yourself.
 
@@ -2991,12 +3082,32 @@ C<structure_features()> yourself.
   <td>how long the sequence those two are over is</td>
 </tr>
 <tr>
+  <td><code>gc_fraction</code></td>
+  <td>the C and G share of the nucleic acid chains' observed sequences</td>
+</tr>
+<tr>
+  <td><code>purine_fraction</code>, <code>n_gc</code></td>
+  <td>the A and G share of the same, and how many bases the first counted</td>
+</tr>
+<tr>
+  <td><code>nucleotide_length</code></td>
+  <td>how long the sequence those are over is</td>
+</tr>
+<tr>
+  <td><code>base_counts</code></td>
+  <td>every letter of it tallied, ambiguous ones included</td>
+</tr>
+<tr>
   <td><code>pi_stacking</code></td>
   <td>the arrayref <code>structure_pi_stacking()</code> returns</td>
 </tr>
 <tr>
   <td><code>disulfides</code></td>
   <td>the arrayref <code>structure_disulfides()</code> returns</td>
+</tr>
+<tr>
+  <td><code>base_pairs</code></td>
+  <td>the arrayref <code>structure_base_pairs()</code> returns</td>
 </tr>
 <tr>
   <td><code>contacts</code></td>
@@ -3020,7 +3131,8 @@ C<structure_features()> yourself.
 C<rg>, C<center> and C<center_of_mass> are absent from a structure with no atoms in
 it, and C<rg_mass> and C<center_of_mass> from one whose atoms have no mass between
 them, because there is no such number rather than because it is zero. The same
-goes for C<hydropathy> and C<aromatic_fraction> when there is no protein.
+goes for C<hydropathy> and C<aromatic_fraction> when there is no protein, and for
+C<gc_fraction> and the three keys beside it when there is no nucleic acid.
 
 The surface is of the structure as C<$info> holds it. Reading with C<< waters =E<gt> 0 >>
 and asking for the surface afterwards gives the surface of a protein with no
@@ -3060,6 +3172,11 @@ surface than its neighbours in the archive unless they are taken out.
   <td>look for SG-SG pairs close enough to be bonded</td>
 </tr>
 <tr>
+  <td><code>base_pairs</code></td>
+  <td>1</td>
+  <td>look for Watson-Crick and wobble base pairs</td>
+</tr>
+<tr>
   <td><code>interface</code></td>
   <td>1</td>
   <td>also run the surface on each chain alone, for the buried area</td>
@@ -3072,7 +3189,7 @@ surface than its neighbours in the archive unless they are taken out.
 <tr>
   <td><code>dihedrals</code></td>
   <td>1</td>
-  <td>phi, psi, omega and chi1-chi5, onto each residue</td>
+  <td>phi, psi, omega and chi1-chi5 on an amino acid, alpha to zeta, chi and the pucker on a nucleotide, onto each residue</td>
 </tr>
 <tr>
   <td><code>contacts</code></td>
@@ -3155,6 +3272,21 @@ surface than its neighbours in the archive unless they are taken out.
   <td>the largest C-to-N separation that still joins two residues, angstrom</td>
 </tr>
 <tr>
+  <td><code>phosphodiester_bond</code></td>
+  <td>2.4</td>
+  <td>the same for the O3'-to-P separation of two nucleotides</td>
+</tr>
+<tr>
+  <td><code>base_pair_hbond</code></td>
+  <td>3.5</td>
+  <td>the longest hydrogen bond a base pair may have, angstrom</td>
+</tr>
+<tr>
+  <td><code>base_pair_stagger</code></td>
+  <td>2.6</td>
+  <td>and the furthest one base may sit out of the other's plane</td>
+</tr>
+<tr>
   <td><code>contact_distance</code></td>
   <td>4.5</td>
   <td>the largest heavy-atom separation that counts as a contact, angstrom</td>
@@ -3201,8 +3333,8 @@ it off.
 
 =head3 Torsion angles
 
-C<phi>, C<psi> and C<omega> on each residue, in degrees, and C<chi> as a list of
-chi1 upwards — mdtraj's C<compute_phi>, C<compute_psi>, C<compute_omega> and
+On each amino acid residue: C<phi>, C<psi> and C<omega>, in degrees, and C<chi> as a
+list of chi1 upwards — mdtraj's C<compute_phi>, C<compute_psi>, C<compute_omega> and
 C<compute_chi1> through C<compute_chi5>.
 
 An angle that would be measured across a chain break is not reported: the two
@@ -3214,6 +3346,114 @@ reason.
 
 C<omega> near zero is a cis peptide bond, which C<< $info-E<gt>{cispep} >> is the
 depositor's own record of — two answers to one question, as with the disulfides.
+
+A nucleotide gets a different set of torsions from the same option; they are
+below.
+
+=head3 Nucleic acid torsions, and the sugar pucker
+
+The same block answers the nucleic acid question, because a residue is one kind
+or the other and both want the same walk. On every nucleotide, in degrees:
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>key</th>
+  <th>what it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>alpha</code></td>
+  <td>O3' of the residue before, then P, O5', C5'</td>
+</tr>
+<tr>
+  <td><code>beta</code></td>
+  <td>P, O5', C5', C4'</td>
+</tr>
+<tr>
+  <td><code>gamma</code></td>
+  <td>O5', C5', C4', C3'</td>
+</tr>
+<tr>
+  <td><code>delta</code></td>
+  <td>C5', C4', C3', O3'</td>
+</tr>
+<tr>
+  <td><code>epsilon</code></td>
+  <td>C4', C3', O3', then P of the residue after</td>
+</tr>
+<tr>
+  <td><code>zeta</code></td>
+  <td>C3', O3', then P and O5' of the residue after</td>
+</tr>
+<tr>
+  <td><code>chi</code></td>
+  <td>O4', C1', then N9 and C4 of a purine or N1 and C2 of a pyrimidine</td>
+</tr>
+<tr>
+  <td><code>nu</code></td>
+  <td>the five torsions of the sugar ring itself, nu0 to nu4</td>
+</tr>
+<tr>
+  <td><code>pucker_phase</code></td>
+  <td>the pseudorotation phase angle, 0 to 360</td>
+</tr>
+<tr>
+  <td><code>pucker_amplitude</code></td>
+  <td>how far the ring is from flat</td>
+</tr>
+<tr>
+  <td><code>pucker</code></td>
+  <td>which of the ten envelope shapes that phase names</td>
+</tr>
+<tr>
+  <td><code>glycosidic</code></td>
+  <td><code>anti</code> or <code>syn</code></td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+The names and the atoms are the IUPAC-IUB Joint Commission on Biochemical
+Nomenclature's (1983) I<Abbreviations and symbols for the description of
+conformations of polynucleotide chains>. C<chi> is the same key an amino acid's
+side chain torsions come back under and no residue has both — an amino acid has
+no C1' and a nucleotide has no CB — but an amino acid's is a list of up to five
+and a nucleotide's is one number.
+
+C<alpha>, C<epsilon> and C<zeta> each span two residues and are not reported across
+a chain break, the way C<phi> and C<psi> are not: the two nucleotides must be
+joined by a phosphodiester bond first, which is gemmi's test — an O3'-to-P
+separation under 1.5 times the 1.6 Å ideal bond.
+
+The pucker is Altona and Sundaralingam (1972) I<J Am Chem Soc> 94(23):8205-12,
+which describes the ring with two numbers instead of five on the observation
+that the five C<nu> are one sinusoid sampled at five points. It is the number
+that tells the two helices apart, and it does so out loud: every ribose of
+C<t/data/rna.pdb>, six nucleotides of a real rRNA hairpin, is C3'-endo, and every
+deoxyribose of C<t/data/duplex.pdb>, four base pairs of the Drew-Dickerson
+dodecamer, is in the southern half of the cycle where C2'-endo is.
+
+ C3'-endo    0-36     C4'-exo    36-72    O4'-endo   72-108
+ C1'-exo   108-144    C2'-endo  144-180   C3'-exo   180-216
+ C4'-endo  216-252    O4'-exo   252-288   C1'-endo  288-324
+ C2'-exo   324-360
+
+C<glycosidic> bisects C<chi> at 90° either side of zero, which is Saenger's
+division and what DSSR reports. It has two names and no third, so the band
+around -90° that the literature calls high-anti comes back as C<syn>; C<chi>
+itself is beside it for a caller who wants to say so.
+
+Which bases are paired is a separate question and a separate answer;
+C<structure_base_pairs> below has it.
 
 =head3 Half-sphere exposure
 
@@ -3529,6 +3769,165 @@ one that does not is 1A4K, a Fab that is in the file twice, whose SSBOND records
 cover one copy and whose coordinates show both. A disagreement is a fact about
 the entry, not about either answer.
 
+=head2 structure_base_pairs
+
+ for my $p (@{ structure_base_pairs($info) }) {
+     printf "%s%s %s - %s%s %s  %s, Saenger %d\n",
+         $p->{chain1}, $p->{residue1}, $p->{resname1},
+         $p->{chain2}, $p->{residue2}, $p->{resname2},
+         $p->{type}, $p->{saenger};
+ }
+ # A2648 G - A2672 U  G-U, Saenger 28
+ # A2649 C - A2671 G  C-G, Saenger 19
+ # A2650 U - A2670 A  U-A, Saenger 20
+ # A2651 C - A2669 G  C-G, Saenger 19
+ # A2652 C - A2668 G  C-G, Saenger 19
+
+ $info->{chains}{A}{residues}{2648}{base_pair};
+ # [ { chain => 'A', residue => '2672', resname => 'U',
+ #     type => 'G-U', saenger => 28 } ]
+
+(C<t/data/wobble.pdb>, twelve nucleotides of 1MSY.)
+
+The base pairs the coordinates show. Like the disulfides, this is geometry and
+not something the file declares, and each pair is written onto both of its
+residues as well as returned.
+
+Only the canonical pairing, which is three geometries:
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th><code>saenger</code></th>
+  <th><code>type</code></th>
+  <th>hydrogen bonds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>19</td>
+  <td>G-C</td>
+  <td>O6···N4, N1···N3, N2···O2</td>
+</tr>
+<tr>
+  <td>20</td>
+  <td>A-U, A-T</td>
+  <td>N6···O4, N1···N3</td>
+</tr>
+<tr>
+  <td>28</td>
+  <td>G-U, G-T — the wobble</td>
+  <td>O6···N3, N1···O2</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+C<type> names the two bases in the order the record reports them, so a C<C-G> and
+a C<G-C> are the same pair read from the two ends; C<saenger> does not depend on
+the order. The numbers are Saenger's, from the table of twenty-eight pair types
+in I<Principles of Nucleic Acid Structure> chapter 6, and are the same numbers
+the archive uses in C<_ndb_struct_na_base_pair.hbond_type_28>.
+
+Each pair also carries the geometry it was found by:
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>key</th>
+  <th>what it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>hbonds</code></td>
+  <td>one <code>{ atom1, atom2, distance }</code> per bond above, in the order the table gives them</td>
+</tr>
+<tr>
+  <td><code>distance</code></td>
+  <td>between the two bases' six-membered ring centroids, angstrom</td>
+</tr>
+<tr>
+  <td><code>plane_angle</code></td>
+  <td>between the two ring planes, 0 to 90 degrees</td>
+</tr>
+<tr>
+  <td><code>stagger</code></td>
+  <td>how far one base sits out of the other's plane, angstrom</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+Two bases are a pair when every one of that type's hydrogen bonds is at most
+C<base_pair_hbond> long and the stagger is at most C<base_pair_stagger>. The
+stagger is what tells a pair from the base stacked above or below it, which
+brings the same atoms within reach but sits a helical rise away rather than
+beside it.
+
+=head3 Where the thresholds come from
+
+There is no reader on hand with an opinion about which bases are paired — not
+mdtraj, not gemmi, not Biopython — so the rule is measured against the
+annotation the wwPDB deposits with the entry itself, which is 3DNA's. Forty
+archive entries carrying an C<_ndb_struct_na_base_pair> loop hold 1372 pairs of
+Saenger type 19, 20 or 28 between them, and 1354 of those are between two
+unmodified bases. The defaults find all 1354 and miss none:
+
+=over
+
+=item * the longest hydrogen bond in one of them is 3.4941 Å and the shortest one in
+a candidate the annotation does not call a pair is 3.5144 Å, so 3.5 Å — which
+is also the conventional heavy-atom hydrogen bond distance — falls between;
+
+=item * the largest stagger in one of them is 2.5408 Å and the smallest in a rejected
+candidate 2.6983 Å, with the stacked contacts proper beginning near 3.0 Å.
+
+=back
+
+The eighteen pairs it does not see are not geometry. Eleven have a modified base
+on one side — C<5MC>, C<2MG>, C<BRU>, C<DDG> — which has no single-letter code to
+match the table with. The other seven are in entries whose asymmetric unit holds
+one strand of a self-complementary duplex and whose second strand is a
+crystallographic symmetry mate: this reads the coordinates as deposited, where
+the two are thirty and forty angstrom apart.
+
+Two pairs are found that the annotation does not list, and both are worth
+reading. 1JJ2's C2542–G2617 is a G-C with all three bonds under 2.94 Å and half
+an angstrom of stagger that appears nowhere in that entry's 1121 annotated rows.
+3SWP's DT4–DA24 is in a 4.11 Å structure whose annotation pairs its DT4 with
+DA25 instead and cannot put a Saenger number on that pair either.
+
+Every base in those forty entries came out of the rule with at most one partner.
+That is what the geometry did rather than something imposed, so a residue's
+C<base_pair> is a list all the same: nothing in the rule forbids a second, and
+a second would say something about the entry worth not hiding.
+
+=head3 What is not here
+
+A base pair that is none of those three. There are twenty-eight in Saenger's
+table and rather more in the Leontis–Westhof classification, and telling them
+apart is a different kind of work: the canonical three are defined by which
+atoms hydrogen-bond to which, and the rest need the base reference frames and
+the six pair parameters that C<_ndb_struct_na_base_pair> carries. What comes back
+here is the double helix, not the whole of RNA structure. C<t/data/wobble.pdb>
+holds one of the others — the U2647·G2673 pair 1MSY's annotation records and
+cannot classify — and this leaves it alone, which is the test that it does.
+
 =head2 aa3to1
 
  aa3to1('ALA');    # 'A'
@@ -3660,9 +4059,9 @@ C<t/data/pdb1gdr.ent> is one such file, a 1993 entry, and C<t/foreign.t> reads i
 None of the arithmetic in C<structure_features()> is this module's own. Each
 piece is a translation of a published method as somebody else implemented it,
 and the tests compare against those implementations rather than against what
-this module currently does — C<t/features.t> reads what mdtraj answered for every
-structure in C<t/data>, frozen into C<t/data/features.txt>, and re-runs mdtraj
-where mdtraj is installed so the frozen answer cannot go stale.
+this module currently does — C<t/features.t> reads what mdtraj and gemmi answered
+for every structure in C<t/data>, frozen into C<t/data/features.txt>, and re-runs
+them where they are installed so the frozen answer cannot go stale.
 
 
 
@@ -3691,6 +4090,26 @@ where mdtraj is installed so the frozen answer cannot go stale.
   <td>torsion angles</td>
   <td></td>
   <td><code>mdtraj.compute_phi</code>, <code>compute_psi</code>, <code>compute_omega</code>, <code>compute_chi1</code>-<code>chi5</code></td>
+</tr>
+<tr>
+  <td>nucleic acid torsions</td>
+  <td>IUPAC-IUB Joint Commission on Biochemical Nomenclature (1983) <i>Eur J Biochem</i> 131:9-15</td>
+  <td><code>mdtraj.compute_dihedrals</code> and gemmi's <code>calculate_dihedral</code>, over the four atoms each definition names</td>
+</tr>
+<tr>
+  <td>sugar pucker</td>
+  <td>Altona, C; Sundaralingam, M (1972) <i>J Am Chem Soc</i> 94(23):8205-12, equations 1 and 2; the envelope names as tabulated there and in Saenger, W (1984) <i>Principles of Nucleic Acid Structure</i>, ch. 2</td>
+  <td></td>
+</tr>
+<tr>
+  <td>the phosphodiester cutoff</td>
+  <td></td>
+  <td>gemmi's <code>are_connected()</code> in <code>gemmi/polyheur.hpp</code></td>
+</tr>
+<tr>
+  <td>base pairs</td>
+  <td>Watson, J D; Crick, F H C (1953) <i>Nature</i> 171(4356):737-8; the pair types as numbered in Saenger, W (1984) <i>Principles of Nucleic Acid Structure</i>, ch. 6</td>
+  <td>no implementation on hand: measured against the wwPDB's own <code>_ndb_struct_na_base_pair</code> annotation, which is 3DNA's, over forty entries</td>
 </tr>
 <tr>
   <td>residue contacts</td>
@@ -3757,6 +4176,11 @@ where mdtraj is installed so the frozen answer cannot go stale.
   <td>Lobry, J R; Gautier, C (1994) <i>Nucleic Acids Res</i> 22(15):3174-3180</td>
   <td>Biopython's <code>ProteinAnalysis.aromaticity()</code></td>
 </tr>
+<tr>
+  <td>G+C content</td>
+  <td></td>
+  <td>Biopython's <code>Bio.SeqUtils.gc_fraction()</code>, with its default <code>ambiguous =&gt; 'remove'</code></td>
+</tr>
 </tbody>
 </table>
 
@@ -3777,7 +4201,7 @@ Three of these are deliberately not what the reference does, and each is argued
 where it is written down. mdtraj computes a torsion angle, and places a Kabsch–
 Sander amide hydrogen, between whichever residues are next to each other in the
 file — across a chain break, where the chemistry never joined them; here the two
-must be peptide-bonded first. mdtraj's C<Topology.create_disulfide_bonds()>
+must be peptide-bonded, or phosphodiester-bonded, first. mdtraj's C<Topology.create_disulfide_bonds()>
 compares angstrom coordinates against a nanometre cutoff and so finds no
 disulfide in any file; the rule it documents is the one implemented here. And
 the face-to-face pi-stacking distance, above.

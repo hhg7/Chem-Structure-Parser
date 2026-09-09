@@ -14,10 +14,22 @@
 #     comparison runs on a machine with no python, and re-runs features.py where
 #     mdtraj is importable so the frozen answer cannot go stale.
 #   Biopython 1.87 -- Bio.SeqUtils.ProtParam.ProteinAnalysis.gravy() and
-#     .aromaticity(), and the Kyte-Doolittle scale of
-#     Bio.SeqUtils.ProtParamData.kd.  Those two take a sequence rather than a
-#     structure, so their answers are written out below as fixtures the way
-#     t/foreign.t writes its cases down, with the sequence each came from.
+#     .aromaticity(), the Kyte-Doolittle scale of Bio.SeqUtils.ProtParamData.kd,
+#     and Bio.SeqUtils.gc_fraction() for the nucleic acid half.  Those take a
+#     sequence rather than a structure, so their answers are written out below
+#     as fixtures the way t/foreign.t writes its cases down, with the sequence
+#     each came from.
+#   gemmi 0.7.5 -- calculate_dihedral(), as a second opinion on the nucleic acid
+#     torsions.  mdtraj has no compute_alpha() and no equivalent, so features.py
+#     names the four atoms of each torsion itself, from the IUPAC-IUB (1983)
+#     definitions, and runs them through both readers' dihedral kernels; the
+#     frozen line carries both answers and this checks against both.
+#   3DNA, at one remove -- no reader here finds base pairs, so the base pair
+#     answers are the wwPDB's own annotation of the entries the fixtures were
+#     lifted from, which is 3DNA's: the _ndb_struct_na_base_pair loop of
+#     1BNA.cif and 1MSY.cif, written out below the way t/foreign.t writes its
+#     cases down.  The geometry those pairs are found by is measured by mdtraj
+#     and gemmi in features.py and checked against both.
 #
 # Set STRUCTURE_INFO_PYTHON to a python that can import mdtraj and numpy to run
 # the live half as well; /home/con/.pyenv/versions/3.14.2/bin/python3 is one.
@@ -30,7 +42,7 @@ use File::Basename 'dirname';
 use File::Spec;
 use Chem::Structure::Parser qw(
 	structure_info structure_features structure_sasa structure_pi_stacking
-	structure_disulfides
+	structure_disulfides structure_base_pairs
 );
 
 my $dir = File::Spec->catdir(dirname(__FILE__), 'data');
@@ -136,7 +148,7 @@ sub compare {
 
 	my ($n_atom, $n_res, $worst64, $worst32) = (0, 0, 0, 0);
 	my (%want_pi, %want_ss, %want_alone, %want_tors, %want_cont, %want_hse,
-	    %want_hb, %want_dssp, %seen_res);
+	    %want_hb, %want_dssp, %want_nuc, %want_pucker, %want_bp, %seen_res);
 	for my $l (@$rows) {
 		my @w = split ' ', $l;
 		if ($w[0] eq 'A') {
@@ -208,6 +220,20 @@ sub compare {
 		} elsif ($w[0] eq 'D') {
 			# value, is the link real, is the angle defined at all
 			$want_tors{"$w[1] $w[2]"} = [ @w[3 .. 5] ];
+		} elsif ($w[0] eq 'N') {
+			# mdtraj's angle, gemmi's or '-', is the link real, is it defined
+			$want_nuc{"$w[1] $w[2]"} = [ @w[3 .. 6] ];
+		} elsif ($w[0] eq 'Q') {
+			$want_pucker{$w[1]} = [ $w[2], $w[3] ];   # phase, amplitude
+		} elsif ($w[0] eq 'W') {
+			# the two letters, the Saenger type, then mdtraj's centroid
+			# distance, plane angle, stagger and hydrogen bonds, and gemmi's
+			my $n = $w[5];
+			$want_bp{"$w[1] $w[2]"} = {
+				letters => $w[3], saenger => $w[4],
+				mdtraj  => [ @w[6 .. 8 + $n] ],
+				gemmi   => ($w[9 + $n] eq '-' ? undef : [ @w[9 + $n .. 11 + 2 * $n] ]),
+			};
 		} elsif ($w[0] eq 'I') {
 			$want_alone{$w[1]} = [ @w[2 .. 5] ];   # n_atoms, f32, f64, one point
 		}
@@ -346,6 +372,192 @@ sub compare {
 		my $d = abs($got - $value);
 		$d = abs($d - 360) if $d > 180;
 		cmp_ok($d, '<', 1e-3, "$file: residue $ri $what");
+	}
+
+	# Nucleic acid torsions.  Two readers rather than one: features.py names the
+	# four atoms of each from the IUPAC-IUB definitions and runs them through
+	# mdtraj's compute_dihedrals() and gemmi's calculate_dihedral(), and both
+	# answers are on the frozen line.  The gemmi column is '-' where gemmi
+	# refuses the file or splits it into a different number of residues, which
+	# is a fact about gemmi and not a licence to skip the mdtraj half.
+	#
+	# The linked flag rides along the way it does for phi and psi, and for the
+	# same reason: an alpha, an epsilon or a zeta spans two residues, and one
+	# measured across a gap in the model is a number rather than an answer.
+	# features.py applies gemmi's own phosphodiester rule to decide, which is
+	# the rule Parser.xs applies.
+	#
+	# Tolerances.  Against mdtraj, 1e-3 degrees: the same bound the protein
+	# torsions use, for the same reason -- mdtraj's coordinates are float32
+	# nanometres and an angle is a ratio of differences of them.  The largest
+	# disagreement over t/data is 1.9e-4 degrees.
+	#
+	# Against gemmi, 1e-8, because there is nothing left to disagree about:
+	# gemmi reads the same decimal columns into the same double and does the
+	# same arithmetic on them, so what is measured here is how far the frozen
+	# file's nine decimal places round.  The largest disagreement over t/data is
+	# 5.0e-10 degrees, which is that rounding and nothing else; 1e-8 is twenty
+	# times it and is still five orders of magnitude below the mdtraj bound, so
+	# a real difference in the atoms picked would not fit through it.
+	for my $k (sort keys %want_nuc) {
+		my ($ri, $what) = split ' ', $k;
+		my ($value, $gemmi, $real, $defined) = @{ $want_nuc{$k} };
+		my $r = $res->[$ri] or next;
+		my $got = $what =~ /\Anu([0-4])\z/
+		        ? ($r->{nu} ? $r->{nu}[$1] : undef)
+		        : $r->{$what};
+		if (!$real) {
+			ok(!defined $got, "$file: residue $ri has no $what, "
+			 . 'because the residues it would span are not bonded');
+			next;
+		}
+		if (!$defined) {
+			ok(!defined $got,
+				"$file: residue $ri has no $what, because its four atoms are collinear");
+			next;
+		}
+		unless (defined $got) {
+			fail("$file: residue $ri has no $what and mdtraj measured one");
+			next;
+		}
+		for my $want ([ $value, 1e-3, 'mdtraj' ],
+		              ($gemmi eq '-' ? () : [ $gemmi, 1e-8, 'gemmi' ])) {
+			# an angle wraps, so 180 and -180 are the same place
+			my $d = abs($got - $want->[0]);
+			$d = abs($d - 360) if $d > 180;
+			cmp_ok($d, '<', $want->[1], "$file: residue $ri $what, against $want->[2]");
+		}
+	}
+
+	# The sugar pucker, from those torsions through Altona and Sundaralingam's
+	# equations.  features.py works it out from mdtraj's five nu in degrees and
+	# Parser.xs from its own five in radians, so this is the two transcriptions
+	# of one published formula agreeing, on top of the torsions agreeing above.
+	# The phase inherits the torsions' 1e-3; the amplitude is nu2 divided by a
+	# cosine of it, so it inherits it too.  The largest disagreement over t/data
+	# is 1.4e-4 degrees on the phase and 1.1e-4 on the amplitude.
+	for my $ri (sort { $a <=> $b } keys %want_pucker) {
+		my ($phase, $amp) = @{ $want_pucker{$ri} };
+		my $r = $res->[$ri] or next;
+		unless (defined $r->{pucker_phase}) {
+			fail("$file: residue $ri has no pucker and mdtraj's torsions give one");
+			next;
+		}
+		my $d = abs($r->{pucker_phase} - $phase);
+		$d = abs($d - 360) if $d > 180;      # the cycle wraps at 0 as an angle does
+		cmp_ok($d, '<', 1e-3, "$file: residue $ri pseudorotation phase");
+		cmp_ok(abs($r->{pucker_amplitude} - $amp), '<', 1e-3,
+			"$file: residue $ri pucker amplitude");
+		# the name is the phase binned in tens, so it follows from the number --
+		# what is checked is that the bin edges are where they are said to be
+		my @name = ("C3'-endo", "C4'-exo", "O4'-endo", "C1'-exo", "C2'-endo",
+		            "C3'-exo", "C4'-endo", "O4'-exo", "C1'-endo", "C2'-exo");
+		is($r->{pucker}, $name[ int($phase / 36) ],
+			"$file: residue $ri pucker name for a phase of " . sprintf('%.1f', $phase));
+		# and that the glycosidic label bisects chi where it is said to
+		is($r->{glycosidic}, abs($r->{chi}) <= 90 ? 'syn' : 'anti',
+			"$file: residue $ri glycosidic conformation")
+			if defined $r->{chi};
+	}
+
+	# A residue mdtraj found no nucleic torsion for must have none here either,
+	# so that a fixture with no nucleotide in it is a check and not a gap.
+	{
+		my @extra;
+		for my $i (0 .. $#$res) {
+			for my $what (qw(alpha beta gamma delta epsilon zeta nu
+			                 pucker pucker_phase pucker_amplitude glycosidic)) {
+				next unless defined $res->[$i]{$what};
+				my $key = $what =~ /\Apucker|\Aglycosidic\z/ ? "$i nu2" : "$i $what";
+				$key = "$i nu0" if $what eq 'nu';
+				push @extra, "$i $what" unless exists $want_nuc{$key};
+			}
+		}
+		is_deeply(\@extra, [], "$file: no nucleic torsion here that mdtraj did not measure");
+	}
+
+	# Base pairs.  features.py measures every pair of complementary bases the
+	# screen in Parser.xs would look at, through mdtraj's kernel and gemmi's;
+	# the rule is applied to those numbers here, so what is compared is the set
+	# this module reports against the set the frozen geometry says it should
+	# report -- both ways round, so a pair too many fails as loudly as one too
+	# few.  Where the fixture's pairs are the wwPDB's annotation of the entry
+	# they were lifted from is checked separately, below.
+	#
+	# The thresholds are structure_features()'s defaults, named once here.  No
+	# candidate in t/data comes anywhere near either of them.  Of the 18 pairs
+	# accepted the tightest has 0.27 A of hydrogen bond and 1.92 A of stagger in
+	# hand; of the 58 rejected the nearest miss is 0.72 A outside.  So which
+	# side of the rule a fixture falls on cannot turn on a rounding difference
+	# between the two implementations.
+	{
+		my $HB = 3.5;   # base_pair_hbond
+		my $SAG = 2.6;  # base_pair_stagger
+		my %ix = map { $res->[$_]{chain} . '/' . $res->[$_]{key} => $_ } 0 .. $#$res;
+		my %got;
+		for my $bp (@{ $feat->{base_pairs} }) {
+			my $i = $ix{"$bp->{chain1}/$bp->{residue1}"};
+			my $j = $ix{"$bp->{chain2}/$bp->{residue2}"};
+			unless (defined $i && defined $j) {
+				fail("$file: a base pair names a residue that is not in the walk");
+				next;
+			}
+			$got{join ' ', sort { $a <=> $b } ($i, $j)} = $bp;
+		}
+		my @want;
+		for my $k (sort keys %want_bp) {
+			# gemmi's numbers where there are any: they are float64 from the
+			# same decimal columns, where mdtraj's are float32
+			my $w = $want_bp{$k};
+			my $m = $w->{gemmi} || $w->{mdtraj};
+			my ($d, $ang, $sag, @bond) = @$m;
+			next if $sag > $SAG;
+			next if grep { $_ > $HB } @bond;
+			push @want, $k;
+		}
+		is_deeply([ sort keys %got ], [ sort @want ],
+			"$file: the base pairs are the ones the frozen geometry says");
+		for my $k (@want) {
+			my $bp = $got{$k} or next;
+			my $w = $want_bp{$k};
+			is($bp->{saenger}, $w->{saenger}, "$file: base pair $k is Saenger type $w->{saenger}");
+			is($bp->{type}, join('-', split //, $w->{letters}),
+				"$file: base pair $k is $w->{letters}");
+			for my $ref ([ $w->{mdtraj}, 1e-4, 'mdtraj' ],
+			             ($w->{gemmi} ? [ $w->{gemmi}, 1e-8, 'gemmi' ] : ())) {
+				my ($m, $tol, $who) = @$ref;
+				my ($d, $ang, $sag, @bond) = @$m;
+				cmp_ok(abs($bp->{distance} - $d), '<', $tol,
+					"$file: base pair $k centroid distance, against $who");
+				cmp_ok(abs($bp->{plane_angle} - $ang), '<', $tol,
+					"$file: base pair $k plane angle, against $who");
+				cmp_ok(abs($bp->{stagger} - $sag), '<', $tol,
+					"$file: base pair $k stagger, against $who");
+				my @h = map { $_->{distance} } @{ $bp->{hbonds} };
+				is(scalar @h, scalar @bond, "$file: base pair $k has " . @bond . ' hydrogen bonds');
+				for my $i (0 .. $#bond) {
+					cmp_ok(abs(($h[$i] // 0) - $bond[$i]), '<', $tol,
+						"$file: base pair $k hydrogen bond $i, against $who");
+				}
+			}
+			# and each of the two residues carries the other
+			for my $end ([ 1, 2 ], [ 2, 1 ]) {
+				my ($me, $you) = @$end;
+				my ($mc, $mr) = ($bp->{"chain$me"}, $bp->{"residue$me"});
+				my ($yc, $yr) = ($bp->{"chain$you"}, $bp->{"residue$you"});
+				my $r = $res->[ $ix{"$mc/$mr"} ];
+				my ($note) = grep { $_->{residue} eq $yr && $_->{chain} eq $yc }
+				             @{ $r->{base_pair} || [] };
+				ok($note, "$file: base pair $k is on residue $me as well");
+				is($note->{saenger}, $bp->{saenger},
+					"$file: and with the same Saenger type") if $note;
+			}
+		}
+		# nothing carries a base_pair note that is not in the list
+		my $notes = 0;
+		$notes += scalar @{ $res->[$_]{base_pair} || [] } for 0 .. $#$res;
+		is($notes, 2 * scalar(keys %got),
+			"$file: every base pair is noted on both of its residues and nowhere else");
 	}
 
 	# Each chain's surface on its own, which with the surface it has in the
@@ -552,6 +764,243 @@ for my $c (@protparam) {
 	is($sf->{n_aromatic}, 5, 'stack.pdb has five F/W/Y residues');
 	cmp_ok(abs($sf->{aromatic_fraction} - 5 / 7), '<', 1e-12,
 		'aromatic_fraction counts histidine in the denominator and not the numerator');
+}
+
+# ---- the nucleic acid sequence numbers, against Biopython ----------------
+#
+# gc_fraction() divides the C and G by the C, G, A, T and U, so an ambiguous or
+# unknown letter is in neither half.  That is its default, ambiguous =>
+# 'remove', and it is the rule structure_features() applies:
+#
+#   python3 -c 'from Bio.SeqUtils import gc_fraction; print(gc_fraction("...."))'
+#
+# An exact rational sum, so it is compared to 1e-12 rather than to a measured
+# tolerance.  The last three cases are the ones that say what 'remove' means: an
+# N, an I and an X are in neither the numerator nor the denominator, so ACGTN
+# and ACGT are both 0.5 and not 0.4.
+my @gcfrac = (
+	# sequence,     Bio.SeqUtils.gc_fraction()
+	[ 'ACGUAA',     0.3333333333333333 ],   # rna.pdb chain A
+	[ 'CGAA',       0.5                ],   # duplex.pdb chain A
+	[ 'TTCG',       0.5                ],   # duplex.pdb chain B
+	[ 'CAGTAT',     0.3333333333333333 ],   # bases.pdb chain P
+	[ 'GGCC',       1.0                ],
+	[ 'AAAA',       0.0                ],
+	[ 'GCGCGCGCGC', 1.0                ],
+	[ 'ACGTN',      0.5                ],
+	[ 'ACGTNIX',    0.5                ],
+);
+for my $c (@gcfrac) {
+	my ($seq, $want) = @$c;
+	my ($gc, $n) = (0, 0);
+	for my $b (split //, $seq) {
+		next unless $b =~ /[ACGTU]/;
+		$gc++ if $b =~ /[CG]/;
+		$n++;
+	}
+	cmp_ok(abs($gc / $n - $want), '<', 1e-12, "Biopython gc_fraction of $seq");
+}
+
+# and the same number as structure_features() computes it, over the sequence
+# structure_info() read out of the file
+{
+	my $rna = structure_info(File::Spec->catfile($dir, 'rna.pdb'));
+	my $rf  = structure_features($rna);
+	is($rna->{chains}{A}{type}, 'rna', 'rna.pdb chain A reads as RNA');
+	is($rna->{chains}{A}{sequence}, 'ACGUAA', '... with the sequence 1MSY has there');
+	cmp_ok(abs($rf->{gc_fraction} - 0.3333333333333333), '<', 1e-12,
+		'structure_features gc_fraction is gc_fraction over that sequence');
+	cmp_ok(abs($rna->{chains}{A}{gc_fraction} - $rf->{gc_fraction}), '<', 1e-12,
+		'the one nucleic chain carries the same fraction as the structure');
+	# A, C, G, U, A, A: four of the six are purines
+	cmp_ok(abs($rf->{purine_fraction} - 4 / 6), '<', 1e-12, 'and four of six are purines');
+	is($rf->{n_gc}, 2, 'two of them are G or C');
+	is($rf->{nucleotide_length}, 6, 'six nucleotides of sequence');
+	is_deeply($rna->{chains}{A}{base_counts}, { A => 3, C => 1, G => 1, U => 1 },
+		'base_counts tallies every letter of it');
+	# no protein in the file, so no protein numbers: a hydropathy of zero would
+	# read as a chain of alanine and glycine rather than as no chain at all
+	ok(!exists $rf->{hydropathy}, 'an RNA structure gets no hydropathy');
+	is($rf->{sequence_length}, 0, '... and no protein sequence length');
+
+	my $dup = structure_info(File::Spec->catfile($dir, 'duplex.pdb'));
+	my $df  = structure_features($dup);
+	is($dup->{chains}{A}{type}, 'dna', 'duplex.pdb chain A reads as DNA');
+	is($dup->{chains}{B}{type}, 'dna', '... and so does chain B');
+	is($dup->{chains}{A}{sequence}, 'CGAA', 'chain A is the CGAA of 1BNA 3 to 6');
+	is($dup->{chains}{B}{sequence}, 'TTCG', 'chain B is its complement read 19 to 22');
+	# the strands are complementary, so each is the other's G+C by symmetry
+	cmp_ok(abs($dup->{chains}{A}{gc_fraction} - 0.5), '<', 1e-12, 'chain A is half G+C');
+	cmp_ok(abs($dup->{chains}{B}{gc_fraction} - 0.5), '<', 1e-12, 'and so is chain B');
+	cmp_ok(abs($df->{gc_fraction} - 0.5), '<', 1e-12, 'and the duplex with them');
+	# ... and each other's purines: three of chain A's four, one of chain B's
+	cmp_ok(abs($dup->{chains}{A}{purine_fraction} - 3 / 4), '<', 1e-12,
+		'chain A is three-quarters purine');
+	cmp_ok(abs($dup->{chains}{B}{purine_fraction} - 1 / 4), '<', 1e-12,
+		'chain B a quarter, which is what antiparallel means');
+	cmp_ok(abs($df->{purine_fraction} - 0.5), '<', 1e-12, 'and the pair exactly half');
+	is($df->{nucleotide_length}, 8, 'eight nucleotides over the two chains');
+	is_deeply($df->{base_counts}, { A => 2, C => 2, G => 2, T => 2 },
+		'base_counts adds the chains up');
+
+	# a structure with no nucleic acid in it gets none of these keys at all
+	my $prot = structure_features(structure_info(File::Spec->catfile($dir, 'fold.pdb')));
+	ok(!exists $prot->{gc_fraction},       'a protein structure gets no gc_fraction');
+	ok(!exists $prot->{nucleotide_length}, '... and no nucleotide length');
+	ok(!exists $prot->{base_counts},       '... and no base counts');
+}
+
+# ---- what the two forms of helix actually say ----------------------------
+#
+# The point of the torsions, and the one thing no per-angle comparison above
+# says out loud: an A-form helix and a B-form helix are told apart by the sugar.
+# rna.pdb is six nucleotides of an rRNA hairpin and duplex.pdb is four base
+# pairs of the Drew-Dickerson dodecamer, and every ribose in the first is
+# C3'-endo (phase within 90 degrees of 0, the north half of the cycle) while
+# every deoxyribose in the second is in the south half.  Both fixtures are real
+# entries and neither was chosen for this; that is simply what they are.
+{
+	my $rna = structure_info(File::Spec->catfile($dir, 'rna.pdb'));
+	my $dup = structure_info(File::Spec->catfile($dir, 'duplex.pdb'));
+	my (@north, @south);
+	for my $t ([ $rna, \@north ], [ $dup, \@south ]) {
+		my ($info, $out) = @$t;
+		for my $cid (@{ $info->{chain_order} }) {
+			my $c = $info->{chains}{$cid};
+			for my $rk (@{ $c->{residue_order} }) {
+				my $r = $c->{residues}{$rk};
+				next unless defined $r->{pucker_phase};
+				push @$out, [ "$cid/$rk", $r->{pucker_phase}, $r->{pucker},
+				              $r->{glycosidic} ];
+			}
+		}
+	}
+	is(scalar @north, 6, 'every nucleotide of rna.pdb has a pucker');
+	is(scalar @south, 8, 'and every nucleotide of duplex.pdb');
+	is_deeply([ grep { $_->[1] > 90 && $_->[1] < 270 } @north ], [],
+		'every ribose of the RNA is in the north half of the cycle');
+	is_deeply([ grep { $_->[2] ne "C3'-endo" } @north ], [],
+		'... and C3-endo to the name, which is what A-form means');
+	is_deeply([ grep { $_->[1] <= 90 || $_->[1] >= 270 } @south ], [],
+		'every deoxyribose of the B-DNA is in the south half');
+	is_deeply([ grep { $_->[3] ne 'anti' } @north ], [],
+		'and every base of the RNA is anti about its glycosidic bond');
+}
+
+# ---- the base pairs, against the archive's own annotation -----------------
+#
+# No reader on this machine finds base pairs, so the answer comes from the
+# wwPDB, which deposits 3DNA's with the entry.  The rows below are the
+# _ndb_struct_na_base_pair loop of the two entries the nucleic fixtures were
+# lifted from, restricted to the residues that are actually in the fixture:
+# i_auth_asym_id, i_auth_seq_id, the same for j, and hbond_type_28, which is
+# Saenger's numbering of the twenty-eight pair types.  Written down here the way
+# t/foreign.t writes its cases down, with the entry each came from, because
+# there is nothing to run.
+#
+#   1BNA.cif, https://files.rcsb.org/download/1BNA.cif -- twelve pairs, of
+#   which four are wholly inside duplex.pdb (chain A 3 to 6, chain B 19 to 22).
+#   1MSY.cif, https://files.rcsb.org/download/1MSY.cif -- eleven, of which six
+#   are inside wobble.pdb (chain A 2647 to 2652 and 2668 to 2673) and one
+#   inside rna.pdb (chain A 2657 to 2662).
+#
+# A '?' is a pair the annotation records and cannot put a Saenger number on:
+# it is a pair, but not one of the three this module looks for, so it must not
+# be reported.  Those are the negative half of this test and are the reason
+# these two fixtures were chosen.
+{
+	my %annotated = (
+		'duplex.pdb' => [
+			[ 'A', 3, 'B', 22, 19 ],
+			[ 'A', 4, 'B', 21, 19 ],
+			[ 'A', 5, 'B', 20, 20 ],
+			[ 'A', 6, 'B', 19, 20 ],
+		],
+		'wobble.pdb' => [
+			[ 'A', 2647, 'A', 2673, '?' ],   # a pair, and none of the twenty-eight
+			[ 'A', 2648, 'A', 2672, 28 ],    # the wobble
+			[ 'A', 2649, 'A', 2671, 19 ],
+			[ 'A', 2650, 'A', 2670, 20 ],
+			[ 'A', 2651, 'A', 2669, 19 ],
+			[ 'A', 2652, 'A', 2668, 19 ],
+		],
+		'rna.pdb' => [
+			[ 'A', 2659, 'A', 2662, '?' ],   # the only pair inside the hairpin
+		],
+	);
+	for my $file (sort keys %annotated) {
+		my $info = structure_info(File::Spec->catfile($dir, $file));
+		my %got;
+		for my $bp (@{ structure_base_pairs($info) }) {
+			my @e = sort { $a->[0] cmp $b->[0] || $a->[1] <=> $b->[1] }
+			        [ $bp->{chain1}, $bp->{residue1} ], [ $bp->{chain2}, $bp->{residue2} ];
+			$got{join '/', map { @$_ } @e} = $bp->{saenger};
+		}
+		my %want;
+		for my $row (@{ $annotated{$file} }) {
+			next unless $row->[4] =~ /\A[0-9]+\z/;
+			my @e = sort { $a->[0] cmp $b->[0] || $a->[1] <=> $b->[1] }
+			        [ @$row[0, 1] ], [ @$row[2, 3] ];
+			$want{join '/', map { @$_ } @e} = $row->[4];
+		}
+		is_deeply(\%got, \%want,
+			"$file: the pairs found are the ones the entry's own annotation calls "
+		  . 'Watson-Crick or wobble, with the same Saenger type');
+	}
+	# and the two formats say the same thing, which t/cif.t asserts over the
+	# whole structure and this asserts over the answer itself
+	for my $stem (qw(duplex wobble rna)) {
+		my $pdb = structure_base_pairs(structure_info(
+			File::Spec->catfile($dir, "$stem.pdb")));
+		my $cif = structure_base_pairs(structure_info(
+			File::Spec->catfile($dir, "$stem.cif")));
+		is_deeply($cif, $pdb, "$stem.cif finds the same base pairs as $stem.pdb");
+	}
+}
+
+# ---- the options ----------------------------------------------------------
+#
+# Both thresholds are the whole of the rule, so both are options.  Widening the
+# hydrogen bond to 4.0 A picks up the pair the 1MSY annotation records and
+# cannot classify -- U2647-G2673, whose two bonds are 3.97 and 5.20 A, so it
+# takes 5.3 A to reach the second one -- and tightening the stagger to 0 leaves
+# nothing at all.
+{
+	my $info = structure_info(File::Spec->catfile($dir, 'wobble.pdb'));
+	is(scalar @{ structure_base_pairs($info) }, 5, 'wobble.pdb has five pairs');
+	is(scalar @{ structure_base_pairs($info, base_pair_hbond => 4.0) }, 5,
+		'... still five at 4.0 A, because the pair it would add needs 5.3');
+	is(scalar @{ structure_base_pairs($info, base_pair_hbond => 5.3) }, 6,
+		'... and six at 5.3, which is U2647-G2673 arriving');
+	is(scalar @{ structure_base_pairs($info, base_pair_stagger => 0) }, 0,
+		'... and none at all with no stagger allowed');
+	# structure_info() wrote the answer onto the residues on the way past, twice
+	# per pair.  Asking again with a different cutoff replaces those notes
+	# rather than adding to them, which is what the hv_delete() at the head of
+	# base_pairs() is for; asking with store => 0 leaves the residues as they
+	# were and answers with the list alone.  Both are structure_disulfides()'s
+	# behaviour, which is where the pattern comes from.
+	my $again = structure_info(File::Spec->catfile($dir, 'wobble.pdb'));
+	my $notes = sub {
+		my $n = 0;
+		for my $cid (@{ $again->{chain_order} }) {
+			my $c = $again->{chains}{$cid};
+			$n += scalar @{ $c->{residues}{$_}{base_pair} || [] }
+				for @{ $c->{residue_order} };
+		}
+		return $n;
+	};
+	is($notes->(), 10, 'structure_info noted all five pairs on both of their residues');
+	structure_base_pairs($again, base_pair_hbond => 5.3);
+	is($notes->(), 12, 'a wider cutoff replaces the notes rather than adding to them');
+	structure_base_pairs($again, base_pair_stagger => 0);
+	is($notes->(), 0, '... and one that finds nothing clears them');
+	structure_base_pairs($again);
+	is($notes->(), 0, 'the no-option call is the lookup and writes nothing');
+	structure_features($again, base_pair_hbond => 3.5);
+	is($notes->(), 10, '... and asking again puts the five pairs back');
+	structure_base_pairs($again, base_pair_stagger => 0, store => 0);
+	is($notes->(), 10, 'store => 0 answers without touching the residues');
 }
 
 # ---- the live half -------------------------------------------------------

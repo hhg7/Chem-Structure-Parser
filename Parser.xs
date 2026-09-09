@@ -3112,6 +3112,289 @@ static AV *pi_stacking(pTHX_ structset *CSP_RESTRICT s, const pi_opt *CSP_RESTRI
 	return out;
 }
 
+/*Watson-Crick base pairs, and the G-U wobble that stands in for one.
+
+A base pair is not something the file declares; like the disulfides below it is
+something the coordinates show.  What is looked for is the canonical pairing and
+only that -- the three geometries a double helix is built from -- because those
+are the ones whose hydrogen bonds are fixed by the pair itself rather than by
+whatever else the two bases happen to be doing.  The atom pairs are the ones
+Watson, J D; Crick, F H C (1953) Nature 171(4356):737-8 drew, and the numbers
+beside them are Saenger, W (1984) Principles of Nucleic Acid Structure, chapter
+6, where the twenty-eight ways two bases can pair are tabulated and these are
+numbers 19, 20 and 28.  That is the same numbering the archive's own annotation
+uses, in _ndb_struct_na_base_pair.hbond_type_28.
+
+**Where the two thresholds come from.**  No reader on this machine finds base
+pairs -- gemmi, mdtraj and Biopython all stop short of it -- so the rule was
+measured against the annotation the wwPDB deposits with the entry, which is
+3DNA's.  The forty entries below are the ones of those read that carry an
+_ndb_struct_na_base_pair loop, and between them they hold 1372 pairs of type 19,
+20 or 28 in model 1 of the asymmetric unit:
+
+  1B94 1B97 1BNA 1D23 1D61 1D8X 1D9R 1EHZ 1FIR 1GID 1I9V 1JJ2 1KD3 1MSY
+  1NJW 1NJX 1NK0 1NK4 1NK7 1NK8 1NK9 1NKC 1NKE 1SDR 1U8D 1Y26 1ZBI 2GIS
+  2O1I 2R8S 355D 3AU6 3DNB 3SWP 3V9D 456D 4GLX 4OFA 5YTY 5YTZ
+
+Two bases are a pair when both of the following hold.
+
+  - Every hydrogen bond of that pair type is at most CSP_BP_HBOND long.  The
+    longest one in the 1354 annotated pairs built from unmodified bases is
+    3.4941 A and the shortest one in a candidate the annotation does not call a
+    pair is 3.5144 A, so 3.5 -- which is also the conventional heavy-atom
+    hydrogen bond distance -- falls between the two, with 0.006 A over the
+    population it has to cover.
+  - The two bases are coplanar to within CSP_BP_STAGGER, measured as the offset
+    between their ring centroids projected on their ring normals, whichever of
+    the two projections is larger.  That is what tells a pair from the stacked
+    neighbour above or below it, which brings the same atoms within reach but
+    sits a rise away rather than beside it: the largest stagger in a real pair
+    is 2.5408 A, the smallest in a rejected candidate 2.6983 A, and the stacked
+    population proper begins near 3.0 A.
+
+Run that way the rule finds all 1354 and misses none.  The other eighteen of the
+1372 are not pairs this can see at all, for two reasons that are both about the
+file rather than the geometry.  Eleven have a modified base on one side -- 5MC,
+2MG, BRU, DDG -- which res_lookup() does not spell, so they have no
+single-letter code to match the table with.  The other seven are in 1D61 and
+2O1I, whose asymmetric unit holds one strand of a self-complementary duplex and
+whose second strand is a crystallographic symmetry mate: the annotation names
+both strands with the same chain and the same residue numbers, and the two are
+thirty and forty angstrom apart in the coordinates as deposited, which is what
+this reads.
+
+Two pairs are found that the annotation does not list, and both are worth
+reading rather than a fault: 1JJ2's C2542-G2617, a G-C with all three bonds
+under 2.94 A and half an angstrom of stagger that appears nowhere in that
+entry's 1121 annotated rows, and 3SWP's DT4-DA24, where the entry is 4.11 A, the
+annotation pairs its DT4 with DA25 instead, and cannot put a Saenger number on
+that pair either.
+
+Every base came out of the set with at most one partner, over all 1354 pairs.
+That is what the geometry did, not something imposed, so a residue's answer is a
+list as its disulfides are: nothing in the rule forbids a second.*/
+#define CSP_BP_HBOND   3.5 //angstrom: the longest hydrogen bond a pair may have
+#define CSP_BP_STAGGER 2.6 //angstrom: the furthest out of plane it may be
+/*How far from its own ring centroid any atom named in the table below can sit,
+which is what makes the centroid grid a safe screen: if every bond is at most
+CSP_BP_HBOND then the centroids are at most CSP_BP_HBOND + 2 * CSP_BASE_REACH
+apart.  The furthest such atom over the 11,525 in the forty entries above is an
+adenine N6 at 2.7734 A.*/
+#define CSP_BASE_REACH 3.0
+#define CSP_BP_BONDS 3 //the most hydrogen bonds any pair in the table has
+
+typedef struct {
+	char a, b;                  //the two bases, the purine first
+	unsigned short int saenger; //which of Saenger's twenty-eight this is
+	unsigned short int n;       //how many of the bonds below define it
+	const char *atom[CSP_BP_BONDS][2]; //the a atom and the b atom of each bond
+} bp_def;
+
+static const bp_def bp_kinds[] = {
+	{ 'G', 'C', 19, 3, { { "O6", "N4" }, { "N1", "N3" }, { "N2", "O2" } } },
+	{ 'A', 'U', 20, 2, { { "N6", "O4" }, { "N1", "N3" }, { NULL, NULL } } },
+	{ 'A', 'T', 20, 2, { { "N6", "O4" }, { "N1", "N3" }, { NULL, NULL } } },
+	//the wobble, and the G-T that is the same pair with a methyl on it: the
+	//archive numbers that one 28 as well, in 1NJW, 1NJX, 1NK8 and 1NKC
+	{ 'G', 'U', 28, 2, { { "O6", "N3" }, { "N1", "O2" }, { NULL, NULL } } },
+	{ 'G', 'T', 28, 2, { { "O6", "N3" }, { "N1", "O2" }, { NULL, NULL } } }
+};
+
+typedef struct {
+	NV cx, cy, cz; //the six-membered ring's centroid
+	NV nx, ny, nz; //and its normal
+	HV *atoms;     //the residue's atoms, for reaching the pairing atoms by name
+	UV res;        //which residue it belongs to
+	char one;      //A, C, G, T or U
+} base_t;
+
+/*The bases, out of the rings pi_stacking() already knows how to find.  A purine
+has two rings and only the six-membered one is here, because it is the one both
+purines and pyrimidines have and the one every atom in the table above hangs
+off.  A modified base has no single-letter code and so is not a base here; that
+is the eighteen pairs the header comment accounts for.*/
+static UV bases_find(pTHX_ structset *CSP_RESTRICT s, base_t *CSP_RESTRICT *CSP_RESTRICT out)
+{
+	ring_t *rings = NULL;
+	base_t *b = NULL;
+	UV n, k, m = 0;
+	*out = NULL;
+	n = rings_find(aTHX_ s, &rings);
+	if (n == 0) { Safefree(rings); return 0; }
+	Newx(b, n, base_t);
+	for (k = 0; k < n; k++) {
+		const UV r = rings[k].res;
+		const char one = s->res_one[r];
+		if (rings[k].label != '6') continue;
+		if (s->res_type[r] != RT_NUC) continue;
+		if (one != 'A' && one != 'C' && one != 'G' && one != 'T' && one != 'U') continue;
+		b[m].cx = rings[k].cx; b[m].cy = rings[k].cy; b[m].cz = rings[k].cz;
+		b[m].nx = rings[k].nx; b[m].ny = rings[k].ny; b[m].nz = rings[k].nz;
+		b[m].atoms = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
+		b[m].res = r;
+		b[m].one = one;
+		if (b[m].atoms) m++;
+	}
+	Safefree(rings);
+	*out = b;
+	return m;
+}
+
+//which entry of bp_kinds two bases could be, and which way round; NULL for a
+//combination that is not one of the canonical pairs
+static const bp_def *bp_kind_of(char x, char y, bool *CSP_RESTRICT swapped)
+{
+	unsigned short int i;
+	for (i = 0; i < (unsigned short int)C_ARRAY_LENGTH(bp_kinds); i++) {
+		if (bp_kinds[i].a == x && bp_kinds[i].b == y) { *swapped = FALSE; return &bp_kinds[i]; }
+		if (bp_kinds[i].a == y && bp_kinds[i].b == x) { *swapped = TRUE;  return &bp_kinds[i]; }
+	}
+	return NULL;
+}
+
+//the partner half of one pair, pushed onto a base's own list
+static void bp_note(pTHX_ HV *CSP_RESTRICT res, HV *CSP_RESTRICT partner,
+                    const char *CSP_RESTRICT type, unsigned short int saenger)
+{
+	SV **slot = hv_fetch(res, "base_pair", 9, 0);
+	AV *list;
+	HV *e;
+	if (slot && *slot && SvROK(*slot) && SvTYPE(SvRV(*slot)) == SVt_PVAV) {
+		list = (AV *)SvRV(*slot);
+	} else {
+		list = newAV();
+		(void)hv_stores(res, "base_pair", newRV_noinc((SV *)list));
+	}
+	e = newHV();
+	pi_field(aTHX_ e, "chain", 5, partner, "chain", 5);
+	pi_field(aTHX_ e, "residue", 7, partner, "key", 3);
+	pi_field(aTHX_ e, "resname", 7, partner, "resname", 7);
+	(void)hv_stores(e, "type", newSVpv(type, 0));
+	(void)hv_stores(e, "saenger", newSVuv((UV)saenger));
+	av_push(list, newRV_noinc((SV *)e));
+}
+
+static AV *base_pairs(pTHX_ structset *CSP_RESTRICT s, NV hb, NV stagger, bool store)
+{
+	AV *out = newAV();
+	base_t *bases = NULL;
+	NV *cx = NULL, *cy = NULL, *cz = NULL;
+	const NV cut = hb + 2.0 * CSP_BASE_REACH;
+	const NV to_deg = 180.0 / CSP_PI;
+	cell_grid g;
+	UV n, i;
+
+	n = bases_find(aTHX_ s, &bases);
+	if (n < 2) { Safefree(bases); return out; }
+	Newx(cx, n, NV); Newx(cy, n, NV); Newx(cz, n, NV);
+	for (i = 0; i < n; i++) { cx[i] = bases[i].cx; cy[i] = bases[i].cy; cz[i] = bases[i].cz; }
+	/*Clear what an earlier call left on these residues, so that asking twice
+	replaces the answer rather than adding to it.  Which residues are candidates
+	is decided by the residue's name and its ring atoms alone, never by either
+	threshold, so these are exactly the ones a previous call could have written
+	to.*/
+	if (store)
+		for (i = 0; i < n; i++)
+			(void)hv_delete(s->res_hv[bases[i].res], "base_pair", 9, G_DISCARD);
+	grid_build(aTHX_ &g, cx, cy, cz, n, cut);
+
+	for (i = 0; i < n; i++) {
+		UV bx, by, bz;
+		UV ci = grid_axis(cx[i] - g.x0, g.cell, g.nx);
+		UV cj = grid_axis(cy[i] - g.y0, g.cell, g.ny);
+		UV ck = grid_axis(cz[i] - g.z0, g.cell, g.nz);
+		UV ax0 = ci ? ci - 1 : 0, ax1 = (ci + 1 < g.nx) ? ci + 1 : g.nx - 1;
+		UV ay0 = cj ? cj - 1 : 0, ay1 = (cj + 1 < g.ny) ? cj + 1 : g.ny - 1;
+		UV az0 = ck ? ck - 1 : 0, az1 = (ck + 1 < g.nz) ? ck + 1 : g.nz - 1;
+		for (bx = ax0; bx <= ax1; bx++)
+		for (by = ay0; by <= ay1; by++)
+		for (bz = az0; bz <= az1; bz++) {
+			UV cell = (bx * g.ny + by) * g.nz + bz, p;
+			for (p = g.start[cell]; p < g.start[cell + 1]; p++) {
+				UV j = g.idx[p];
+				const bp_def *kind;
+				bool swapped = FALSE;
+				NV vx, vy, vz, d, plane, sag_i, sag_j, sag;
+				NV bond[CSP_BP_BONDS];
+				unsigned short int k;
+				bool whole = TRUE;
+				char tname[4];
+				HV *h;
+				AV *hbs;
+				if (j <= i) continue; //each pair once
+				//one residue's two rings cannot pair with each other, and
+				//neither can two conformers sharing a residue
+				if (bases[i].res == bases[j].res) continue;
+				kind = bp_kind_of(bases[i].one, bases[j].one, &swapped);
+				if (!kind) continue;
+				vx = cx[j] - cx[i]; vy = cy[j] - cy[i]; vz = cz[j] - cz[i];
+				d = nv_sqrt(vx * vx + vy * vy + vz * vz);
+				if (d > cut) continue;
+				for (k = 0; k < kind->n; k++) {
+					/*the table names the purine's atom first, so a pair whose
+					purine is the later residue reads its two names backwards*/
+					const char *an = kind->atom[k][swapped ? 1 : 0];
+					const char *bn = kind->atom[k][swapped ? 0 : 1];
+					NV ax, ay, az, bx2, by2, bz2, dx, dy, dz;
+					if (!atom_xyz(aTHX_ bases[i].atoms, an, &ax, &ay, &az)
+					 || !atom_xyz(aTHX_ bases[j].atoms, bn, &bx2, &by2, &bz2)) {
+						whole = FALSE;
+						break;
+					}
+					dx = bx2 - ax; dy = by2 - ay; dz = bz2 - az;
+					bond[k] = nv_sqrt(dx * dx + dy * dy + dz * dz);
+					if (bond[k] > hb) { whole = FALSE; break; }
+				}
+				if (!whole) continue;
+				sag_i = nv_fabs(vx * bases[i].nx + vy * bases[i].ny + vz * bases[i].nz);
+				sag_j = nv_fabs(vx * bases[j].nx + vy * bases[j].ny + vz * bases[j].nz);
+				sag = (sag_i > sag_j) ? sag_i : sag_j;
+				if (sag > stagger) continue;
+				plane = vec_angle_capped(bases[i].nx, bases[i].ny, bases[i].nz,
+				                         bases[j].nx, bases[j].ny, bases[j].nz);
+				if (plane < 0.0) continue;
+				//the pair is named in the order it is reported, so that the
+				//two letters and the two resname fields read the same way round
+				tname[0] = bases[i].one; tname[1] = '-';
+				tname[2] = bases[j].one; tname[3] = '\0';
+				h = newHV();
+				(void)hv_stores(h, "type", newSVpvn(tname, 3));
+				(void)hv_stores(h, "saenger", newSVuv((UV)kind->saenger));
+				pi_field(aTHX_ h, "chain1", 6, s->res_hv[bases[i].res], "chain", 5);
+				pi_field(aTHX_ h, "residue1", 8, s->res_hv[bases[i].res], "key", 3);
+				pi_field(aTHX_ h, "resname1", 8, s->res_hv[bases[i].res], "resname", 7);
+				pi_field(aTHX_ h, "chain2", 6, s->res_hv[bases[j].res], "chain", 5);
+				pi_field(aTHX_ h, "residue2", 8, s->res_hv[bases[j].res], "key", 3);
+				pi_field(aTHX_ h, "resname2", 8, s->res_hv[bases[j].res], "resname", 7);
+				(void)hv_stores(h, "distance", newSVnv(d));
+				(void)hv_stores(h, "plane_angle", newSVnv(plane * to_deg));
+				(void)hv_stores(h, "stagger", newSVnv(sag));
+				hbs = newAV();
+				for (k = 0; k < kind->n; k++) {
+					HV *e = newHV();
+					(void)hv_stores(e, "atom1", newSVpv(kind->atom[k][swapped ? 1 : 0], 0));
+					(void)hv_stores(e, "atom2", newSVpv(kind->atom[k][swapped ? 0 : 1], 0));
+					(void)hv_stores(e, "distance", newSVnv(bond[k]));
+					av_push(hbs, newRV_noinc((SV *)e));
+				}
+				(void)hv_stores(h, "hbonds", newRV_noinc((SV *)hbs));
+				av_push(out, newRV_noinc((SV *)h));
+				if (store) {
+					bp_note(aTHX_ s->res_hv[bases[i].res], s->res_hv[bases[j].res],
+					        tname, kind->saenger);
+					tname[0] = bases[j].one; tname[2] = bases[i].one;
+					bp_note(aTHX_ s->res_hv[bases[j].res], s->res_hv[bases[i].res],
+					        tname, kind->saenger);
+				}
+			}
+		}
+	}
+	grid_free(aTHX_ &g);
+	Safefree(cx); Safefree(cy); Safefree(cz);
+	Safefree(bases);
+	return out;
+}
+
 /*Disulfide bonds, found by geometry.
 
 $info->{ssbond} is what the file *says* -- an SSBOND record, or an mmCIF
@@ -3434,12 +3717,231 @@ static bool chi_of(pTHX_ HV *CSP_RESTRICT atoms, const char *const alt[][4],
 	return FALSE;
 }
 
+/*Nucleic acid torsion angles, and the shape of the sugar ring.
+
+A nucleotide's conformation is six backbone torsions, one glycosidic torsion and
+the pucker of its ribose, and between them they are what tells an A-form helix
+from a B-form one and either from what a loop does.  The names and the atoms of
+each are the IUPAC-IUB Joint Commission on Biochemical Nomenclature's (1983)
+"Abbreviations and symbols for the description of conformations of
+polynucleotide chains", Eur J Biochem 131:9-15:
+
+  alpha    O3' of the residue before, then P, O5', C5'
+  beta     P, O5', C5', C4'
+  gamma    O5', C5', C4', C3'
+  delta    C5', C4', C3', O3'
+  epsilon  C4', C3', O3', then P of the residue after
+  zeta     C3', O3', then P and O5' of the residue after
+  chi      O4', C1', then N9 and C4 of a purine or N1 and C2 of a pyrimidine
+  nu0..nu4 the ring itself, C4'-O4'-C1'-C2' round to C3'-C4'-O4'-C1'
+
+chi is stored under the same key an amino acid's side chain torsions are, and no
+residue has both -- an amino acid has no C1' and a nucleotide has no CB -- but an
+amino acid's chi is a list of up to five and a nucleotide's is one number.
+
+Which four atoms it is turns on N9 rather than on trying one quadruple and then
+the other: only a purine has an N9, while a purine has N1 and C2 as well as N9
+and C4, so a purine missing its C4 would fall through to the pyrimidine atoms
+and answer a different torsion under the same name.  Asking for the atom that
+separates the two cases costs one lookup and cannot do that.
+
+Nothing here asks whether the residue is a nucleotide: the atoms decide, as they
+do for phi and psi.  A protein residue has no O3' and gets none of these, and a
+nucleotide sitting in a binding site as a ligand rather than in a chain gets the
+ones its own atoms define, which is the right answer rather than an accident.
+
+alpha needs the residue before and epsilon and zeta the one after, and both
+links are tested rather than assumed, for the reason phi and psi test theirs: a
+gap in the model puts two residues next to each other that are not bonded, and a
+torsion across one is a number rather than an answer.  The test is gemmi's, from
+are_connected() in gemmi/polyheur.hpp -- an O3'-to-P separation under 1.5 times
+the 1.6 A ideal bond, so 2.4 A -- which is the polynucleotide half of the same
+function whose polypeptide half supplies the 1.8 A used above.
+
+**The pucker.**  Altona, C; Sundaralingam, M (1972) J Am Chem Soc 94(23):8205-12
+describes the ring with two numbers instead of five, on the observation that the
+five nu are one sinusoid sampled at five points: a phase angle P saying which of
+the ring's ten envelope shapes it is nearest, and an amplitude nu_max saying how
+far from flat it is.  Their equations 1 and 2:
+
+    tan P = ((nu4 + nu1) - (nu3 + nu0)) / (2 * nu2 * (sin 36 + sin 72))
+    nu_max = nu2 / cos P
+
+Written as an atan2 of the two halves rather than a division, which puts P in
+the right half of the circle without a separate test: the denominator carries
+the sign of nu2, so cos P and nu2 always agree in sign and nu_max comes out
+positive, which is the paper's convention.  Both sides of the fraction are
+linear in the nu, so the units cancel and the radians this file works in give
+the same P as the degrees the paper is written in.
+
+P is reported in 0 to 360 rather than the -180 to 180 every other angle here is
+in, because the cycle is conventionally read that way and the pucker names are
+ranges of it.  They are the ten envelope forms, each the 36 degrees of P centred
+on it, as tabulated by Altona and Sundaralingam and by Saenger, W (1984)
+Principles of Nucleic Acid Structure, chapter 2.  C3'-endo (P near 18) is what
+an A-form helix and almost every ribose are in and C2'-endo (P near 162) what a
+B-form helix is, so the name is often the whole answer.
+
+**glycosidic** is which side of the sugar the base is turned to, read off chi:
+syn within 90 degrees of 0, anti within 90 of 180, which is Saenger's division
+in the same chapter and the one DSSR reports.  Nearly everything is anti, which
+is what makes a syn guanosine worth being told about.  It is a bisection and not
+a classification with a gap, so the band around -90 that the literature calls
+high-anti comes back here as syn: chi itself is beside it for a caller who wants
+the third name.*/
+
+//gemmi's are_connected(): 1.5 times the 1.6 A ideal O3'-P bond
+#define CSP_PHOSPHO_BOND 2.4
+
+/*The ten envelope forms, each named for the ring atom furthest out of the plane
+of the other four and which face of the ring it is on.  Entry k covers the phase
+angle from 36k to 36(k+1) degrees.*/
+static const char *const nuc_pucker[10] = {
+	"C3'-endo", "C4'-exo",  "O4'-endo", "C1'-exo",  "C2'-endo",
+	"C3'-exo",  "C4'-endo", "O4'-exo",  "C1'-endo", "C2'-exo"
+};
+
+//the keys below, so that asking twice replaces the answer rather than leaving
+//half of an older one beside it
+static const char *const nuc_keys[] = {
+	"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "glycosidic",
+	"nu", "pucker", "pucker_phase", "pucker_amplitude"
+};
+
+//gemmi's nucleotide bond: the O3' of the earlier residue this close to the P of
+//the later one
+static bool nucleotide_linked(pTHX_ HV *CSP_RESTRICT prev, HV *CSP_RESTRICT next, NV cut)
+{
+	HV *pa, *na;
+	NV ox, oy, oz, px, py, pz, dx, dy, dz;
+	if (!prev || !next) return FALSE;
+	pa = hvf_hv(aTHX_ prev, "atoms", 5);
+	na = hvf_hv(aTHX_ next, "atoms", 5);
+	if (!pa || !na) return FALSE;
+	if (!atom_xyz(aTHX_ pa, "O3'", &ox, &oy, &oz)) return FALSE;
+	if (!atom_xyz(aTHX_ na, "P",   &px, &py, &pz)) return FALSE;
+	dx = px - ox; dy = py - oy; dz = pz - oz;
+	return (dx * dx + dy * dy + dz * dz) < cut * cut;
+}
+
+//one nucleotide's torsions, onto its residue hash.  Degrees, and a torsion
+//whose atoms are not all present simply has no key.
+static void nuc_torsions(pTHX_ HV *CSP_RESTRICT me, HV *CSP_RESTRICT my_at,
+                         HV *CSP_RESTRICT pv_at, HV *CSP_RESTRICT nx_at,
+                         bool prev_linked, bool next_linked)
+{
+	static const unsigned short int here[4]   = { 0, 0, 0, 0 };
+	static const unsigned short int prev_w[4] = { 0, 1, 1, 1 };
+	static const unsigned short int eps_w[4]  = { 0, 0, 0, 1 };
+	static const unsigned short int zeta_w[4] = { 0, 0, 1, 1 };
+	static const char *const alpha_n[4] = { "O3'", "P", "O5'", "C5'" };
+	static const char *const beta_n[4]  = { "P", "O5'", "C5'", "C4'" };
+	static const char *const gamma_n[4] = { "O5'", "C5'", "C4'", "C3'" };
+	static const char *const delta_n[4] = { "C5'", "C4'", "C3'", "O3'" };
+	static const char *const eps_n[4]   = { "C4'", "C3'", "O3'", "P" };
+	static const char *const zeta_n[4]  = { "C3'", "O3'", "P", "O5'" };
+	static const char *const chi_pur[4] = { "O4'", "C1'", "N9", "C4" };
+	static const char *const chi_pyr[4] = { "O4'", "C1'", "N1", "C2" };
+	static const char *const nu_n[5][4] = {
+		{ "C4'", "O4'", "C1'", "C2'" }, { "O4'", "C1'", "C2'", "C3'" },
+		{ "C1'", "C2'", "C3'", "C4'" }, { "C2'", "C3'", "C4'", "O4'" },
+		{ "C3'", "C4'", "O4'", "C1'" }
+	};
+	const NV to_deg = 180.0 / CSP_PI;
+	NV p[4][3], v, nu[5];
+	bool have_nu = TRUE;
+	unsigned short int k;
+
+	for (k = 0; k < (unsigned short int)C_ARRAY_LENGTH(nuc_keys); k++)
+		(void)hv_delete(me, nuc_keys[k], (I32)strlen(nuc_keys[k]), G_DISCARD);
+
+	if (prev_linked && four_atoms(aTHX_ pv_at, my_at, alpha_n, prev_w, p)
+	    && dihedral4(p[0], p[1], p[2], p[3], &v))
+		(void)hv_stores(me, "alpha", newSVnv(v * to_deg));
+	if (four_atoms(aTHX_ my_at, NULL, beta_n, here, p)
+	    && dihedral4(p[0], p[1], p[2], p[3], &v))
+		(void)hv_stores(me, "beta", newSVnv(v * to_deg));
+	if (four_atoms(aTHX_ my_at, NULL, gamma_n, here, p)
+	    && dihedral4(p[0], p[1], p[2], p[3], &v))
+		(void)hv_stores(me, "gamma", newSVnv(v * to_deg));
+	if (four_atoms(aTHX_ my_at, NULL, delta_n, here, p)
+	    && dihedral4(p[0], p[1], p[2], p[3], &v))
+		(void)hv_stores(me, "delta", newSVnv(v * to_deg));
+	if (next_linked) {
+		if (four_atoms(aTHX_ my_at, nx_at, eps_n, eps_w, p)
+		    && dihedral4(p[0], p[1], p[2], p[3], &v))
+			(void)hv_stores(me, "epsilon", newSVnv(v * to_deg));
+		if (four_atoms(aTHX_ my_at, nx_at, zeta_n, zeta_w, p)
+		    && dihedral4(p[0], p[1], p[2], p[3], &v))
+			(void)hv_stores(me, "zeta", newSVnv(v * to_deg));
+	}
+	{
+		NV n9[3];
+		const char *const *CSP_RESTRICT chi_n =
+			atom_xyz(aTHX_ my_at, "N9", &n9[0], &n9[1], &n9[2]) ? chi_pur : chi_pyr;
+		if (four_atoms(aTHX_ my_at, NULL, chi_n, here, p)
+		    && dihedral4(p[0], p[1], p[2], p[3], &v)) {
+			const NV deg = v * to_deg;
+			(void)hv_stores(me, "chi", newSVnv(deg));
+			(void)hv_stores(me, "glycosidic",
+			                newSVpv(nv_fabs(deg) <= 90.0 ? "syn" : "anti", 0));
+		}
+	}
+
+	for (k = 0; k < 5; k++) {
+		if (four_atoms(aTHX_ my_at, NULL, nu_n[k], here, p)
+		    && dihedral4(p[0], p[1], p[2], p[3], &nu[k])) continue;
+		have_nu = FALSE;
+		break;
+	}
+	if (have_nu) {
+		/*sin 36 + sin 72, the constant of Altona and Sundaralingam's equation 1.
+		Computed rather than written out, so that it is exact to whatever width
+		this perl's NV is rather than to however many digits were typed.*/
+		const NV k1 = nv_sin(CSP_PI / 5.0) + nv_sin(2.0 * CSP_PI / 5.0);
+		const NV num = (nu[4] + nu[1]) - (nu[3] + nu[0]);
+		const NV den = 2.0 * nu[2] * k1;
+		AV *list = newAV();
+		for (k = 0; k < 5; k++) av_push(list, newSVnv(nu[k] * to_deg));
+		(void)hv_stores(me, "nu", newRV_noinc((SV *)list));
+		/*A ring flat to the last bit has no phase -- every P describes it as
+		well as every other, and atan2(0, 0) would answer 0 as though one of
+		them did.  Real geometry never gets there; a fixture built on a straight
+		line has no nu at all, dihedral4() having refused them.*/
+		if (num != 0.0 || den != 0.0) {
+			const NV pr = nv_atan2(num, den);
+			const NV cp = nv_cos(pr);
+			NV phase = pr * to_deg;
+			if (phase < 0.0) phase += 360.0;
+			//an angle a hair below zero adds the whole turn and rounds to it,
+			//and 360 is 0: the cycle closes, and the range is documented as
+			//0 to 360 with the upper end not in it
+			if (phase >= 360.0) phase = 0.0;
+			(void)hv_stores(me, "pucker_phase", newSVnv(phase));
+			(void)hv_stores(me, "pucker",
+			                newSVpv(nuc_pucker[(unsigned short int)(phase / 36.0)], 0));
+			//cos P is zero only when nu2 is exactly zero, where the amplitude
+			//is the other half of the fraction; there is no ring like that in
+			//a real file and none is invented here
+			if (cp != 0.0)
+				(void)hv_stores(me, "pucker_amplitude", newSVnv(nu[2] / cp * to_deg));
+		}
+	}
+}
+
 /*dihedrals() -- every torsion angle of every residue, written onto the residue.
 
 Degrees, in -180 to 180, which is what the rest of the module reports an angle
 in.  A residue that has no phi -- the first of a chain, or the one after a gap
--- simply has no phi key, rather than a zero that would plot.*/
-static void dihedrals(pTHX_ structset *CSP_RESTRICT s, NV bond)
+-- simply has no phi key, rather than a zero that would plot.  The one exception
+is the pucker phase, which nuc_torsions() reports in 0 to 360 because that is
+how the pseudorotation cycle is read.
+
+One loop for both kinds of residue: the protein torsions and the nucleic ones
+want the same three residue hashes and the same two link tests, and a residue is
+one or the other, so asking twice would be walking twice.  `bond' is the peptide
+cutoff and `phospho' the phosphodiester one.*/
+static void dihedrals(pTHX_ structset *CSP_RESTRICT s, NV bond, NV phospho)
 {
 	static const char *const phi_n[4]   = { "C", "N", "CA", "C" };
 	static const unsigned short int phi_w[4] = { 0, 1, 1, 1 };
@@ -3495,6 +3997,10 @@ static void dihedrals(pTHX_ structset *CSP_RESTRICT s, NV bond)
 					av_push(list, have[k] ? newSVnv(chi[k] * to_deg) : newSV(0));
 				(void)hv_stores(me, "chi", newRV_noinc((SV *)list));
 			}
+
+			nuc_torsions(aTHX_ me, my_at, pv_at, nx_at,
+			             nucleotide_linked(aTHX_ prev, me, phospho),
+			             nucleotide_linked(aTHX_ me, next, phospho));
 		}
 	}
 }
@@ -4209,6 +4715,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	HV *sasa_hv = NULL;
 	AV *pi = NULL;
 	AV *ss = NULL;
+	AV *bp = NULL;
 	AV *cont = NULL;
 	AV *hb = NULL;
 	const bool want_sasa  = opt_bool(aTHX_ o, "sasa", TRUE);
@@ -4216,6 +4723,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	const bool want_shape = opt_bool(aTHX_ o, "shape", TRUE);
 	const bool want_pi   = opt_bool(aTHX_ o, "pi_stacking", TRUE);
 	const bool want_ss   = opt_bool(aTHX_ o, "disulfides", TRUE);
+	const bool want_bp   = opt_bool(aTHX_ o, "base_pairs", TRUE);
 	const bool want_tors = opt_bool(aTHX_ o, "dihedrals", TRUE);
 	const bool want_cont = opt_bool(aTHX_ o, "contacts", TRUE);
 	const bool want_hse  = opt_bool(aTHX_ o, "exposure", TRUE);
@@ -4345,8 +4853,11 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 
 	if (want_tors && store) {
 		const NV bond = opt_nv(aTHX_ o, "peptide_bond", CSP_PEPTIDE_BOND);
+		const NV phospho = opt_nv(aTHX_ o, "phosphodiester_bond", CSP_PHOSPHO_BOND);
 		if (bond <= 0.0) croak("%s: peptide_bond must be a positive number", who);
-		dihedrals(aTHX_ &s, bond);
+		if (phospho <= 0.0)
+			croak("%s: phosphodiester_bond must be a positive number", who);
+		dihedrals(aTHX_ &s, bond, phospho);
 	}
 
 	if (want_hb || want_ssq) {
@@ -4376,6 +4887,15 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 		if (cut < 0.0) croak("%s: disulfide_distance must not be negative", who);
 		ss = disulfides(aTHX_ &s, cut, store);
 		sv_2mortal((SV *)ss);
+	}
+
+	if (want_bp) {
+		const NV hb  = opt_nv(aTHX_ o, "base_pair_hbond", CSP_BP_HBOND);
+		const NV sag = opt_nv(aTHX_ o, "base_pair_stagger", CSP_BP_STAGGER);
+		if (hb <= 0.0) croak("%s: base_pair_hbond must be a positive number", who);
+		if (sag < 0.0) croak("%s: base_pair_stagger must not be negative", who);
+		bp = base_pairs(aTHX_ &s, hb, sag, store);
+		sv_2mortal((SV *)bp);
 	}
 
 	//the result hash is built last, so that nothing between here and the return
@@ -4443,6 +4963,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	}
 	if (want_pi) (void)hv_stores(out, "pi_stacking", newRV_inc((SV *)pi));
 	if (want_ss) (void)hv_stores(out, "disulfides", newRV_inc((SV *)ss));
+	if (want_bp) (void)hv_stores(out, "base_pairs", newRV_inc((SV *)bp));
 	if (want_cont) (void)hv_stores(out, "contacts", newRV_inc((SV *)cont));
 	if (want_hb) (void)hv_stores(out, "hbonds", newRV_inc((SV *)hb));
 	LEAVE;

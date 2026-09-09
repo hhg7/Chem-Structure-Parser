@@ -220,7 +220,7 @@ ok(@over <= $chains_with_seqres / 20,
 	# the largest van der Waals radius in the table is francium's 3.48 A, so no
 	# atom's accessible sphere can be larger than this whatever it is made of
 	my $cap = 4 * atan2(1, 0) * 2 * (3.48 + 1.4) ** 2;
-	my ($n_ring_pairs, $checked_features) = (0, 0);
+	my ($n_ring_pairs, $checked_features, $n_puckers, $n_pairs) = (0, 0, 0, 0);
 	for my $file (@some) {
 		my $name = (split m{/}, $file)[-1];
 		my $info = structure_info($file);
@@ -251,6 +251,32 @@ ok(@over <= $chains_with_seqres / 20,
 					"$name: $r->{resname} $rk has a believable relative accessibility")
 					if $r->{rsa} < 0 || $r->{rsa} >= 3;
 			}
+			# The sugar pucker, where there is one, against what it is by
+			# construction rather than against a reference: the phase is an
+			# atan2 mapped into 0 to 360, the amplitude is a ring torsion
+			# divided by the cosine of that and Altona and Sundaralingam's
+			# convention makes it positive, the name is the phase binned in
+			# tens of degrees, and there are five nu or there is no pucker.
+			# Whether the numbers are right is t/features.t's question.
+			for my $rk (@{ $c->{residue_order} }) {
+				my $r = $c->{residues}{$rk};
+				next unless defined $r->{pucker_phase};
+				my @name = ("C3'-endo", "C4'-exo", "O4'-endo", "C1'-exo", "C2'-endo",
+				            "C3'-exo", "C4'-endo", "O4'-exo", "C1'-endo", "C2'-exo");
+				my $where = "$name: $r->{resname} $cid/$rk";
+				$n_puckers++;
+				die "$where: pucker phase $r->{pucker_phase} is outside 0 to 360"
+					unless $r->{pucker_phase} >= 0 && $r->{pucker_phase} < 360;
+				die "$where: pucker amplitude $r->{pucker_amplitude} is not positive"
+					unless $r->{pucker_amplitude} > 0;
+				die "$where: pucker '$r->{pucker}' is not the name for that phase"
+					unless $r->{pucker} eq $name[ int($r->{pucker_phase} / 36) ];
+				die "$where: a pucker without five ring torsions"
+					unless $r->{nu} && @{ $r->{nu} } == 5;
+				die "$where: glycosidic '$r->{glycosidic}' does not match chi $r->{chi}"
+					if defined $r->{chi}
+					&& $r->{glycosidic} ne (abs($r->{chi}) <= 90 ? 'syn' : 'anti');
+			}
 			die "$name: chain $cid does not add up" if abs($residues - $c->{sasa}) > 1e-5;
 		}
 		cmp_ok(abs($atoms - $f->{sasa}{total}) / ($f->{sasa}{total} || 1), '<', 1e-9,
@@ -270,6 +296,51 @@ ok(@over <= $chains_with_seqres / 20,
 		              + ($bb->{ymax} - $bb->{ymin}) ** 2
 		              + ($bb->{zmax} - $bb->{zmin}) ** 2);
 		cmp_ok($f->{rg}, '<', $diag, "$name: which is smaller than the bounding box diagonal");
+
+		# The base pairs, again against what they are by construction: the two
+		# residues are not the same one, every hydrogen bond and the stagger are
+		# inside the thresholds the answer was found with, the Saenger type
+		# matches the two letters, and both residues carry the pair.  Whether
+		# the pairs are the right ones is t/features.t's question, against the
+		# archive's own annotation.
+		{
+			my %res;
+			for my $cid (@{ $info->{chain_order} }) {
+				my $c = $info->{chains}{$cid};
+				$res{"$cid/$_"} = $c->{residues}{$_} for @{ $c->{residue_order} };
+			}
+			my %saenger = ('G-C' => 19, 'C-G' => 19, 'A-U' => 20, 'U-A' => 20,
+			               'A-T' => 20, 'T-A' => 20, 'G-U' => 28, 'U-G' => 28,
+			               'G-T' => 28, 'T-G' => 28);
+			for my $bp (@{ $f->{base_pairs} }) {
+				my $k1 = "$bp->{chain1}/$bp->{residue1}";
+				my $k2 = "$bp->{chain2}/$bp->{residue2}";
+				my $where = "$name: base pair $k1 $k2";
+				$n_pairs++;
+				die "$where: a residue paired with itself" if $k1 eq $k2;
+				die "$where: type '$bp->{type}' is not a canonical pair"
+					unless $saenger{ $bp->{type} };
+				die "$where: type $bp->{type} is not Saenger $bp->{saenger}"
+					unless $saenger{ $bp->{type} } == $bp->{saenger};
+				die "$where: Saenger $bp->{saenger} wants "
+				  . ($bp->{saenger} == 19 ? 3 : 2) . ' hydrogen bonds'
+					unless @{ $bp->{hbonds} } == ($bp->{saenger} == 19 ? 3 : 2);
+				for my $h (@{ $bp->{hbonds} }) {
+					die "$where: a hydrogen bond of $h->{distance} A"
+						if $h->{distance} > 3.5;
+				}
+				die "$where: a stagger of $bp->{stagger} A" if $bp->{stagger} > 2.6;
+				die "$where: a plane angle of $bp->{plane_angle} degrees"
+					if $bp->{plane_angle} < 0 || $bp->{plane_angle} > 90;
+				for my $end ([ $k1, $bp->{chain2}, $bp->{residue2} ],
+				             [ $k2, $bp->{chain1}, $bp->{residue1} ]) {
+					my ($me, $yc, $yr) = @$end;
+					die "$where: $me does not carry the pair"
+						unless grep { $_->{chain} eq $yc && $_->{residue} eq $yr }
+						       @{ $res{$me}{base_pair} || [] };
+				}
+			}
+		}
 
 		for my $s (@{ $f->{pi_stacking} }) {
 			$n_ring_pairs++;
@@ -353,7 +424,8 @@ ok(@over <= $chains_with_seqres / 20,
 
 	ok($checked_features > 0, 'the physical properties were computed on real structures');
 	diag("computed the properties of $checked_features structures, "
-	   . "$n_ring_pairs stacked ring pairs between them");
+	   . "$n_ring_pairs stacked ring pairs, $n_puckers sugar puckers and "
+	   . "$n_pairs base pairs between them");
 }
 
 diag("checked $checked structures");

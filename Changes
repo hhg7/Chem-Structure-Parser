@@ -1,7 +1,7 @@
 Revision history for Chem-Structure-Parser
 
 
-0.03 2026-09-08 CDT
+0.03 2026-09-09 CDT
 
  - new: the rest of the physical properties, all computed by structure_info()
    on the way past and reachable through $info->{features} or the functions
@@ -44,6 +44,49 @@ Revision history for Chem-Structure-Parser
    - half-sphere exposure: hse_up and hse_down on every standard amino acid
      residue, after Biopython's HSExposureCB.  Exact.
 
+   - nucleic acid torsions: alpha, beta, gamma, delta, epsilon, zeta and the
+     glycosidic chi on every nucleotide, plus nu, the five torsions of the
+     sugar ring, all in degrees.  The atoms of each are the IUPAC-IUB (1983)
+     definitions; the angles agree with mdtraj's compute_dihedrals and gemmi's
+     calculate_dihedral over the same four atoms to 1.9e-4 degrees, which is
+     mdtraj's float32 coordinates, and to the rounding of the frozen file
+     against gemmi.  alpha, epsilon and zeta span two residues and are not
+     measured across a chain break: the two must be joined by a phosphodiester
+     bond first, which is gemmi's are_connected() test at 2.4 A, and
+     phosphodiester_bond is the option that sets it.
+
+   - the sugar pucker: pucker_phase, pucker_amplitude and the envelope name
+     pucker on every nucleotide, by Altona and Sundaralingam's (1972)
+     pseudorotation equations, and glycosidic, which says whether the base is
+     anti or syn.  This is the number that tells an A-form helix from a B-form
+     one, and it does: every ribose of the new rna.pdb is C3'-endo and every
+     deoxyribose of the new duplex.pdb is in the southern half of the cycle.
+
+   - the two numbers a nucleic acid sequence answers: gc_fraction and
+     purine_fraction on the structure and on every DNA or RNA chain, with
+     base_counts, n_gc and nucleotide_length beside them.  Which letters count
+     is Bio.SeqUtils.gc_fraction()'s default, so an ambiguous base is in
+     neither half of the fraction rather than counted as something it is not.
+
+   - new: structure_base_pairs(), the Watson-Crick and wobble base pairs the
+     coordinates show, with the hydrogen bonds, the centroid separation, the
+     plane angle and the stagger each was found by, and base_pair on both of
+     the residues.  Three pair types, numbered as Saenger (1984) numbers them:
+     19 for G-C, 20 for A-U and A-T, 28 for the G-U wobble and the G-T that is
+     the same pair in DNA.
+
+     This is the one property in the module with no reference implementation to
+     compare against -- mdtraj, gemmi and Biopython all stop short of base
+     pairing -- so it is measured against the annotation the wwPDB deposits
+     with the entry, which is 3DNA's.  Over the forty archive entries that
+     carry an _ndb_struct_na_base_pair loop it finds all 1354 of the annotated
+     pairs that are between two unmodified bases and misses none.  Eleven of
+     the eighteen it does not see have a modified base on one side and seven
+     are pairs with a crystallographic symmetry mate; two are found that the
+     annotation does not list, and both are argued in the documentation rather
+     than tuned away.  base_pair_hbond and base_pair_stagger move the two
+     thresholds; base_pairs => 0 skips the work.
+
  - a torsion angle and a Kabsch-Sander amide hydrogen are no longer measured
    across a chain break.  mdtraj takes the residue before this one to be
    whichever came before it in the file and computes a phi, or places a
@@ -56,6 +99,15 @@ Revision history for Chem-Structure-Parser
    that hold an alpha helix, a 3-10 helix, two strands and the turns between
    them.  Without the second, the hydrogen bonds and the secondary structure
    would have had almost nothing in t/data to be tested on.
+
+ - and rna.pdb, duplex.pdb and wobble.pdb, likewise with their twins: six
+   nucleotides of 1MSY's GUAA tetraloop, which is where the riboses are, four
+   base pairs of 1BNA, the Drew-Dickerson dodecamer, which is where B-form DNA
+   is, and twelve nucleotides of 1MSY's lower helix, which is where the wobble
+   is.  bases.pdb is a single DNA strand and has no O2' in it, so without the
+   first two the nucleic acid torsions would have been tested on half of what
+   they say; the third holds all three of the pair types base_pairs() looks for
+   and one that it has to leave alone.
 
  - structure.info.pl gains --ss, one row per disulfide with what the file
    declares beside it.
@@ -153,6 +205,14 @@ Revision history for Chem-Structure-Parser
 
  - structure.info.pl gains --features, one tab separated row of properties per
    structure, and --stacks, one row per stacked pair.
+
+ - removed: pdb_info() and cif_info().  Each was structure_info() with
+   format => 'pdb' or format => 'mmcif' filled in, and nothing else -- no
+   option, no error and no answer of their own -- so the two names bought a
+   reader nothing but the question of whether they differed.  Detection costs
+   nothing to skip: it reads the file only when the name says nothing at all.
+   Call structure_info($file, format => 'pdb') where you called pdb_info($file),
+   and structure_info($file, format => 'mmcif') where you called cif_info($file).
 
  - the release notes are no longer generated from README.md.  They lived in
    three places at once -- the README, the module's POD and this file -- and

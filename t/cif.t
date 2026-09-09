@@ -267,7 +267,7 @@ for my $opt ([ { hydrogens => 0 },        'hydrogens => 0' ],
 }
 
 #--------------------------------------------------------------------
-# getting there: detection, the named entry points, strings, gzip
+# getting there: detection, naming the format, strings, gzip
 #--------------------------------------------------------------------
 {
 	is_deeply([ formats() ], [ 'mmcif', 'pdb' ], 'formats() lists both');
@@ -284,16 +284,15 @@ for my $opt ([ { hydrogens => 0 },        'hydrogens => 0' ],
 	throws_ok { structure_info("$data/mini.cif", format => 'nonsense') }
 		qr/unrecognized format/, 'a format that does not exist still dies';
 
-	is(cif_info("$data/mini.cif")->{format}, 'mmcif', 'cif_info() reads an mmCIF');
-	is(pdb_info("$data/mini.pdb")->{format}, 'pdb',   'pdb_info() still reads a PDB');
-	is_deeply(coords(cif_info("$data/mini.cif")), coords(structure_info("$data/mini.cif")),
-		'cif_info() and structure_info() agree about a file they both read');
+	is_deeply(coords(structure_info("$data/mini.cif", format => 'mmcif')),
+	          coords(structure_info("$data/mini.cif")),
+		'naming the format and letting it be detected give the same structure');
 
-	# cif_info() and pdb_info() are the caller saying which format this is, and
-	# saying so wrongly reads no atoms rather than dying -- the same as
-	# format => 'pdb' on anything else, which t/errors.t pins down.  It is why
-	# neither of them is the usual way in: structure_info() works it out.
-	is(cif_info("$data/mini.pdb")->{stats}{n_atoms}, 0,
+	# format => is the caller saying which format this is, and saying so wrongly
+	# reads no atoms rather than dying -- the same as format => 'pdb' on anything
+	# else, which t/errors.t pins down.  It is why naming it is not the usual way
+	# in: structure_info() works it out.
+	is(structure_info("$data/mini.pdb", format => 'mmcif')->{stats}{n_atoms}, 0,
 		'a PDB read as mmCIF because it was told to yields nothing, rather than nonsense');
 	is(structure_info("$data/mini.pdb")->{format}, 'pdb',
 		'while structure_info() looks at the file and gets it right');
@@ -386,14 +385,14 @@ for my $opt ([ { hydrogens => 0 },        'hydrogens => 0' ],
 # thought to check.  The stacked-ring list carries the depositor's chain ids and
 # residue keys, which is what makes it comparable at all: an mmCIF file's
 # label_asym_id would have named these chains something else.
-for my $stem (qw(mini stack bases nmr bare)) {
+for my $stem (qw(mini stack bases rna duplex wobble nmr bare)) {
 	my $pdb = structure_features(structure_info("$data/$stem.pdb"));
 	my $cif = structure_features(structure_info("$data/$stem.cif"));
 	is_deeply($cif, $pdb, "$stem: the two formats give the same physical properties");
 }
 
 # and what was written into the structures matches down to the atom
-for my $stem (qw(mini stack bases)) {
+for my $stem (qw(mini stack bases rna duplex wobble)) {
 	my $pdb = structure_info("$data/$stem.pdb");
 	my $cif = structure_info("$data/$stem.cif");
 	structure_features($_) for $pdb, $cif;
