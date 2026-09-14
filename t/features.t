@@ -887,6 +887,80 @@ for my $c (@gcfrac) {
 		'and every base of the RNA is anti about its glycosidic bond');
 }
 
+# ---- the chain's view of the same torsions -------------------------------
+#
+# Every angle written onto a residue above is also gathered onto its chain, one
+# array per torsion, parallel to the chain's residue_order.  Nothing new is
+# measured, so there is no other reader to ask: what is checked is that the two
+# views hold the same numbers in the same order, which is the whole claim.
+{
+	# every key the chain arrays can carry, so that a chain holding one this
+	# does not know about is a failure rather than something nobody looked at
+	my @all = qw(phi psi omega chi alpha beta gamma delta epsilon zeta
+	             nu pucker pucker_phase pucker_amplitude glycosidic);
+
+	# the two kinds of chain, and which of those keys each should end up with
+	my %want = (
+		'fold.pdb' => [ qw(phi psi omega chi) ],
+		'rna.pdb'  => [ qw(alpha beta gamma delta epsilon zeta chi nu
+		                   pucker pucker_phase pucker_amplitude glycosidic) ],
+	);
+
+	for my $file (sort keys %want) {
+		my $info = structure_info(File::Spec->catfile($dir, $file));
+		for my $cid (@{ $info->{chain_order} }) {
+			my $c = $info->{chains}{$cid};
+			my $t = $c->{torsions};
+			ok($t, "$file: chain $cid has a torsions hash") or next;
+			is_deeply([ sort keys %$t ], [ sort @{ $want{$file} } ],
+				"$file: chain $cid carries exactly the torsions its residues have");
+			for my $key (@all) {
+				# a key no residue has is absent, not an array of undefs
+				my @res = map { $c->{residues}{$_}{$key} }
+				          @{ $c->{residue_order} };
+				unless (grep { defined } @res) {
+					ok(!exists $t->{$key},
+						"$file: chain $cid has no $key, because no residue of it does");
+					next;
+				}
+				is(scalar @{ $t->{$key} }, scalar @{ $c->{residue_order} },
+					"$file: chain $cid $key is one element per residue");
+				is_deeply($t->{$key}, \@res,
+					"$file: chain $cid $key is what its residues say, in residue_order");
+			}
+		}
+	}
+
+	# a residue with no phi -- the first of the chain -- holds an undef in the
+	# array rather than shortening it, which is what keeps the index meaningful
+	my $fold = structure_info(File::Spec->catfile($dir, 'fold.pdb'));
+	my $ch = $fold->{chains}{A};
+	ok(!defined $ch->{torsions}{phi}[0],
+		'the first residue of a chain has an undef where its phi would be');
+	ok(defined $ch->{torsions}{phi}[1], '... and the second has its phi');
+	ok(!defined $ch->{torsions}{psi}[ $#{ $ch->{residue_order} } ],
+		'and the last residue has no psi, for the same reason');
+
+	# chi is one list per residue, and the chain names the residue's own list
+	# rather than a copy of it
+	is($ch->{torsions}{chi}[0], $ch->{residues}{ $ch->{residue_order}[0] }{chi},
+		'a chi in the chain array is the same list the residue has');
+
+	# asking twice replaces the answer rather than adding to it
+	my $n = scalar @{ $ch->{torsions}{phi} };
+	structure_features($fold);
+	is(scalar @{ $fold->{chains}{A}{torsions}{phi} }, $n,
+		'asking a second time replaces the arrays rather than extending them');
+
+	# store => 0 computes no torsions at all, so there is nothing to gather
+	my $bare = structure_info(File::Spec->catfile($dir, 'fold.pdb'), features => 0);
+	ok(!exists $bare->{chains}{A}{torsions},
+		'features => 0 leaves no torsions hash on the chain');
+	structure_features($bare, store => 0);
+	ok(!exists $bare->{chains}{A}{torsions},
+		'... and store => 0 does not put one there either');
+}
+
 # ---- the base pairs, against the archive's own annotation -----------------
 #
 # No reader on this machine finds base pairs, so the answer comes from the

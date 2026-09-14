@@ -1,7 +1,7 @@
 Revision history for Chem-Structure-Parser
 
 
-0.03 2026-09-09 CDT
+0.03 2026-09-14 CDT
 
  - new: the rest of the physical properties, all computed by structure_info()
    on the way past and reachable through $info->{features} or the functions
@@ -19,7 +19,12 @@ Revision history for Chem-Structure-Parser
      the first one cost.  interface => 0 turns it off.
 
    - torsion angles: phi, psi, omega and chi1 to chi5 on every residue, in
-     degrees, after mdtraj's compute_phi and its relatives.
+     degrees, after mdtraj's compute_phi and its relatives.  Every one of them
+     is gathered onto its chain as well, as $chain->{torsions}{phi} and its
+     relatives: one array per angle, parallel to the chain's residue_order,
+     with an undef where a residue has no such angle.  That is the form a
+     Ramachandran plot or a rotamer census wants, and it is the same option --
+     dihedrals => 0 leaves it off with the angles themselves.
 
    - new: structure_contacts(), which residues touch which, after mdtraj's
      compute_contacts() with its closest-heavy scheme; n_contacts on every
@@ -249,6 +254,11 @@ Revision history for Chem-Structure-Parser
    the POD copy was a hundred and fifty lines of history in the middle of the
    reference documentation.  This file is now written by hand and md2pod.pl
    only checks it.
+
+ - one fewer prerequisite: autodie is no longer required.  It was there to
+   check five calls -- two opens, a read and two closes -- and those are now
+   checked where they are made, dying in autodie's own words, so a failure
+   says exactly what it used to say.  Nothing a caller can see changes.
 
 0.02 2026-08-22 CDT
 

@@ -277,6 +277,48 @@ changing anything it touches.
   that function, move it to `PerlIO_open`/`PerlIO_read`/`PerlIO_error` rather
   than adding more stdio around it.
 
+## The Perl half behaves as though `autodie` were loaded, and it is not
+
+`lib/Chem/Structure/Parser.pm` does not `use autodie`, and must not: it is one
+more runtime prerequisite on every installer's machine for a handful of calls,
+and `dist.ini` and `Makefile.PL` no longer ask for it. What it was there to
+prevent is still prevented, by hand.
+
+- **Every fallible builtin is checked at its call site.** `open`, `close`,
+  `read`, `sysread`, `seek`, `opendir`, `mkdir`, `rename`, `unlink` — anything
+  in autodie's `:default` — gets an `or die` (or a `defined ... or die` where
+  `0` is a legitimate return, as it is for `read`). A call whose failure would
+  otherwise return false quietly and let the code carry on with an empty string
+  is exactly the bug autodie existed to stop, and it is not allowed back in
+  because the pragma is gone. Adding an unchecked `open` is a defect, not a
+  shortcut.
+- **Die in autodie's words**, so the message a user sees does not change with
+  the pragma's absence: name the operation, what it was given, and `$!` in
+  quotes — `die "Can't open '$file' with mode '<:raw': '$!'"`. Where autodie
+  would have printed nothing more useful than a `GLOB(0x55f…)` — `close` and
+  `read` do — name the file instead; the point of the wording is that it is
+  recognisable, not that it is bug-compatible. Perl appends `at FILE line N.`
+  to a `die` without a trailing newline, which is where autodie put the same
+  information, so the location survives too.
+- **`croak` where the caller's line is the useful one.** The rest of the module
+  already croaks for an argument it will not accept (`structure_info: 'file'
+  does not exist`); a failed `open` on a file the caller named belongs to the
+  caller in the same way. Use `die` only inside the private helpers, where the
+  module's own line is what a bug report needs.
+- **A method call was never autodie's job.** `IO::Uncompress::Gunzip->new` and
+  `$z->read` are not builtins and were unchecked even when the pragma was
+  loaded, which is why `_slurp_maybe_gzipped()` checks them itself. Keep that
+  up: a new dependency's failure return is checked whether or not anything else
+  on the line is.
+- The author-only helpers in the distribution root (`md2pod.pl`, `use.pl`,
+  `benchmark.pl`, `structure.info.pl`, `test.all.perls.pl`) may keep `use
+  autodie` — they are not shipped, so they cost an installer nothing. So may
+  `t/data/generate.pl`, `t/data/features.pl` and `t/data/oracle.pl`, which are
+  shipped but are run by hand: no `.t` file executes them, they only name them
+  in a diagnostic, so `make test` on a smoker never loads the pragma. Nothing
+  under `t/*.t` uses it, and `t/errors.t`'s `open ... or die $!` is the form to
+  follow.
+
 ## Tests come from other people's readers, not from this one
 
 If a claim about the format has an equivalent in a reader someone else wrote,
@@ -392,9 +434,9 @@ The fast check, which does not clobber the current `Makefile`: generate the
 `-std=c99` (not `gnu99`) is the closest local proxy for a vendor compiler:
 compile the generated `.c` with it when in doubt. It must stay clean.
 
-### Windows, Solaris and every BSD
+### Cygwin, Windows, Solaris and every BSD
 
-There is no local Windows, Solaris, illumos or BSD perl, so this is discipline
+There is no local Cygwin, Windows, Solaris, illumos or BSD perl, so this is discipline
 applied while writing, not something a run here will catch.
 
 - Keep the `_GNU_SOURCE` / `__EXTENSIONS__` block at the top of `Parser.xs`

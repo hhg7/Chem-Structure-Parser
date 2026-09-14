@@ -73,12 +73,14 @@ WriteMakefile(
 	CONFIGURE_REQUIRES => {
 		'ExtUtils::MakeMaker' => 6.52,
 	},
+	# "autodie" is deliberately absent: the module checks the calls the pragma
+	# would have checked, in its own words, rather than asking every installer
+	# for it.  Kept in step with the [Prereqs] block in dist.ini.
 	PREREQ_PM => {
 		'Carp'         => 0,
 		'Exporter'     => 0,
 		'Scalar::Util' => 0,
 		'XSLoader'     => 0,
-		'autodie'      => 0,
 	},
 	TEST_REQUIRES => {
 		'Test::More'      => 0,

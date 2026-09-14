@@ -4,12 +4,31 @@ use 5.044;
 no source::encoding;
 use warnings FATAL => 'all';
 use autodie ':default';
-use DDP {output => 'STDOUT', array_max => 10, show_memsize => 1};
-use Devel::Confess 'color';
 use Chem::Structure::Parser;
+use Util;
 #use Util;
 #qw(json_file_to_ref ref_to_json_file);
 #~/.local/share/libgedit-gtksourceview-300/language-specs/perl.lang
 
-my $f = structure_info('157d.pdb');
-p $f;
+#my $f = structure_info('157d.pdb');
+#st $f->{chains}{A};
+
+# bare.pdb is the coordinates-and-nothing-else fixture: its atoms are 5.2 A
+# apart and all on one straight line, so no residue is peptide-bonded to the
+# next and no torsion is defined.  fold.pdb is a real backbone.
+my $s = structure_info('t/data/fold.pdb');
+foreach my $chain (sort keys %{ $s->{chains} }) {
+	my $c = $s->{chains}{$chain};
+	my $t = $c->{torsions};	# one array per angle, by residue_order
+	foreach my $i (0 .. $#{ $c->{residue_order} }) {
+		my $r = $c->{residue_order}[$i];
+		printf "%s %4s %-3s  phi %8s  psi %8s  omega %8s  chi %s\n",
+			$chain, $r, $c->{residues}{$r}{resname},
+			map({ defined $_ ? sprintf('%.1f', $_) : '-' }
+				$t->{phi}[$i], $t->{psi}[$i], $t->{omega}[$i]),
+			defined $t->{chi}[$i]
+				? join ', ', map { defined $_ ? sprintf '%.1f', $_ : '-' } @{ $t->{chi}[$i] }
+				: '-';
+	}
+}
+p $s->{chains};

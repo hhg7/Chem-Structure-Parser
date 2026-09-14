@@ -4392,6 +4392,71 @@ static void nuc_torsions(pTHX_ HV *CSP_RESTRICT me, HV *CSP_RESTRICT my_at,
 	}
 }
 
+/*chain_torsions() -- the same angles again, as one array per torsion.
+
+The block above writes each angle onto the residue it belongs to, which is where
+a question about one residue is asked.  A question about the chain -- a
+Ramachandran plot, a rotamer census, the mean of an angle along a helix -- wants
+them as columns instead, so they are gathered onto the chain as well, under
+`torsions': $info->{chains}{A}{torsions}{phi} and its relatives.
+
+Each array runs parallel to the chain's `residue_order', one element per residue
+in the order the walk saw them, and a residue with no such torsion holds an
+undef rather than being left out -- the position is what says which residue a
+value came from, and a compacted array would lose that.  A key no residue in the
+chain has at all is absent instead, so a protein chain carries phi, psi, omega
+and chi and a nucleic acid one alpha to zeta, and neither carries eleven arrays
+of nothing.
+
+The elements are copies of the residues' scalars, so writing to one does not
+reach back; `chi' and `nu' copy the reference, which means the chain and the
+residue name one list between them, as two references to a thing always do.*/
+
+/*every key the torsions above write onto a residue: the amino acid ones, then
+the nucleotide ones, which are nuc_keys[] with the chi the two kinds share
+lifted out of it*/
+static const char *const tors_name[] = {
+	"phi", "psi", "omega", "chi",
+	"alpha", "beta", "gamma", "delta", "epsilon", "zeta",
+	"nu", "pucker", "pucker_phase", "pucker_amplitude", "glycosidic"
+};
+#define NTORS ((unsigned short int)(sizeof tors_name / sizeof *tors_name))
+
+static void chain_torsions(pTHX_ HV *CSP_RESTRICT chain,
+                           HV *CSP_RESTRICT *CSP_RESTRICT res, UV n)
+{
+	HV *out = newHV();
+	AV *col[NTORS];
+	STRLEN len[NTORS];
+	bool any[NTORS];   //FALSE until some residue turns out to have the key
+	unsigned short int k;
+	UV i;
+
+	for (k = 0; k < NTORS; k++) {
+		col[k] = newAV();
+		len[k] = strlen(tors_name[k]);
+		any[k] = FALSE;
+		//n undefs, of which the loop below fills in the ones there are
+		if (n) av_fill(col[k], (SSize_t)n - 1);
+	}
+	for (i = 0; i < n; i++)
+		for (k = 0; k < NTORS; k++) {
+			SV *v = hvf_sv(aTHX_ res[i], tors_name[k], len[k]);
+			if (!v) continue;
+			(void)av_store(col[k], (SSize_t)i, newSVsv(v));
+			any[k] = TRUE;
+		}
+	for (k = 0; k < NTORS; k++) {
+		if (any[k])
+			(void)hv_store(out, tors_name[k], (I32)len[k],
+			               newRV_noinc((SV *)col[k]), 0);
+		else
+			SvREFCNT_dec((SV *)col[k]);
+	}
+	//replaced whole rather than added to, so that asking twice gives one answer
+	(void)hv_stores(chain, "torsions", newRV_noinc((SV *)out));
+}
+
 /*dihedrals() -- every torsion angle of every residue, written onto the residue.
 
 Degrees, in -180 to 180, which is what the rest of the module reports an angle
@@ -4403,7 +4468,11 @@ how the pseudorotation cycle is read.
 One loop for both kinds of residue: the protein torsions and the nucleic ones
 want the same three residue hashes and the same two link tests, and a residue is
 one or the other, so asking twice would be walking twice.  `bond' is the peptide
-cutoff and `phospho' the phosphodiester one.*/
+cutoff and `phospho' the phosphodiester one.
+
+Each chain is then handed to chain_torsions(), which collects what its residues
+were just given into one array per angle; that is the same walk again, on one
+chain's worth of residue hashes, rather than a second pass over the structure.*/
 static void dihedrals(pTHX_ structset *CSP_RESTRICT s, NV bond, NV phospho)
 {
 	static const char *const phi_n[4]   = { "C", "N", "CA", "C" };
@@ -4465,6 +4534,9 @@ static void dihedrals(pTHX_ structset *CSP_RESTRICT s, NV bond, NV phospho)
 			             nucleotide_linked(aTHX_ prev, me, phospho),
 			             nucleotide_linked(aTHX_ me, next, phospho));
 		}
+		//and the chain's own view of what the residues above were given
+		chain_torsions(aTHX_ s->chain_hv[c], s->res_hv + s->chain_first[c],
+		               s->chain_last[c] - s->chain_first[c]);
 	}
 }
 

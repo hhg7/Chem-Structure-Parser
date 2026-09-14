@@ -5,8 +5,10 @@ use strict;
 package Chem::Structure::Parser;
 our $VERSION = 0.03;
 require XSLoader;
-use autodie ':default';
 use warnings FATAL => 'all';
+# No `use autodie': it would ask every installer for a prerequisite in order to
+# check five calls.  They are checked by hand instead, in autodie's own words,
+# and anything fallible added here must be checked the same way.
 use Exporter 'import';
 use Scalar::Util 'reftype';
 XSLoader::load('Chem::Structure::Parser', $VERSION);
@@ -824,16 +826,20 @@ sub _slurp_maybe_gzipped {
 		$z->close;
 		return $text;
 	}
-	open my $fh, '<:raw', $file;
+	open my $fh, '<:raw', $file
+		or die "Can't open '$file' with mode '<:raw': '$!'";
 	my $text = '';
 	if (defined $limit) {
-		read $fh, $text, $limit;
+		# 0 is a short file rather than a failure, so it is defined() that says
+		# which happened
+		defined(read $fh, $text, $limit)
+			or die "Can't read from '$file': '$!'";
 	} else {
 		local $/;
 		$text = <$fh>;
 		$text = '' unless defined $text;
 	}
-	close $fh;
+	close $fh or die "Can't close '$file': '$!'";
 	return $text;
 }
 
@@ -2206,7 +2212,9 @@ sub _pod_sections {
 	# any other, which listed the version number among the documented functions
 	# until this filtered on the export list.
 	my %exported = map { $_ => 1 } @EXPORT_OK;
-	open my $fh, '<', __FILE__;
+	my $self = __FILE__;
+	open my $fh, '<', $self
+		or die "Can't open '$self' with mode '<': '$!'";
 	my ($in, $name);
 	while (my $l = <$fh>) {
 		if ($l =~ /\A=head2\s+(\S+)/) {
@@ -2227,7 +2235,7 @@ sub _pod_sections {
 		}
 		$sec{$name} .= $l if $in && defined $name;
 	}
-	close $fh;
+	close $fh or die "Can't close '$self': '$!'";
 	s/\A\n+//, s/\n+\z/\n/ for values %sec;
 	return \%sec;
 }
@@ -3035,6 +3043,8 @@ already are:
  $info->{chains}{A}{residues}{54}{phi};             # -127.6   degrees
  $info->{chains}{A}{residues}{54}{psi};             #   20.5
  $info->{chains}{A}{residues}{54}{chi};             # [ -60.6, -82.9 ]
+ $info->{chains}{A}{torsions}{phi};                 # every phi of the chain,
+                                                    # by residue_order
  $info->{chains}{A}{residues}{54}{ss};              # 'E'      or H G I B T S ' '
  $info->{chains}{A}{residues}{54}{ss_simple};       # 'E'      or H or C
  $info->{chains}{A}{residues}{54}{hse_up};          # 12       half-sphere exposure
@@ -3244,7 +3254,7 @@ surface than its neighbours in the archive unless they are taken out.
 <tr>
   <td><code>dihedrals</code></td>
   <td>1</td>
-  <td>phi, psi, omega and chi1-chi5 on an amino acid, alpha to zeta, chi and the pucker on a nucleotide, onto each residue</td>
+  <td>phi, psi, omega and chi1-chi5 on an amino acid, alpha to zeta, chi and the pucker on a nucleotide, onto each residue and, as one array per angle, onto each chain</td>
 </tr>
 <tr>
   <td><code>contacts</code></td>
@@ -3411,6 +3421,32 @@ reason.
 
 C<omega> near zero is a cis peptide bond, which C<< $info-E<gt>{cispep} >> is the
 depositor's own record of — two answers to one question, as with the disulfides.
+
+=head3 The same angles, by chain
+
+Every angle written onto a residue is also gathered onto its chain, one array
+per torsion, which is the form a Ramachandran plot or a rotamer census wants:
+
+ my $t = $info->{chains}{A}{torsions};
+ $t->{phi};       # [ undef, -64.2, -175.0, -127.6, ... ]
+ $t->{psi};       # [ -167.5, 158.8, -149.5, 20.5, ... ]
+ $t->{omega};     # [ -167.3, 177.7, -176.3, -177.5, ... ]
+ $t->{chi};       # [ [ -132.6, -44.5 ], [ 79.3, -89.7 ], undef, ... ]
+
+Each array is parallel to the chain's C<residue_order>, one element per residue,
+so C<< $t-E<gt>{phi}[$i] >> and C<< $info-E<gt>{chains}{A}{residues}{ $c-E<gt>{residue_order}[$i] } >>
+are the same residue. A residue that has no such torsion — the first of a chain
+has no C<phi>, glycine no C<chi> — holds an C<undef> there rather than being left
+out: the position is what says which residue a value came from.
+
+A key no residue in the chain has at all is absent instead, so a protein chain
+carries C<phi>, C<psi>, C<omega> and C<chi>, a nucleic acid one C<alpha> through
+C<zeta> and the pucker, and neither carries a dozen arrays of nothing. The
+elements are copies, except that C<chi> and C<nu> are the residue's own lists
+named a second time.
+
+It is the same option as the angles themselves: C<< dihedrals =E<gt> 0 >> leaves the
+C<torsions> hash off with them, and so does C<< store =E<gt> 0 >>.
 
 A nucleotide gets a different set of torsions from the same option; they are
 below.

@@ -698,6 +698,8 @@ already are:
     $info->{chains}{A}{residues}{54}{phi};             # -127.6   degrees
     $info->{chains}{A}{residues}{54}{psi};             #   20.5
     $info->{chains}{A}{residues}{54}{chi};             # [ -60.6, -82.9 ]
+    $info->{chains}{A}{torsions}{phi};                 # every phi of the chain,
+                                                       # by residue_order
     $info->{chains}{A}{residues}{54}{ss};              # 'E'      or H G I B T S ' '
     $info->{chains}{A}{residues}{54}{ss_simple};       # 'E'      or H or C
     $info->{chains}{A}{residues}{54}{hse_up};          # 12       half-sphere exposure
@@ -783,7 +785,7 @@ surface than its neighbours in the archive unless they are taken out.
 | `base_stacks` | 1 | score how far every nearby pair of bases is stacked |
 | `interface` | 1 | also run the surface on each chain alone, for the buried area |
 | `shape` | 1 | the gyration tensor and the descriptors built from it |
-| `dihedrals` | 1 | phi, psi, omega and chi1-chi5 on an amino acid, alpha to zeta, chi and the pucker on a nucleotide, onto each residue |
+| `dihedrals` | 1 | phi, psi, omega and chi1-chi5 on an amino acid, alpha to zeta, chi and the pucker on a nucleotide, onto each residue and, as one array per angle, onto each chain |
 | `contacts` | 1 | which residues touch which |
 | `exposure` | 1 | half-sphere exposure, onto each amino acid residue |
 | `hbonds` | 1 | backbone hydrogen bonds, by Kabsch and Sander's energy |
@@ -855,6 +857,32 @@ reason.
 
 `omega` near zero is a cis peptide bond, which `$info->{cispep}` is the
 depositor's own record of — two answers to one question, as with the disulfides.
+
+### The same angles, by chain
+
+Every angle written onto a residue is also gathered onto its chain, one array
+per torsion, which is the form a Ramachandran plot or a rotamer census wants:
+
+    my $t = $info->{chains}{A}{torsions};
+    $t->{phi};       # [ undef, -64.2, -175.0, -127.6, ... ]
+    $t->{psi};       # [ -167.5, 158.8, -149.5, 20.5, ... ]
+    $t->{omega};     # [ -167.3, 177.7, -176.3, -177.5, ... ]
+    $t->{chi};       # [ [ -132.6, -44.5 ], [ 79.3, -89.7 ], undef, ... ]
+
+Each array is parallel to the chain's `residue_order`, one element per residue,
+so `$t->{phi}[$i]` and `$info->{chains}{A}{residues}{ $c->{residue_order}[$i] }`
+are the same residue. A residue that has no such torsion — the first of a chain
+has no `phi`, glycine no `chi` — holds an `undef` there rather than being left
+out: the position is what says which residue a value came from.
+
+A key no residue in the chain has at all is absent instead, so a protein chain
+carries `phi`, `psi`, `omega` and `chi`, a nucleic acid one `alpha` through
+`zeta` and the pucker, and neither carries a dozen arrays of nothing. The
+elements are copies, except that `chi` and `nu` are the residue's own lists
+named a second time.
+
+It is the same option as the angles themselves: `dihedrals => 0` leaves the
+`torsions` hash off with them, and so does `store => 0`.
 
 A nucleotide gets a different set of torsions from the same option; they are
 below.
