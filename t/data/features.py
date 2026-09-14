@@ -687,10 +687,9 @@ def main(path):
         ok = linked(t, prev, cur) if (prev is not None and cur is not None) else False
         print('B %d %d %.9f %d' % (int(a), int(d), float(e), int(ok)))
 
-    # Secondary structure, mdtraj's compute_dssp.  See the head of the block in
-    # Parser.xs: this module's assignment is the Kabsch-Sander dictionary and
-    # agrees with mdtraj on most residues but not all, so the test bounds the
-    # disagreement rather than demanding equality.
+    # Secondary structure, mdtraj's compute_dssp.  This module's assignment is
+    # mdtraj's dssp.cpp transcribed, so t/features.t demands equality rather
+    # than bounding a disagreement; see the head of the block in Parser.xs.
     dssp = md.compute_dssp(t, simplified=False)[0]
     for i, v in enumerate(dssp):
         v = v.strip() or '_'

@@ -88,6 +88,39 @@ for my $pair ([ 'mini', 'one of everything' ],
 	is_deeply(structure_sequences($c), structure_sequences($p), "$stem: structure_sequences agrees");
 	is_deeply(structure_sequences("$data/$stem.cif"), structure_sequences("$data/$stem.pdb"),
 		"$stem: structure_sequences agrees when handed the file name");
+	# The secondary structure is the one property whose inputs are not only
+	# coordinates: it wants to know where one chain stops and the next begins,
+	# and the two formats say so differently -- a TER record on one side and
+	# label_asym_id on the other.  Neither is read; the chains are this module's
+	# own, so both files answer the same.
+	is_deeply(structure_dssp($c), structure_dssp($p), "$stem: structure_dssp agrees");
+	is_deeply(structure_info("$data/$stem.cif", 'dssp'),
+	          structure_info("$data/$stem.pdb", 'dssp'),
+		"$stem: and so does structure_info(\$file, 'dssp')");
+}
+
+# The secondary structure over every pair in t/data, not only the three above.
+# It is the one property that asks where a chain stops, and the two formats say
+# so differently -- a TER record on one side, label_asym_id on the other --
+# which makes it the property most likely to come apart across them.  fold.pdb
+# is the one with a fold in it, so it is the one that has letters to compare.
+{
+	opendir(my $dh, $data) or die "$data: $!";
+	my @stems = sort grep { -e "$data/$_.cif" }
+	            map { /\A(.+)\.pdb\z/ ? $1 : () } readdir $dh;
+	closedir $dh;
+	ok(scalar @stems >= 3, 'there are structures in both formats to compare');
+	my $lettered = 0;
+	for my $stem (@stems) {
+		my $d = structure_info("$data/$stem.pdb", 'dssp');
+		is_deeply(structure_info("$data/$stem.cif", 'dssp'), $d,
+			"$stem: the same secondary structure from either format");
+		for my $cid (keys %$d) {
+			$lettered += scalar @{ $d->{$cid}{$_} } for keys %{ $d->{$cid} };
+		}
+	}
+	cmp_ok($lettered, '>', 0,
+		'and there were residues with a letter, so this compared something');
 }
 
 # bare.cif has no _atom_site.type_symbol, as bare.pdb has no element columns,

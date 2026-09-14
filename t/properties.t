@@ -37,6 +37,7 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 	is(structure_contacts($i),    $i->{features}{contacts},    'and structure_contacts its pairs');
 	is(structure_base_stacks($i), $i->{features}{base_stacks}, 'and structure_base_stacks its stacks');
 	is(structure_hbonds($i),      $i->{features}{hbonds},      'and structure_hbonds its bonds');
+	is(structure_dssp($i),        $i->{features}{dssp},        'and structure_dssp its secondary structure');
 	# name any option and it is computed again with that option in force
 	isnt(structure_features($i, probe => 2.0), $i->{features},
 		'naming an option computes again instead');
@@ -514,9 +515,66 @@ for my $pair ([ 'stack.pdb', 'stack.cif' ], [ 'bases.pdb', 'bases.cif' ],
 	structure_features($i);
 }
 
+# ---- the secondary structure roll-up -------------------------------------
+#
+# What the letters *are* is t/features.t's job: it holds every one of them to
+# mdtraj's.  This is the shape of the hash of hashes they are handed back in,
+# and the two ways of asking for it.
+{
+	my $i = structure_info("$data/fold.pdb");
+	my $d = structure_dssp($i);
+	is(ref $d, 'HASH', 'structure_dssp: a hash reference');
+	is_deeply([ sort keys %$d ], [ 'A' ], 'keyed by chain id');
+	ok(scalar keys %{ $d->{A} } > 1, 'and then by DSSP letter');
+	is_deeply([ grep { !/\A[HBEGITS ]\z/ } keys %{ $d->{A} } ], [],
+		'every key is one of the eight letters, coil being a space');
+
+	# the indices are positions in that chain's residue_order, so they index
+	# straight into the chain and into structure_residues()
+	my $order = $i->{chains}{A}{residue_order};
+	my $flat  = structure_residues($i, 'A');
+	my ($ix)  = @{ $d->{A}{H} };
+	is($i->{chains}{A}{residues}{ $order->[$ix] }{ss}, 'H',
+		'an index reaches the residue through residue_order');
+	is($flat->[$ix]{ss}, 'H', 'and the same residue in structure_residues');
+	is_deeply([ @{ $d->{A}{H} } ], [ sort { $a <=> $b } @{ $d->{A}{H} } ],
+		'each list is in residue order');
+
+	# a residue with no backbone has no letter and is in no list
+	my $lettered = grep { defined $_->{ss} } @$flat;
+	my $listed = 0;
+	$listed += scalar @{ $d->{A}{$_} } for keys %{ $d->{A} };
+	is($listed, $lettered, 'every residue with a letter is listed exactly once');
+
+	# structure_info($file, 'dssp') is the same hash asked for on its own, and
+	# dssp => 1 is the same hash left on the structure
+	is_deeply(structure_info("$data/fold.pdb", 'dssp'), $d,
+		"structure_info(\$file, 'dssp') hands back just the roll-up");
+	my $with = structure_info("$data/fold.pdb", dssp => 1);
+	is($with->{dssp}, $with->{features}{dssp}, 'dssp => 1 puts it at $info->{dssp}');
+	is_deeply($with->{dssp}, $d, 'and it is the same answer');
+	ok(!exists $i->{dssp}, 'without the option there is no such key');
+
+	# the view form takes the reader's options after it
+	my $one = structure_info("$data/mini.pdb", 'dssp', chains => ['A']);
+	is_deeply([ sort keys %$one ], [ 'A' ], 'and options after it are the reader\'s');
+
+	throws_ok { structure_info("$data/fold.pdb", 'sasa') }
+		qr/structure_info: 'sasa' is not a view/,
+		'a name that is not a view says so, and says what is';
+	throws_ok { structure_info("$data/fold.pdb", 'dssp', features => 0) }
+		qr/structure_info: 'dssp' needs the features/,
+		'and asking for one with features => 0 does not hand back nothing quietly';
+	throws_ok { structure_info("$data/fold.pdb", 'dssp', atoms => 0) }
+		qr/atoms => 0/, 'nor with atoms => 0';
+	throws_ok { structure_dssp($i, probe => 2) }
+		qr/structure_dssp: unknown option 'probe'/,
+		'structure_dssp takes no options, because there is nothing to tune';
+}
+
 for my $who (qw(structure_features structure_sasa structure_pi_stacking
                 structure_disulfides structure_contacts structure_hbonds
-                structure_base_stacks)) {
+                structure_base_stacks structure_dssp)) {
 	no strict 'refs';
 	throws_ok { &{"Chem::Structure::Parser::$who"}(undef) } qr/\Q$who\E: expected the hash/,
 		"$who refuses undef";

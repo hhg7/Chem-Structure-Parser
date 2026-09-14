@@ -47,10 +47,22 @@ What the structure *is* comes back the same way, in one more call:
     print scalar @{ $f->{pi_stacking} };  # 2    stacked pairs of aromatic rings
 
     print $info->{chains}{A}{residues}{54}{rsa};   # 0.103  PHE 54 is mostly buried
+    print $info->{chains}{A}{residues}{54}{ss};    # 'G'    and it is in a 3-10 helix
 
 which is the Shrake-Rupley surface, the ring geometry, the radii and the masses
 as mdtraj implements them and the two sequence indices as Biopython does. All of
 it is in C, for the same reason the parse is.
+
+The secondary structure comes back the other way round as well, which is the
+shape to take a whole fold in at once:
+
+    my $dssp = structure_info('1a22.ent.pdb', 'dssp');
+
+    print scalar @{ $dssp->{A}{H} };   # 122   residues of chain A in alpha helix
+    print scalar @{ $dssp->{B}{E} };   # 90    and of chain B in a strand
+
+Chain, then DSSP letter, then where in that chain those residues are. It is
+mdtraj's `compute_dssp()` letter for letter — see `structure_dssp`.
 
 The coordinate section is parsed in C, because across a directory of
 structures it is millions of lines: the largest entry in PDBbind v2020 is
@@ -182,11 +194,20 @@ every function here is exported, so Perl parses the bareword as a call to
 ## structure_info
 
     my $info = structure_info($file, %options);
+    my $dssp = structure_info($file, 'dssp', %options);
 
 Reads `$file` and returns a hash reference. The format is worked out from the
 file name — `.pdb`, `.ent`, `.cif`, `.mmcif`, `.pdbx` — and from the first
 records in the file when the name gives nothing away. `.gz` files are read as
 they are, without unpacking to a temporary file.
+
+A plain string in second place names a *view*, and asks for that and nothing
+else: the file is read, the view is taken out of it, and the rest is thrown
+away. There is one view today, `dssp` — see `structure_dssp` below — and the
+options that follow are the reader's, the same ones the first form takes. The
+two forms cannot be confused with one another: a file name followed by an even
+number of arguments is an option list with an odd number of elements, which was
+never anything but a mistake.
 
 ### What comes back
 
@@ -499,6 +520,8 @@ that goes unnoticed until the ten-thousandth file.
     chains    => ['A','B']  read only these chains
     format    => 'pdb'      skip the format detection: 'pdb' or 'mmcif'
                             ('cif', 'pdbx' and 'ent' name the same two)
+    dssp      => 0          also leave the secondary structure roll-up at
+                            {dssp}, where structure_dssp() would find it
 
 Every option is checked. A misspelled one is fatal, because an ignored typo is
 a wrong answer that arrives without a word: `hydrogen => 0` that is quietly
@@ -700,8 +723,8 @@ already are:
     $info->{chains}{A}{residues}{54}{chi};             # [ -60.6, -82.9 ]
     $info->{chains}{A}{torsions}{phi};                 # every phi of the chain,
                                                        # by residue_order
-    $info->{chains}{A}{residues}{54}{ss};              # 'E'      or H G I B T S ' '
-    $info->{chains}{A}{residues}{54}{ss_simple};       # 'E'      or H or C
+    $info->{chains}{A}{residues}{54}{ss};              # 'G'      or H I E B T S ' '
+    $info->{chains}{A}{residues}{54}{ss_simple};       # 'H'      or E or C
     $info->{chains}{A}{residues}{54}{hse_up};          # 12       half-sphere exposure
     $info->{chains}{A}{residues}{54}{n_contacts};      # 13
     $info->{chains}{A}{residues}{23}{disulfide};       # [ { chain, residue, distance } ]
@@ -759,6 +782,7 @@ floor.
 | `base_stacks` | the arrayref `structure_base_stacks()` returns |
 | `contacts` | the arrayref `structure_contacts()` returns |
 | `hbonds` | the arrayref `structure_hbonds()` returns |
+| `dssp` | the hashref `structure_dssp()` returns |
 | `shape` | `gyration_tensor`, `principal_moments`, `asphericity`, `acylindricity`, `anisotropy` |
 
 `rg`, `center` and `center_of_mass` are absent from a structure with no atoms in
@@ -789,7 +813,7 @@ surface than its neighbours in the archive unless they are taken out.
 | `contacts` | 1 | which residues touch which |
 | `exposure` | 1 | half-sphere exposure, onto each amino acid residue |
 | `hbonds` | 1 | backbone hydrogen bonds, by Kabsch and Sander's energy |
-| `secondary` | 1 | secondary structure, onto each residue |
+| `secondary` | 1 | secondary structure, onto each residue and as the `dssp` roll-up |
 | `store` | 1 | write the per-atom, per-residue and per-chain figures into `$info` |
 | `probe` | 1.4 | solvent probe radius, angstrom |
 | `points` | 960 | sphere points per atom, from 1 to 10,000,000 |
@@ -1095,10 +1119,46 @@ This is mdtraj's `kabsch_sander()`, and the two agree exactly: over 1A42, 1A22,
 1AHW and 3AU6 they find the same bonds and the same energies to 4e-5 kcal/mol,
 which is float32 rounding on mdtraj's side.
 
-### Secondary structure
+These are not the bonds the secondary structure is read from. `structure_dssp()`
+builds a second table, to mdtraj's rules rather than to this module's, and the
+two differ by a handful of bonds per structure; the section below says why.
 
-The same bonds, read for the patterns they fall into, give every residue a
-letter — the Kabsch–Sander dictionary:
+## structure_dssp
+
+    my $dssp = structure_dssp($info);
+    my $dssp = structure_info($file, 'dssp');       # the same, from a file
+
+    for my $i (@{ $dssp->{A}{H} }) {                # every helical residue of A
+        my $order = $info->{chains}{A}{residue_order};
+        my $r     = $info->{chains}{A}{residues}{ $order->[$i] };
+        printf "%s%s is in a helix\n", $r->{resname}, $r->{number};
+    }
+
+The secondary structure, chain by chain and letter by letter: a hash of hashes
+whose keys are chain ids and then DSSP letters, and whose values are the
+positions in that chain's `residue_order` of the residues that have the letter,
+in order.
+
+This is `t/data/fold.pdb`, a stretch of carbonic anhydrase II that folds and has
+no strand in it, so five of the eight letters appear:
+
+    {
+        A => {
+            'H' => [ 9, 10, 11, 12 ],               alpha helix
+            'G' => [ 17, 18, 19, 20, 31, 32, 33 ],  3-10 helix
+            'T' => [ 5, 6, 7, 13, 14, 15, ... ],    turns
+            'S' => [ 3, 4, 8, 21, 25, 34 ],         bends
+            ' ' => [ 0, 1, 2, 16, 24, ... ],        coil
+        },
+    }
+
+An index is a position and not a residue number: `residue_order` is what it
+indexes, and so is `structure_residues($info, $chain)`, which is the same
+residues in the same order. A chain with no assigned residue in it is not a key,
+and neither is a letter no residue of the chain has — so a nucleic acid chain,
+or a chain of waters, is simply absent.
+
+The eight letters are the Kabsch–Sander dictionary's:
 
 | letter | what it is |
 | --- | --- |
@@ -1111,19 +1171,57 @@ letter — the Kabsch–Sander dictionary:
 | `S` | bend |
 | ` ` | none of them |
 
-`$residue->{ss}` is that letter and `$residue->{ss_simple}` is the three-state
-reduction of it — `H` for the three helices, `E` for the two sheet letters, `C`
-for everything else. A residue with no backbone gets neither, because it is not
-coil, it is not protein.
+The same assignment is on the residues themselves, which is where to read it
+when you are walking them anyway: `$residue->{ss}` is the letter and
+`$residue->{ss_simple}` is the three-state reduction of it — `H` for the three
+helices, `E` for the two sheet letters, `C` for everything else. A residue with
+no backbone gets neither, because it is not coil, it is not protein.
 
-**This is the one number in the module that does not reproduce its reference
-exactly.** Against mdtraj's `compute_dssp()` it agrees on 96.9% of residues
-eight-state and 98.2% three-state, measured over 1A42, 1A22, 1AHW, 3AU6 and
-1A4K — 3,314 residues. The residual is almost all beta sheet extension: mdtraj's
-implementation joins ladders across bulges, a rule past the 1983 paper's core
-definitions, and this does not. `t/features.t` bounds the disagreement rather
-than asserting equality, and says so where it does. If you need DSSP's exact
-answer, run DSSP.
+There is nothing to tune, so `structure_dssp()` takes no options: DSSP is the
+hydrogen bonds and the two constants Kabsch and Sander chose for them.
+`structure_info($file, dssp => 1)` leaves the same hash at `$info->{dssp}` for a
+caller who wants the structure as well.
+
+### Against mdtraj
+
+This is mdtraj's `compute_dssp()`, letter for letter. It is not the 1983 paper
+read afresh: `mdtraj/geometry/src/dssp.cpp` — itself DSSP 2.2.0 ported by
+Robert T. McGibbon — is transcribed function for function, together with the
+`kabsch_sander()` it calls and the float32 arithmetic both compute in, down to
+the order the four terms of the energy are summed in. `t/features.t` demands
+equality on every residue of every structure in `t/data` rather than bounding a
+disagreement.
+
+Measured over every tenth entry of PDBbind v2020 — 1,011 of the 1,012 read, the
+other being a file mdtraj will not open at all — the two give the same letter
+for all 619,067 residues that have a backbone. Not most of them; all of them.
+
+There is one place where that agreement is luck rather than construction, and it
+is mdtraj's end. It places an amide hydrogen from the residue before in its
+array without checking that that residue has a carbonyl; where it has none,
+`ks_assign_hydrogens()` indexes the coordinate array with -1 and reads whatever
+lies in front of it. What it finds is not a structure, and the hydrogen it
+places from it bonds to nothing — which is what this code does on purpose. If it
+ever found something, the two would part company there.
+
+Two things follow from matching it that are worth knowing about.
+
+The first is that the hydrogen bonds underneath are not the ones
+`structure_hbonds()` reports. Those are the same energy over a table built to
+this module's own rules: a donor has to be peptide-bonded to the residue whose
+carbonyl its hydrogen was placed from. mdtraj asks for no such thing — the
+residue before in its array will do, bonded or not, same chain or not — and DSSP
+is defined on mdtraj's table. A table built to be right and a table built to be
+mdtraj's cannot be the same table, so there are two.
+
+The second is where one chain stops and the next begins, which DSSP needs
+because no turn, bridge or bend may cross a chain. mdtraj starts a new chain at
+every `TER` record and every change of chain id, so a chain's ligands and its
+waters are chains of their own; this module keeps an author chain whole. The
+division is made here instead, by cutting an author chain after the last residue
+of its polymer — which is the same line the `TER` draws, and is drawn from the
+residues themselves rather than from a record only one of the two formats has.
+That is what keeps `1cka.pdb` and `1cka.cif` answering the same.
 
 ## structure_disulfides
 
@@ -1591,7 +1689,7 @@ them where they are installed so the frozen answer cannot go stale.
 | base stacking | Condon, D E; Kennedy, S D; Mort, B C; Kierzek, R; Yildirim, I; Turner, D H (2015) *J Chem Theory Comput* 11(6):2729-2742, section 2.4 | the same authors' `PDB_stacker`, and the paper's own Figure 4 worked on 157D |
 | residue contacts | | `mdtraj.compute_contacts`, `closest-heavy` |
 | backbone hydrogen bonds | Kabsch, W; Sander, C (1983) *Biopolymers* 22(12):2577-637 | `mdtraj.geometry.kabsch_sander` |
-| secondary structure | the same paper | `mdtraj.compute_dssp` — the one place the agreement is not exact; see `structure_hbonds` |
+| secondary structure | the same paper | `mdtraj.compute_dssp` — exactly; see `structure_dssp` |
 | half-sphere exposure | Hamelryck, T (2005) *Proteins* 59(1):38-48 | Biopython's `Bio.PDB.HSExposure.HSExposureCB` |
 | the peptide-bond cutoff | | Biopython's `Bio.PDB.Polypeptide.PPBuilder` `radius` |
 | disulfides | | mdtraj's `Topology.create_disulfide_bonds` rule |
@@ -1613,6 +1711,13 @@ digits, and mdtraj as it ships differs on four atoms of 620, by one sphere point
 each — a point sitting within a float32 ulp of a neighbouring atom's surface is
 accessible at one width and covered at the other.
 
+The secondary structure is the exception, and computes in float32 and nanometre
+as mdtraj does. It is not a number but a letter, and the letter turns on two
+comparisons against constants — an energy below -0.5 kcal/mol is a hydrogen
+bond, a CA-to-CA separation under 0.9 nm is worth testing at all. Computing
+those wider does not make them better; it makes them different, and one bond
+either way is worth several residues' letters.
+
 Three of these are deliberately not what the reference does, and each is argued
 where it is written down. mdtraj computes a torsion angle, and places a Kabsch–
 Sander amide hydrogen, between whichever residues are next to each other in the
@@ -1628,10 +1733,11 @@ them from the geometric centroid; `rg_mass` measures from the centre of mass,
 which is what the quantity means. `rg` takes mdtraj's default of equal weights,
 where the two centres are the same point and the two answers agree exactly.
 
-The last is the secondary structure, which is the only number here that does not
-reproduce its reference: 96.9% agreement eight-state, 98.2% three-state, over
-3,314 residues. It is written up under `structure_hbonds` above, and
-`t/features.t` bounds the disagreement instead of pretending there is none.
+The secondary structure is not one of the three, and is the reason the hydrogen
+bonds are computed twice: `structure_dssp()` wants mdtraj's table, bonds across
+chain breaks and all, because that is the table mdtraj's answer is defined on,
+and `structure_hbonds()` reports the other one. Both are written up under
+`structure_dssp` above.
 
 # What is parsed in C, and why
 

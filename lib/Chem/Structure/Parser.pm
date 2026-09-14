@@ -19,6 +19,7 @@ our @EXPORT_OK = qw(
 	chain_sequence structure_summary is_single_ion
 	structure_features structure_sasa structure_pi_stacking structure_disulfides
 	structure_base_pairs structure_base_stacks structure_contacts structure_hbonds
+	structure_dssp
 	aa3to1 aa1to3 res1 res_type formats h
 );
 our @EXPORT = @EXPORT_OK;
@@ -87,6 +88,7 @@ my %DEFAULT = (
 	anisou    => 0,       # keep ANISOU lines (they double the size of the file)
 	chains    => undef,   # arrayref: read only these chains
 	format    => undef,   # override format detection
+	dssp      => 0,       # also put the secondary structure roll-up at $info->{dssp}
 );
 
 # residues that need no explanation.  Everything else that res_type() calls an
@@ -118,9 +120,26 @@ my $NUM = qr/[0-9]*\.?[0-9]+/;
 
 # Public entry points
 
+# The views structure_info($file, $view) will hand back on their own, and the
+# key each is filed under in $info->{features}.  A second argument that is a
+# plain string is a request for one of these rather than the first half of an
+# option pair, and the two forms cannot be confused: a file and an even number
+# of arguments after it is always an odd-sized option list, which is an error.
+my %VIEW = (dssp => 'dssp');
+
 # structure_info($file, %opt) -- read a structure file into a hash of hashes.
+# structure_info($file, $view, %opt) -- one view of it, and nothing else.
 sub structure_info {
-	my ($file, %opt) = @_;
+	my $file = shift;
+	my $view;
+	if (@_ % 2 == 1 && defined $_[0] && !ref $_[0]) {
+		$view = shift;
+		die "structure_info: '$view' is not a view; the ones there are: "
+		    . join(', ', sort keys %VIEW) . "\nOr did you mean an option? "
+		    . "Those are named pairs: structure_info(\$file, $view => 1)"
+			unless exists $VIEW{$view};
+	}
+	my %opt = @_;
 	die 'structure_info: no file name given' unless defined $file && length $file;
 	die "structure_info: '$file' does not exist"  unless -e $file;
 	die "structure_info: '$file' is a directory"  if -d $file;
@@ -131,7 +150,15 @@ sub structure_info {
 		       . (exists $NOT_YET{$fmt}
 		          ? "$NOT_YET{$fmt} is not implemented yet; formats read today: " . join(', ', sort keys %READER)
 		          : "unrecognized format '$fmt'; formats read today: " . join(', ', sort keys %READER));
-	return $reader->($file, $o);
+	my $info = $reader->($file, $o);
+	return $info unless defined $view;
+	# a view asked for on its own is the whole answer, and asking for one of a
+	# file read with features => 0 or atoms => 0 is a mistake worth saying out
+	# loud rather than an empty hash that reads as a structure with none
+	die "structure_info: '$view' needs the features, and this file was read with "
+	  . (!$o->{atoms} ? 'atoms => 0' : 'features => 0')
+		unless $info->{features};
+	return $info->{features}{ $VIEW{$view} };
 }
 
 # structure_info_string($text, %opt) -- the same, from a string already in hand.
@@ -600,6 +627,20 @@ sub structure_hbonds {
 	return _features($info, $o, 'structure_hbonds')->{hbonds};
 }
 
+# structure_dssp($info) -- the secondary structure, chain by chain and letter by
+# letter.  There is nothing to tune, so there are no options: DSSP is the
+# hydrogen bonds and the two constants Kabsch and Sander chose for them.
+sub structure_dssp {
+	my ($info, %opt) = @_;
+	_check_info($info, 'structure_dssp');
+	return $info->{features}{dssp} if !%opt && $info->{features};
+	my $o = _feature_options(\%opt, 'structure_dssp', []);
+	$o->{$_} = 0 for qw(sasa pi_stacking disulfides base_pairs base_stacks shape
+	                    dihedrals contacts exposure hbonds);
+	$o->{secondary} = 1;
+	return _features($info, $o, 'structure_dssp')->{dssp};
+}
+
 # structure_disulfides($info, %opt) -- the SG-SG pairs close enough to be bonded.
 sub structure_disulfides {
 	my ($info, %opt) = @_;
@@ -967,6 +1008,12 @@ sub _build_structure {
 	# be a worse answer than one that quietly has nothing to compute from.
 	$info->{features} = _all_features($info, 'structure_info')
 		if $o->{features} && $o->{atoms};
+
+	# dssp => 1 lifts the secondary structure roll-up out of the features and
+	# puts it where a caller who wants that and not the rest will look for it.
+	# It is the same hash, not a copy: structure_dssp() hands back the same one.
+	$info->{dssp} = $info->{features}{dssp}
+		if $o->{dssp} && $info->{features};
 
 	return $info;
 }
@@ -2299,10 +2346,22 @@ What the structure I<is> comes back the same way, in one more call:
  print scalar @{ $f->{pi_stacking} };  # 2    stacked pairs of aromatic rings
 
  print $info->{chains}{A}{residues}{54}{rsa};   # 0.103  PHE 54 is mostly buried
+ print $info->{chains}{A}{residues}{54}{ss};    # 'G'    and it is in a 3-10 helix
 
 which is the Shrake-Rupley surface, the ring geometry, the radii and the masses
 as mdtraj implements them and the two sequence indices as Biopython does. All of
 it is in C, for the same reason the parse is.
+
+The secondary structure comes back the other way round as well, which is the
+shape to take a whole fold in at once:
+
+ my $dssp = structure_info('1a22.ent.pdb', 'dssp');
+
+ print scalar @{ $dssp->{A}{H} };   # 122   residues of chain A in alpha helix
+ print scalar @{ $dssp->{B}{E} };   # 90    and of chain B in a strand
+
+Chain, then DSSP letter, then where in that chain those residues are. It is
+mdtraj's C<compute_dssp()> letter for letter — see C<structure_dssp>.
 
 The coordinate section is parsed in C, because across a directory of
 structures it is millions of lines: the largest entry in PDBbind v2020 is
@@ -2527,11 +2586,20 @@ C<res_type()> before C<h> is ever reached. Use one of the three forms above.
 =head2 structure_info
 
  my $info = structure_info($file, %options);
+ my $dssp = structure_info($file, 'dssp', %options);
 
 Reads C<$file> and returns a hash reference. The format is worked out from the
 file name — C<.pdb>, C<.ent>, C<.cif>, C<.mmcif>, C<.pdbx> — and from the first
 records in the file when the name gives nothing away. C<.gz> files are read as
 they are, without unpacking to a temporary file.
+
+A plain string in second place names a I<view>, and asks for that and nothing
+else: the file is read, the view is taken out of it, and the rest is thrown
+away. There is one view today, C<dssp> — see C<structure_dssp> below — and the
+options that follow are the reader's, the same ones the first form takes. The
+two forms cannot be confused with one another: a file name followed by an even
+number of arguments is an option list with an odd number of elements, which was
+never anything but a mistake.
 
 =head3 What comes back
 
@@ -2844,6 +2912,8 @@ that goes unnoticed until the ten-thousandth file.
  chains    => ['A','B']  read only these chains
  format    => 'pdb'      skip the format detection: 'pdb' or 'mmcif'
                          ('cif', 'pdbx' and 'ent' name the same two)
+ dssp      => 0          also leave the secondary structure roll-up at
+                         {dssp}, where structure_dssp() would find it
 
 Every option is checked. A misspelled one is fatal, because an ignored typo is
 a wrong answer that arrives without a word: C<< hydrogen =E<gt> 0 >> that is quietly
@@ -3045,8 +3115,8 @@ already are:
  $info->{chains}{A}{residues}{54}{chi};             # [ -60.6, -82.9 ]
  $info->{chains}{A}{torsions}{phi};                 # every phi of the chain,
                                                     # by residue_order
- $info->{chains}{A}{residues}{54}{ss};              # 'E'      or H G I B T S ' '
- $info->{chains}{A}{residues}{54}{ss_simple};       # 'E'      or H or C
+ $info->{chains}{A}{residues}{54}{ss};              # 'G'      or H I E B T S ' '
+ $info->{chains}{A}{residues}{54}{ss_simple};       # 'H'      or E or C
  $info->{chains}{A}{residues}{54}{hse_up};          # 12       half-sphere exposure
  $info->{chains}{A}{residues}{54}{n_contacts};      # 13
  $info->{chains}{A}{residues}{23}{disulfide};       # [ { chain, residue, distance } ]
@@ -3178,6 +3248,10 @@ C<structure_features()> yourself.
   <td>the arrayref <code>structure_hbonds()</code> returns</td>
 </tr>
 <tr>
+  <td><code>dssp</code></td>
+  <td>the hashref <code>structure_dssp()</code> returns</td>
+</tr>
+<tr>
   <td><code>shape</code></td>
   <td><code>gyration_tensor</code>, <code>principal_moments</code>, <code>asphericity</code>, <code>acylindricity</code>, <code>anisotropy</code></td>
 </tr>
@@ -3274,7 +3348,7 @@ surface than its neighbours in the archive unless they are taken out.
 <tr>
   <td><code>secondary</code></td>
   <td>1</td>
-  <td>secondary structure, onto each residue</td>
+  <td>secondary structure, onto each residue and as the <code>dssp</code> roll-up</td>
 </tr>
 <tr>
   <td><code>store</code></td>
@@ -3748,10 +3822,46 @@ This is mdtraj's C<kabsch_sander()>, and the two agree exactly: over 1A42, 1A22,
 1AHW and 3AU6 they find the same bonds and the same energies to 4e-5 kcal/mol,
 which is float32 rounding on mdtraj's side.
 
-=head3 Secondary structure
+These are not the bonds the secondary structure is read from. C<structure_dssp()>
+builds a second table, to mdtraj's rules rather than to this module's, and the
+two differ by a handful of bonds per structure; the section below says why.
 
-The same bonds, read for the patterns they fall into, give every residue a
-letter — the Kabsch–Sander dictionary:
+=head2 structure_dssp
+
+ my $dssp = structure_dssp($info);
+ my $dssp = structure_info($file, 'dssp');       # the same, from a file
+
+ for my $i (@{ $dssp->{A}{H} }) {                # every helical residue of A
+     my $order = $info->{chains}{A}{residue_order};
+     my $r     = $info->{chains}{A}{residues}{ $order->[$i] };
+     printf "%s%s is in a helix\n", $r->{resname}, $r->{number};
+ }
+
+The secondary structure, chain by chain and letter by letter: a hash of hashes
+whose keys are chain ids and then DSSP letters, and whose values are the
+positions in that chain's C<residue_order> of the residues that have the letter,
+in order.
+
+This is C<t/data/fold.pdb>, a stretch of carbonic anhydrase II that folds and has
+no strand in it, so five of the eight letters appear:
+
+ {
+     A => {
+         'H' => [ 9, 10, 11, 12 ],               alpha helix
+         'G' => [ 17, 18, 19, 20, 31, 32, 33 ],  3-10 helix
+         'T' => [ 5, 6, 7, 13, 14, 15, ... ],    turns
+         'S' => [ 3, 4, 8, 21, 25, 34 ],         bends
+         ' ' => [ 0, 1, 2, 16, 24, ... ],        coil
+     },
+ }
+
+An index is a position and not a residue number: C<residue_order> is what it
+indexes, and so is C<structure_residues($info, $chain)>, which is the same
+residues in the same order. A chain with no assigned residue in it is not a key,
+and neither is a letter no residue of the chain has — so a nucleic acid chain,
+or a chain of waters, is simply absent.
+
+The eight letters are the Kabsch–Sander dictionary's:
 
 
 
@@ -3804,19 +3914,57 @@ letter — the Kabsch–Sander dictionary:
 
 
 
-C<< $residue-E<gt>{ss} >> is that letter and C<< $residue-E<gt>{ss_simple} >> is the three-state
-reduction of it — C<H> for the three helices, C<E> for the two sheet letters, C<C>
-for everything else. A residue with no backbone gets neither, because it is not
-coil, it is not protein.
+The same assignment is on the residues themselves, which is where to read it
+when you are walking them anyway: C<< $residue-E<gt>{ss} >> is the letter and
+C<< $residue-E<gt>{ss_simple} >> is the three-state reduction of it — C<H> for the three
+helices, C<E> for the two sheet letters, C<C> for everything else. A residue with
+no backbone gets neither, because it is not coil, it is not protein.
 
-B<This is the one number in the module that does not reproduce its reference
-exactly.> Against mdtraj's C<compute_dssp()> it agrees on 96.9% of residues
-eight-state and 98.2% three-state, measured over 1A42, 1A22, 1AHW, 3AU6 and
-1A4K — 3,314 residues. The residual is almost all beta sheet extension: mdtraj's
-implementation joins ladders across bulges, a rule past the 1983 paper's core
-definitions, and this does not. C<t/features.t> bounds the disagreement rather
-than asserting equality, and says so where it does. If you need DSSP's exact
-answer, run DSSP.
+There is nothing to tune, so C<structure_dssp()> takes no options: DSSP is the
+hydrogen bonds and the two constants Kabsch and Sander chose for them.
+C<< structure_info($file, dssp =E<gt> 1) >> leaves the same hash at C<< $info-E<gt>{dssp} >> for a
+caller who wants the structure as well.
+
+=head3 Against mdtraj
+
+This is mdtraj's C<compute_dssp()>, letter for letter. It is not the 1983 paper
+read afresh: C<mdtraj/geometry/src/dssp.cpp> — itself DSSP 2.2.0 ported by
+Robert T. McGibbon — is transcribed function for function, together with the
+C<kabsch_sander()> it calls and the float32 arithmetic both compute in, down to
+the order the four terms of the energy are summed in. C<t/features.t> demands
+equality on every residue of every structure in C<t/data> rather than bounding a
+disagreement.
+
+Measured over every tenth entry of PDBbind v2020 — 1,011 of the 1,012 read, the
+other being a file mdtraj will not open at all — the two give the same letter
+for all 619,067 residues that have a backbone. Not most of them; all of them.
+
+There is one place where that agreement is luck rather than construction, and it
+is mdtraj's end. It places an amide hydrogen from the residue before in its
+array without checking that that residue has a carbonyl; where it has none,
+C<ks_assign_hydrogens()> indexes the coordinate array with -1 and reads whatever
+lies in front of it. What it finds is not a structure, and the hydrogen it
+places from it bonds to nothing — which is what this code does on purpose. If it
+ever found something, the two would part company there.
+
+Two things follow from matching it that are worth knowing about.
+
+The first is that the hydrogen bonds underneath are not the ones
+C<structure_hbonds()> reports. Those are the same energy over a table built to
+this module's own rules: a donor has to be peptide-bonded to the residue whose
+carbonyl its hydrogen was placed from. mdtraj asks for no such thing — the
+residue before in its array will do, bonded or not, same chain or not — and DSSP
+is defined on mdtraj's table. A table built to be right and a table built to be
+mdtraj's cannot be the same table, so there are two.
+
+The second is where one chain stops and the next begins, which DSSP needs
+because no turn, bridge or bend may cross a chain. mdtraj starts a new chain at
+every C<TER> record and every change of chain id, so a chain's ligands and its
+waters are chains of their own; this module keeps an author chain whole. The
+division is made here instead, by cutting an author chain after the last residue
+of its polymer — which is the same line the C<TER> draws, and is drawn from the
+residues themselves rather than from a record only one of the two formats has.
+That is what keeps C<1cka.pdb> and C<1cka.cif> answering the same.
 
 =head2 structure_disulfides
 
@@ -4501,7 +4649,7 @@ them where they are installed so the frozen answer cannot go stale.
 <tr>
   <td>secondary structure</td>
   <td>the same paper</td>
-  <td><code>mdtraj.compute_dssp</code> — the one place the agreement is not exact; see <code>structure_hbonds</code></td>
+  <td><code>mdtraj.compute_dssp</code> — exactly; see <code>structure_dssp</code></td>
 </tr>
 <tr>
   <td>half-sphere exposure</td>
@@ -4574,6 +4722,13 @@ digits, and mdtraj as it ships differs on four atoms of 620, by one sphere point
 each — a point sitting within a float32 ulp of a neighbouring atom's surface is
 accessible at one width and covered at the other.
 
+The secondary structure is the exception, and computes in float32 and nanometre
+as mdtraj does. It is not a number but a letter, and the letter turns on two
+comparisons against constants — an energy below -0.5 kcal/mol is a hydrogen
+bond, a CA-to-CA separation under 0.9 nm is worth testing at all. Computing
+those wider does not make them better; it makes them different, and one bond
+either way is worth several residues' letters.
+
 Three of these are deliberately not what the reference does, and each is argued
 where it is written down. mdtraj computes a torsion angle, and places a Kabsch–
 Sander amide hydrogen, between whichever residues are next to each other in the
@@ -4589,10 +4744,11 @@ them from the geometric centroid; C<rg_mass> measures from the centre of mass,
 which is what the quantity means. C<rg> takes mdtraj's default of equal weights,
 where the two centres are the same point and the two answers agree exactly.
 
-The last is the secondary structure, which is the only number here that does not
-reproduce its reference: 96.9% agreement eight-state, 98.2% three-state, over
-3,314 residues. It is written up under C<structure_hbonds> above, and
-C<t/features.t> bounds the disagreement instead of pretending there is none.
+The secondary structure is not one of the three, and is the reason the hydrogen
+bonds are computed twice: C<structure_dssp()> wants mdtraj's table, bonds across
+chain breaks and all, because that is the table mdtraj's answer is defined on,
+and C<structure_hbonds()> reports the other one. Both are written up under
+C<structure_dssp> above.
 
 =head1 What is parsed in C, and why
 

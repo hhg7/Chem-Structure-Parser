@@ -110,12 +110,23 @@ proportional to the number of atoms.  Measured: 6,432 atoms in 0.16 s and 16,399
 in 0.40 s, which is 25 and 24 microseconds an atom -- flat, where a scan would
 have cost the larger one two and a half times as much per atom.  `t/features.t`
 is what says the two find the *same* neighbours: mdtraj's scan is exhaustive,
-and every atom's surface matches it.  The same grid answers six other
+and every atom's surface matches it.  The same grid answers seven other
 questions -- ring centroids, base centroids, sulphurs, CA atoms, heavy atoms,
-contacts -- and
+contacts, and the CA atoms again for the secondary structure -- and
 the bridge search in the secondary structure avoids one entirely by reading its
 candidates out of the hydrogen bond list, which is linear in the bonds where the
 obvious search is quadratic in the residues.
+
+**The secondary structure counts the hydrogen bonds twice, on purpose.**
+`structure_hbonds()` reports the bonds this module believes in -- a donor has to
+be peptide-bonded to the residue its amide hydrogen was placed from -- and DSSP
+is defined on the ones mdtraj finds, which has no such requirement.  Reusing one
+table for both would mean either reporting bonds across chain breaks or
+answering a different DSSP from mdtraj's, so there are two tables and two grid
+walks.  It costs almost nothing: over 2AGV, 2,248 residues and 15,830 atoms, the
+whole DSSP pass -- the second grid, the second table, the bridges, the ladders,
+the helices, the bends and the hash of hashes -- is 0.021 s against 0.79 s for
+everything the module computes by default, and 0.097 s for the parse itself.
 
 **One walk, not nine.** The structure is a hash of chains of residues of atoms
 and the arithmetic wants flat coordinate arrays, so `structure_features()`

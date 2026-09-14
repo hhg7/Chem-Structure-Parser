@@ -130,6 +130,23 @@ no_leaks_ok { structure_info("$data/empty.cif") } 'nor does an empty one';
 	no_leaks_ok { structure_features($info, disulfides => 0) } 'or without the disulfides';
 	no_leaks_ok { structure_contacts($info) } 'structure_contacts does not leak';
 	no_leaks_ok { structure_hbonds($info) }   'structure_hbonds does not leak';
+	no_leaks_ok { structure_dssp($info) }     'structure_dssp does not leak';
+}
+{
+	# fold.pdb is a real backbone, so this is the secondary structure with
+	# something in it rather than an empty hash of hashes: the roll-up builds an
+	# array per chain per letter and one SV per residue, which is exactly the
+	# shape a reference count goes wrong in
+	my $info = structure_info("$data/fold.pdb");
+	no_leaks_ok { structure_dssp($info) } 'nor does it on a structure with a fold';
+	no_leaks_ok { structure_features($info, store => 0) }
+		'nor with nothing written back onto the residues';
+	no_leaks_ok { structure_info("$data/fold.pdb", 'dssp') }
+		"structure_info(\$file, 'dssp') does not leak";
+	no_leaks_ok { structure_info("$data/fold.pdb", dssp => 1) }
+		'nor does dssp => 1';
+	no_leaks_ok { eval { structure_info("$data/fold.pdb", 'nosuch') } }
+		'nor does a view that is not one';
 	for my $off (qw(shape dihedrals contacts exposure hbonds secondary interface)) {
 		no_leaks_ok { structure_features($info, $off => 0) } "nor does $off => 0";
 	}

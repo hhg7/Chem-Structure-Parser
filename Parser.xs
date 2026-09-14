@@ -4979,232 +4979,816 @@ static AV *hbond_list(pTHX_ structset *CSP_RESTRICT s)
 
 /*Secondary structure, by the Kabsch-Sander dictionary.
 
-DSSP is the hydrogen bonds above and nothing else: it reads the patterns they
-fall into and gives every residue one of eight letters.  Kabsch, W; Sander, C
-(1983) Biopolymers 22(12):2577-637 is the definition and mdtraj's compute_dssp()
-is the implementation checked against.
+DSSP reads the backbone hydrogen bonds and nothing else: it gives every residue
+one of eight letters for the pattern the bonds around it fall into.  Kabsch, W;
+Sander, C (1983) Biopolymers 22(12):2577-637 is the definition.
 
   H  alpha helix: a 4-turn beginning at this residue and the one before it
   G  3-10 helix, from 3-turns; I  pi helix, from 5-turns
-  E  extended strand: a residue in a bridge that has a neighbour in one
-  B  isolated beta bridge: a bridge with no neighbouring bridge
+  E  extended strand: a residue in a beta ladder
+  B  isolated beta bridge: a bridge with no ladder around it
   T  hydrogen-bonded turn: in an n-turn but in none of the above
   S  bend: the chain turns through more than 70 degrees here
      coil: none of them, written as a space
 
-An n-turn at i is a bond from the C=O of i to the N-H of i+n.  A bridge between
-i and j is the four-bond pattern that makes two strands run beside each other,
-parallel or antiparallel.  The order above is the priority: a residue that
-qualifies for two letters gets the earlier one.
+What follows is not the paper read afresh.  It is mdtraj 1.11.1 transcribed
+function for function: mdtraj/geometry/src/dssp.cpp, which is DSSP 2.2.0 ported
+by Robert T. McGibbon, together with the kabsch_sander() it calls out of
+mdtraj/geometry/src/geometry.cpp and the fvec4 those two compute through,
+mdtraj/geometry/include/vectorize_sse.h.  Agreeing with mdtraj letter for letter
+is the point of it, so t/features.t holds it to mdtraj's answer exactly rather
+than to a percentage of it.
 
-Bridges are searched from the bonds rather than over every pair of residues.
-Each of the four patterns names a bond, so every bridge has at least one bond in
-it and the candidates are the handful of pairs each bond can belong to -- which
-turns a search that is quadratic in the residues into one that is linear in the
-bonds.  A ribosome has half a million residues and a few hundred thousand bonds.
+Measured: over every tenth entry of PDBbind v2020 -- 1,011 of the 1,012 read,
+the other being a file mdtraj will not open at all -- the two give the same
+letter for all 619,067 residues that have a backbone.  Not most of them; all of
+them.
 
-Chain boundaries are respected, as mdtraj's DSSP does (it is handed the chain of
-every residue): no turn, bridge or bend reaches across one.*/
-#define SS_COIL  ' '
-#define SS_BEND  'S'
-#define SS_TURN  'T'
-#define SS_PI    'I'
-#define SS_G310  'G'
+There is one place where agreement is luck rather than construction, and it is
+mdtraj's end.  It places an amide hydrogen from the residue before in its array
+without checking that that residue has a carbonyl, so where it has none --
+nco_indices holds -1 -- ks_assign_hydrogens() indexes the coordinate array with
+-1 and reads whatever lies in front of it.  What it finds is not a structure and
+the hydrogen it places from it bonds to nothing, which is what this code does
+deliberately; if it ever found something, the two would part company there.
+
+Nothing here is the hydrogen bonds that structure_hbonds() reports.  Those are
+the same energy over a table built to this module's own rules -- a donor has to
+be peptide-bonded to the residue its hydrogen is placed from -- and the two
+tables differ in a handful of bonds per structure.  DSSP is defined on mdtraj's
+table and is computed from a second one, because a table built to be right and a
+table built to be mdtraj's cannot be the same table.*/
+
+/*The kernel is float, in nanometre.
+
+Everything else in this file computes in NV, so that it is as accurate as the
+perl running it.  This block does not, and the departure is deliberate.  mdtraj
+computes in float32 throughout -- coordinates, distances, energies -- and the
+assignment turns on two comparisons against constants: an energy below
+-0.5 kcal/mol is a bond, and a CA-to-CA separation under 0.9 nm is worth
+testing at all.  Computing them wider does not make them better, it makes them
+different, and a pair that a float32 puts at -0.49999997 and an NV at
+-0.50000001 is a bond in one and not in the other.  One bond is worth several
+residues' letters.  So this rounds where mdtraj rounds:
+
+  * Coordinates arrive as (float)((double)angstrom * 0.1).  That is what
+    mdtraj's PDB reader does -- it parses to double, multiplies by the double
+    nearest 0.1 in mdtraj/utils/unit, and casts the array to float32 -- and it
+    reproduces t.xyz bit for bit.  The cast to double is not decoration: a
+    long-double or __float128 NV multiplied at its own width and then narrowed
+    would round twice and need not land on the same float.
+  * Four products are summed as (p0 + p1) + (p2 + p3), not left to right,
+    because mdtraj reaches them through fvec4's dot3() and dot4(), which are
+    _mm_dp_ps2() -- a software DPPS whose horizontal add is two HADDPS.
+  * Every intermediate is assigned to a named float, and nothing is left to be
+    read back out of a wider expression.  ISO C rounds at an assignment
+    whatever FLT_EVAL_METHOD is, and gcc honours that in an ISO mode; in the
+    -std=gnu99 Makefile.PL asks for it is free not to, and on an x87 target --
+    a 32-bit build -- the wider format is 64 bits of mantissa.  Written this
+    way it comes out the same either way in practice: built with the 32-bit
+    perlbrew perl, which is x87, it gives letter-for-letter the same answer as
+    the x86-64 build over 307 entries of PDBbind v2020.
+
+sqrt() and acos() are called at double and the result cast back to float rather
+than calling sqrtf() and acosf().  For the square root that is exactly mdtraj's
+answer and not an approximation to it: double carries more than twice float's
+mantissa plus two bits, so rounding a correctly-rounded double square root down
+to float is the correctly-rounded float square root, which is what mdtraj's
+_mm_sqrt_ps returns.  acos is not correctly rounded in either width, so that one
+is the same answer to within a last-place bit of the float, on a comparison
+against 70 degrees that a structure would have to be built to sit on.  Neither
+goes through the nv_* macros: there is no NV here, the width is the point, and
+sqrtf()/acosf() are C99 where sqrt() and acos() are C89.*/
+#define SS_COIL   ' '
+#define SS_BEND   'S'
+#define SS_TURN   'T'
+#define SS_PI     'I'
+#define SS_G310   'G'
 #define SS_BRIDGE 'B'
 #define SS_STRAND 'E'
 #define SS_HELIX  'H'
 
-//is the C=O of `a' bonded to the N-H of `d'?  The table keeps two acceptors per
-//donor, so this is two comparisons rather than a search
-static bool ks_bonded(const structset *CSP_RESTRICT s, UV a, UV d)
+#define DSSP_KEEP   2         //acceptors kept per donor
+#define DSSP_CA2    0.81f     //(0.9 nm)^2: a pair further apart is not tested
+#define DSSP_CUTOFF (-0.5f)   //kcal/mol: below this it is a bond
+#define DSSP_FLOOR  (-9.9f)   //kcal/mol: no bond is reported as stronger
+#define DSSP_H      0.1f      //nm: N to the amide hydrogen it is given
+#define DSSP_COUPLE 2.7888f   //332 kcal A/mol * 0.42 * 0.20, as kcal nm/mol
+/*70 degrees in radians, as the double mdtraj's `70 * (M_PI / 180.0)' is.  The
+digits are M_PI's: CSP_PI is an NV and would be a different constant on a
+long-double or a quadmath build, and this comparison is mdtraj's, not this
+file's.*/
+#define DSSP_BEND   (70.0 * (3.14159265358979323846 / 180.0))
+
+//one residue's backbone, in the width and the units the kernel works in
+typedef struct {
+	float n[3], ca[3], c[3], o[3];
+	float h[3];    //the amide hydrogen, placed from the residue before this one
+	bool has_n, has_ca, has_c, has_o;
+	bool whole;    //all four: mdtraj's skip[] is the negation of this
+	bool proline;  //no amide hydrogen of its own: it accepts and never donates
+	bool donor;    //whole, not proline, and a hydrogen was placed for it
+} dssp_res;
+
+//angstrom as this module reads it to nanometre as mdtraj holds it; see the
+//block above for why the double is in the middle
+static float dssp_nm(NV a)
 {
-	if (a >= s->n_res || d >= s->n_res) return FALSE;
-	return s->ks_acc[d * CSP_KS_KEEP] == a || s->ks_acc[d * CSP_KS_KEEP + 1] == a;
+	double d = (double)a * 0.1;
+	return (float)d;
 }
 
-//two residues are in the same chain when the walk put them in one
-static bool same_chain(const structset *CSP_RESTRICT s, UV a, UV b)
+/*The three products of two vectors, summed the way fvec4::dot3() sums them.
+
+No CSP_RESTRICT on the two: dot3(v, v) is how a squared length is asked for
+here, so they are routinely the same vector.*/
+static float dssp_dot3(const float *a, const float *b)
 {
-	UV c;
-	if (a >= s->n_res || b >= s->n_res) return FALSE;
-	for (c = 0; c < s->n_chain; c++)
-		if (a >= s->chain_first[c] && a < s->chain_last[c])
-			return b >= s->chain_first[c] && b < s->chain_last[c];
-	return FALSE;
+	float p0 = a[0] * b[0], p1 = a[1] * b[1], p2 = a[2] * b[2];
+	float lo = p0 + p1, hi = p2 + 0.0f;
+	return lo + hi;
 }
 
-//an n-turn at i: the C=O of i reaches the N-H of i+n, both in one chain
-static bool n_turn(const structset *CSP_RESTRICT s, UV i, UV n)
+static void dssp_sub3(const float *CSP_RESTRICT a, const float *CSP_RESTRICT b,
+                      float *CSP_RESTRICT out)
 {
-	return same_chain(s, i, i + n) && ks_bonded(s, i, i + n);
+	out[0] = a[0] - b[0];
+	out[1] = a[1] - b[1];
+	out[2] = a[2] - b[2];
 }
 
-#define BR_NONE  0
-#define BR_PARA  1 //the two strands run the same way
-#define BR_ANTI  2 //they run opposite ways
+/*The energy of the bond from acceptor a's C=O to donor d's N-H.
 
-static unsigned char bridge_kind(const structset *CSP_RESTRICT s, UV i, UV j)
+E = 2.7888 * (1/r_ON + 1/r_CH - 1/r_OH - 1/r_CN), kcal/mol, with the four
+reciprocals summed in the order fvec4::dot4() sums them: the pairs are
+(ON, CH) and (OH, CN) in mdtraj's `coupling' vector, which lists them
+OH, CN, CH, ON with the first two negated.*/
+static float dssp_energy(const dssp_res *CSP_RESTRICT a, const dssp_res *CSP_RESTRICT d)
 {
+	float v[3], r[4], lo, hi, e;
+	unsigned short int k;
+	dssp_sub3(d->h, a->o, v); r[0] = dssp_dot3(v, v);
+	dssp_sub3(d->n, a->c, v); r[1] = dssp_dot3(v, v);
+	dssp_sub3(d->h, a->c, v); r[2] = dssp_dot3(v, v);
+	dssp_sub3(d->n, a->o, v); r[3] = dssp_dot3(v, v);
+	for (k = 0; k < 4; k++) r[k] = 1.0f / (float)sqrt((double)r[k]);
+	lo = (-DSSP_COUPLE) * r[0] + (-DSSP_COUPLE) * r[1];
+	hi = DSSP_COUPLE * r[2] + DSSP_COUPLE * r[3];
+	e = lo + hi;
+	return (e < DSSP_FLOOR) ? DSSP_FLOOR : e;
+}
+
+/*Which DSSP chain each residue is in.
+
+mdtraj is handed one chain index per residue and will not let a turn, a bridge
+or a bend reach from one chain into another.  Its chains are not this module's:
+reading PDB it starts a new one at every TER and at every change of chain id, so
+a chain's ligands and its waters are chains of their own, and reading mmCIF it
+takes them from label_asym_id, which draws the same line.  This module keeps a
+chain whole -- polymer, ligands and waters under the one author id -- so the
+division has to be made here.
+
+The rule that reproduces the TER is to cut an author chain in two after the last
+residue of its polymer.  A residue counts as polymer when the Perl half typed it
+an amino acid or a nucleotide -- not when its name merely looks like one -- and
+when it is either an ATOM record or a modified residue.  Each of those three
+clauses is there for cases that come up:
+
+  * The name is not enough.  A residue the table has never heard of can sit in
+    the middle of a chain and is part of it in mdtraj too (5MAD's chromophore
+    CRO 66, 5TTW's trimethyl-lysine M3L 3); a free amino acid sitting after the
+    chain is a ligand and a chain of its own (3TDJ's GLU 401, 1XQH's SAH, the
+    free SER 502 that follows 6BMI's GLU 416).
+  * The type alone is not enough either.  The Perl half tells a modified residue
+    from a free one by its number, and a chain numbered out of order defeats
+    that: 3LMS chain A runs 4, 567, 1501, 1889, 2356 and so on, so its free
+    GLY 501 falls inside the numbering and stays an amino acid.  It is a HETATM
+    and the TER is before it.
+  * HETATM alone is not enough, because a modified residue capping a terminus is
+    a HETATM inside the chain.
+
+None of the three catches a residue the name table has never heard of that is
+nonetheless the last residue of the chain: 1CMX ends chains B and D with a GLZ,
+a glycine capped at the carboxyl, and the TER is after it.  So once the cut has
+been found it is walked forward over anything that is peptide-bonded to what
+comes before it, which is the difference between a cap and a free amino acid in
+a binding site and the only difference there is.  Forward from the cut and not
+anywhere: 4QFP has a free valyl-threonine dipeptide sitting after chain A, and
+its two residues are bonded to each other but not to the chain.  The bond length
+is this file's own constant rather than the peptide_bond option -- which
+residues DSSP calls one chain is not something to tune underneath it.
+
+A residue with no backbone is skipped by the assignment wherever it sits, so
+what the cut is really for is the handful of guards that ask whether i-1 and
+i+1, or i-2 and i+2, are in one chain without asking whether they are protein.*/
+static bool dssp_is_polymer(pTHX_ HV *CSP_RESTRICT res)
+{
+	SV *t = hvf_sv(aTHX_ res, "type", 4);
+	SV *h, *m;
+	const char *p = t ? SvPV_nolen(t) : NULL;
+	if (!p || !(strEQ(p, "amino_acid") || strEQ(p, "nucleotide"))) return FALSE;
+	h = hvf_sv(aTHX_ res, "hetero", 6);
+	if (!h || !SvTRUE(h)) return TRUE;
+	m = hvf_sv(aTHX_ res, "modified", 8);
+	return (m && SvTRUE(m)) ? TRUE : FALSE;
+}
+
+static void dssp_segments(pTHX_ structset *CSP_RESTRICT s, UV *CSP_RESTRICT seg)
+{
+	UV c, r, k = 0;
+	for (c = 0; c < s->n_chain; c++) {
+		UV first = s->chain_first[c], last = s->chain_last[c], cut = first;
+		for (r = first; r < last; r++)
+			if (dssp_is_polymer(aTHX_ s->res_hv[r])) cut = r + 1;
+		while (cut > first && cut < last
+		       && peptide_linked(aTHX_ s->res_hv[cut - 1], s->res_hv[cut], CSP_PEPTIDE_BOND))
+			cut++;
+		for (r = first; r < last; r++) {
+			if (r == cut && r != first) k++;
+			seg[r] = k;
+		}
+		k++;
+	}
+}
+
+/*The backbone, and the amide hydrogen on it.
+
+mdtraj places the hydrogen of residue r from the carbonyl of residue r-1 in its
+array: one angstrom from r's nitrogen, along the direction from that carbonyl's
+carbon to its oxygen.  It does so whether or not the two are bonded, whether or
+not they are in the same chain, and -- see the head of this block -- whether or
+not r-1 has a carbonyl at all.  Here r-1 is the residue before r in the walk,
+and the hydrogen is placed only when that residue is in the same DSSP chain and
+does have a C and an O.  A residue with no hydrogen cannot donate.
+
+That is the one place this deliberately does not follow mdtraj to the letter,
+and the two cases it covers are the two mdtraj has no answer for: the first
+residue of the whole structure, which mdtraj gives a hydrogen sitting on top of
+its own nitrogen, and a residue whose predecessor has no carbonyl, where mdtraj
+reads off the front of its array.  A hydrogen placed from either is a hydrogen
+in a direction nothing chose, and over the thousand entries measured at the head
+of this block, refusing to place it changes no letter.*/
+static void dssp_read(pTHX_ structset *CSP_RESTRICT s, dssp_res *CSP_RESTRICT bb,
+                      const UV *CSP_RESTRICT seg)
+{
+	UV r;
+	unsigned short int k;
+	for (r = 0; r < s->n_res; r++) {
+		HV *at = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
+		dssp_res *b = &bb[r];
+		NV x, y, z;
+		Zero(b, 1, dssp_res);
+		b->proline = (s->res_key[r] == K3('P','R','O'));
+		if (!at) continue;
+		if (atom_xyz(aTHX_ at, "N", &x, &y, &z)) {
+			b->n[0] = dssp_nm(x); b->n[1] = dssp_nm(y); b->n[2] = dssp_nm(z);
+			b->has_n = TRUE;
+		}
+		if (atom_xyz(aTHX_ at, "CA", &x, &y, &z)) {
+			b->ca[0] = dssp_nm(x); b->ca[1] = dssp_nm(y); b->ca[2] = dssp_nm(z);
+			b->has_ca = TRUE;
+		}
+		if (atom_xyz(aTHX_ at, "C", &x, &y, &z)) {
+			b->c[0] = dssp_nm(x); b->c[1] = dssp_nm(y); b->c[2] = dssp_nm(z);
+			b->has_c = TRUE;
+		}
+		if (atom_xyz(aTHX_ at, "O", &x, &y, &z)) {
+			b->o[0] = dssp_nm(x); b->o[1] = dssp_nm(y); b->o[2] = dssp_nm(z);
+			b->has_o = TRUE;
+		}
+		b->whole = b->has_n && b->has_ca && b->has_c && b->has_o;
+	}
+	for (r = 1; r < s->n_res; r++) {
+		dssp_res *b = &bb[r];
+		const dssp_res *p = &bb[r - 1];
+		float co[3], len;
+		if (!b->whole || b->proline) continue;
+		if (seg[r] != seg[r - 1] || !p->has_c || !p->has_o) continue;
+		dssp_sub3(p->c, p->o, co);
+		len = (float)sqrt((double)dssp_dot3(co, co));
+		if (!(len > 0.0f)) continue;
+		for (k = 0; k < 3; k++) {
+			//one step per named float, so that each is rounded to float where
+			//it is in mdtraj, rather than a wider product reaching the sum
+			float u = co[k] / len;
+			float step = u * DSSP_H;
+			b->h[k] = b->n[k] + step;
+		}
+		b->donor = TRUE;
+	}
+}
+
+/*Keep the two lowest energies a donor has, best first.
+
+mdtraj's store_energies(), which tests its slots for NaN because the array
+kabsch_sander() fills for its own caller starts as NaN; the one the DSSP pass
+fills starts as zero, so the NaN arm is never taken there and an empty slot is
+the one with no acceptor in it.  Which slot an acceptor lands in does not depend
+on the order they arrive in.*/
+static void dssp_store(UV n_res, UV *CSP_RESTRICT acc, float *CSP_RESTRICT en,
+                       UV donor, UV a, float e)
+{
+	UV slot = donor * DSSP_KEEP;
+	if (acc[slot] >= n_res || e < en[slot]) {
+		acc[slot + 1] = acc[slot];
+		en[slot + 1]  = en[slot];
+		acc[slot] = a;
+		en[slot]  = e;
+	} else if (acc[slot + 1] >= n_res || e < en[slot + 1]) {
+		acc[slot + 1] = a;
+		en[slot + 1]  = e;
+	}
+}
+
+/*The hydrogen bonds DSSP is read from: each residue's two best acceptors.
+
+mdtraj walks every pair of residues and tests the CA separation first; this
+walks a cell grid over the CA atoms instead, which finds the same pairs and does
+not take a ribosome quadratically.  The grid is only a sieve: what decides is
+the float comparison against 0.81 below, which is mdtraj's own.
+
+The cell is 0.9001 nm and not 0.9 because the two are not measuring quite the
+same thing.  The float dot3() carries three products and two sums, each rounded,
+so it can sit as much as 4 * 2^-24 below the exact squared distance; a pair it
+puts just inside 0.81 can therefore be as far apart as 0.90000011 nm, and a
+0.9 nm cell would have thrown it away before the comparison that keeps it.
+0.0001 nm of cell is eight hundred times that bound and costs nothing -- the
+cell count changes by a part in ten thousand.
+
+Which of two acceptors ends up in which slot does not depend on the order the
+pairs arrive in -- the pair kept is the two lowest energies either way -- so the
+grid's order is free.  Two acceptors at bit-identical energies would be the
+exception, and that is a structure built to have one.
+
+acc[d * DSSP_KEEP + k] is the residue whose carbonyl residue d's amide hydrogen
+is bonded to, or n_res where there is no such bond.*/
+static void dssp_hbonds(pTHX_ structset *CSP_RESTRICT s, const dssp_res *CSP_RESTRICT bb,
+                        UV *CSP_RESTRICT acc, float *CSP_RESTRICT en)
+{
+	NV *CSP_RESTRICT cx = NULL, *CSP_RESTRICT cy = NULL, *CSP_RESTRICT cz = NULL;
+	UV *CSP_RESTRICT which = NULL;
+	cell_grid g;
+	UV n = 0, r, k;
+
+	for (r = 0; r < s->n_res * DSSP_KEEP; r++) { acc[r] = s->n_res; en[r] = 0.0f; }
+	if (s->n_res == 0) return;
+
+	Newx(cx, s->n_res, NV); Newx(cy, s->n_res, NV); Newx(cz, s->n_res, NV);
+	Newx(which, s->n_res, UV);
+	for (r = 0; r < s->n_res; r++) {
+		if (!bb[r].whole) continue;
+		cx[n] = (NV)bb[r].ca[0]; cy[n] = (NV)bb[r].ca[1]; cz[n] = (NV)bb[r].ca[2];
+		which[n] = r;
+		n++;
+	}
+	if (n == 0) {
+		Safefree(cx); Safefree(cy); Safefree(cz); Safefree(which);
+		return;
+	}
+	grid_build(aTHX_ &g, cx, cy, cz, n, 0.9001);   //nm; see the head of this function
+
+	for (k = 0; k < n; k++) {
+		UV i = which[k];
+		UV bx, by, bz, ci, cj, ck;
+		ci = grid_axis(cx[k] - g.x0, g.cell, g.nx);
+		cj = grid_axis(cy[k] - g.y0, g.cell, g.ny);
+		ck = grid_axis(cz[k] - g.z0, g.cell, g.nz);
+		for (bx = ci ? ci - 1 : 0; bx <= (ci + 1 < g.nx ? ci + 1 : g.nx - 1); bx++)
+		for (by = cj ? cj - 1 : 0; by <= (cj + 1 < g.ny ? cj + 1 : g.ny - 1); by++)
+		for (bz = ck ? ck - 1 : 0; bz <= (ck + 1 < g.nz ? ck + 1 : g.nz - 1); bz++) {
+			UV cell = (bx * g.ny + by) * g.nz + bz, p;
+			for (p = g.start[cell]; p < g.start[cell + 1]; p++) {
+				UV j = which[g.idx[p]];
+				float d[3], e;
+				if (j <= i) continue;   //each pair once, in mdtraj's i < j order
+				dssp_sub3(bb[i].ca, bb[j].ca, d);
+				if (!(dssp_dot3(d, d) < DSSP_CA2)) continue;
+				if (bb[i].donor) {
+					e = dssp_energy(&bb[j], &bb[i]);
+					if (e < DSSP_CUTOFF) dssp_store(s->n_res, acc, en, i, j, e);
+				}
+				/*The pair a residue makes with the one before it is not a bond
+				to test in that direction: j's hydrogen was placed from i's own
+				carbonyl, so the two are one peptide unit and the energy between
+				them is an artefact of having placed it.  mdtraj skips it as
+				rj == ri + 1 in its array, which is the same residue as this.*/
+				if (j != i + 1 && bb[j].donor) {
+					e = dssp_energy(&bb[i], &bb[j]);
+					if (e < DSSP_CUTOFF) dssp_store(s->n_res, acc, en, j, i, e);
+				}
+			}
+		}
+	}
+	grid_free(aTHX_ &g);
+	Safefree(cx); Safefree(cy); Safefree(cz); Safefree(which);
+}
+
+//is the C=O of `a' bonded to the N-H of `d'?  Two acceptors are kept per donor,
+//so this is two comparisons rather than a search
+static bool dssp_bonded(UV n_res, const UV *CSP_RESTRICT acc, UV d, UV a)
+{
+	if (d >= n_res || a >= n_res) return FALSE;
+	return acc[d * DSSP_KEEP] == a || acc[d * DSSP_KEEP + 1] == a;
+}
+
+#define BR_NONE 0
+#define BR_PARA 1 //the two strands run the same way
+#define BR_ANTI 2 //they run opposite ways
+
+/*Is the pair (i, j) a beta bridge, and of which kind?
+
+mdtraj's MResidue::TestBridge(), which is the 1983 paper's definition with one
+thing added: the residue on each side needs a neighbour before and after it in
+the same chain, whether or not the pattern names that neighbour.  The two
+strands themselves may be in different chains, and often are.*/
+static unsigned char dssp_test_bridge(UV n_res, const UV *CSP_RESTRICT seg,
+                                      const UV *CSP_RESTRICT acc, UV i, UV j)
+{
+	UV a, b = i, c = i + 1, d, e = j, f = j + 1;
 	if (i == 0 || j == 0) return BR_NONE;
-	if (i + 1 >= s->n_res || j + 1 >= s->n_res) return BR_NONE;
-	//DSSP asks for three residues between them, and for one chain
-	if (!same_chain(s, i, j)) return BR_NONE;
-	if (!(same_chain(s, i - 1, i + 1) && same_chain(s, j - 1, j + 1))) return BR_NONE;
-	if ((i > j ? i - j : j - i) < 3) return BR_NONE;
-	if ((ks_bonded(s, i - 1, j) && ks_bonded(s, j, i + 1))
-	 || (ks_bonded(s, j - 1, i) && ks_bonded(s, i, j + 1)))
+	a = i - 1; d = j - 1;
+	if (c >= n_res || f >= n_res) return BR_NONE;
+	if (seg[a] != seg[c] || seg[d] != seg[f]) return BR_NONE;
+	if ((dssp_bonded(n_res, acc, c, e) && dssp_bonded(n_res, acc, e, a))
+	 || (dssp_bonded(n_res, acc, f, b) && dssp_bonded(n_res, acc, b, d)))
 		return BR_PARA;
-	if ((ks_bonded(s, i, j) && ks_bonded(s, j, i))
-	 || (ks_bonded(s, i - 1, j + 1) && ks_bonded(s, j - 1, i + 1)))
+	if ((dssp_bonded(n_res, acc, c, d) && dssp_bonded(n_res, acc, f, a))
+	 || (dssp_bonded(n_res, acc, e, b) && dssp_bonded(n_res, acc, b, e)))
 		return BR_ANTI;
 	return BR_NONE;
 }
 
-/*dssp_compute() -- the eight-letter assignment, onto each residue.
+/*A bridge, and then a ladder: the run of residues [i_first, i_last] paired with
+the run [j_first, j_last].  Both runs are contiguous while the ladder is being
+built -- a bridge only extends one residue at a time, at one end -- and stop
+being so when two ladders are joined across a bulge, which is why the ends are
+kept rather than the runs.  n_i is the count the join does not disturb, and
+tells an isolated bridge from a ladder.*/
+typedef struct {
+	unsigned char type;   //BR_PARA or BR_ANTI
+	UV chain_i;           //the DSSP chain the i run is in; mdtraj's Bridge keeps
+	                      //the j run's as well and never reads it, so this does not
+	UV i_first, i_last, j_first, j_last;
+	UV n_i;
+	UV seq;               //the order it was found in, so the sort below is stable
+} dssp_bridge;
 
-`ss' is the letter; `ss_simple' is mdtraj's three-state reduction of it, H for
-the three helices, E for the two sheet letters and C for everything else.  A
-residue with no backbone to speak of gets neither key rather than a letter
-saying it is coil, because it is not coil, it is not protein.*/
-static void dssp_compute(pTHX_ structset *CSP_RESTRICT s,
-                         const backbone *CSP_RESTRICT bb, bool store)
+static int dssp_bridge_cmp(const void *pa, const void *pb)
 {
-	char *CSP_RESTRICT ss = NULL;
-	unsigned char *CSP_RESTRICT bridge = NULL;
-	UV i, d;
-	unsigned short int k;
+	/*No CSP_RESTRICT and no const on the parameters beyond what qsort asks for:
+	the prototype is the C library's, not this file's.*/
+	const dssp_bridge *a = (const dssp_bridge *)pa;
+	const dssp_bridge *b = (const dssp_bridge *)pb;
+	if (a->chain_i != b->chain_i) return (a->chain_i < b->chain_i) ? -1 : 1;
+	if (a->i_first != b->i_first) return (a->i_first < b->i_first) ? -1 : 1;
+	return (a->seq < b->seq) ? -1 : (a->seq > b->seq);
+}
 
-	if (s->n_res == 0) return;
-	Newx(ss, s->n_res, char);
-	Newxz(bridge, s->n_res, unsigned char);
-	for (i = 0; i < s->n_res; i++) ss[i] = SS_COIL;
+//a candidate pair for the bridge search, and the order the search visits them in
+typedef struct { UV i, j; } dssp_pair;
 
-	/*The order matters, and it is not the order of the priority list.  A 3-10 or
-	a pi helix is laid down only where the whole run of it is free -- if any one
-	residue of the run is already an alpha helix or a sheet, the whole run is
-	refused rather than trimmed, which is what the reference implementations do
-	and is why 1A42's residues 13 and 14 come out T and not G: a 3-turn pair
-	starts at 12, and 12 is already the last residue of an alpha helix.
+static int dssp_pair_cmp(const void *pa, const void *pb)
+{
+	const dssp_pair *a = (const dssp_pair *)pa;
+	const dssp_pair *b = (const dssp_pair *)pb;
+	if (a->i != b->i) return (a->i < b->i) ? -1 : 1;
+	return (a->j < b->j) ? -1 : (a->j > b->j);
+}
 
-	So: alpha helices, then sheets, then the two weaker helices where nothing
-	stronger sits, then turns, then bends.*/
-	for (i = 1; i < s->n_res; i++) {
-		UV j;
-		if (n_turn(s, i - 1, 4) && n_turn(s, i, 4))
-			for (j = i; j < i + 4 && j < s->n_res; j++) ss[j] = SS_HELIX;
-	}
+/*The pairs the bridge search has to look at.
 
-	/*Bridges, from the bonds rather than from every pair.  Each of the four
-	patterns is a pair of bonds, so reading one bond's two residues back through
-	every place it can appear gives all eight pairs a bridge could be built on --
-	and every bridge has a bond in it, so no bridge is missed.  That turns a
-	search quadratic in the residues into one linear in the bonds.*/
-	for (d = 0; d < s->n_res; d++) {
-		for (k = 0; k < CSP_KS_KEEP; k++) {
-			UV a = s->ks_acc[d * CSP_KS_KEEP + k];
-			UV cand[8][2];
-			unsigned short int c;
-			UV am1 = (a > 0) ? a - 1 : s->n_res;
-			UV dm1 = (d > 0) ? d - 1 : s->n_res;
-			if (a >= s->n_res) continue;
-			(void)am1;
-			//parallel, first clause:  Hbond(i-1,j) and Hbond(j,i+1)
-			cand[0][0] = a + 1; cand[0][1] = d;
-			cand[1][0] = dm1;   cand[1][1] = a;
-			//parallel, second clause: Hbond(j-1,i) and Hbond(i,j+1)
-			cand[2][0] = d;     cand[2][1] = a + 1;
-			cand[3][0] = a;     cand[3][1] = dm1;
-			//antiparallel, first clause:  Hbond(i,j) and Hbond(j,i)
-			cand[4][0] = a;     cand[4][1] = d;
-			cand[5][0] = d;     cand[5][1] = a;
-			//antiparallel, second clause: Hbond(i-1,j+1) and Hbond(j-1,i+1)
-			cand[6][0] = a + 1; cand[6][1] = dm1;
-			cand[7][0] = dm1;   cand[7][1] = a + 1;
+mdtraj walks every (i, j) with 1 <= i < n-4 and i+3 <= j < n-1 and asks
+dssp_test_bridge() about each, which is quadratic in the residues; a ribosome
+has half a million of them.  Every one of the four bridge patterns names two
+hydrogen bonds, though, so a pair with no bond in any of the eight positions the
+patterns can put one in cannot be a bridge and the walk would only have thrown
+it away.  Reading each bond back through the eight positions gives the same
+pairs, in a list linear in the bonds; sorting it puts them in the order the walk
+would have reached them, which is the order the ladders are built in and so part
+of the answer.*/
+static UV dssp_candidates(pTHX_ UV n_res, const UV *CSP_RESTRICT acc,
+                          dssp_pair *CSP_RESTRICT *CSP_RESTRICT out)
+{
+	dssp_pair *CSP_RESTRICT p = NULL;
+	UV cap = 0, n = 0, d, w;
+	unsigned short int k, c;
+	if (n_res < 6) { *out = NULL; return 0; }
+	for (d = 0; d < n_res; d++) {
+		for (k = 0; k < DSSP_KEEP; k++) {
+			UV a = acc[d * DSSP_KEEP + k], cand[8][2];
+			if (a >= n_res) continue;
+			{
+				//the eight (i, j) the bond d -> a can be half of.  d - 1 where d
+				//is 0 is mdtraj's -1, a position no pair can use; it is written
+				//as n_res, which the bounds test below drops.
+				UV dm1 = d ? d - 1 : n_res;
+				cand[0][0] = a;   cand[0][1] = dm1;
+				cand[1][0] = d;   cand[1][1] = a + 1;
+				cand[2][0] = dm1; cand[2][1] = a;
+				cand[3][0] = a + 1; cand[3][1] = d;
+				cand[4][0] = a + 1; cand[4][1] = dm1;
+				cand[5][0] = dm1; cand[5][1] = a + 1;
+				cand[6][0] = d;   cand[6][1] = a;
+				cand[7][0] = a;   cand[7][1] = d;
+			}
 			for (c = 0; c < 8; c++) {
-				UV bi = cand[c][0], bj = cand[c][1];
-				if (bi >= s->n_res || bj >= s->n_res) continue;
-				if (bridge_kind(s, bi, bj) == BR_NONE) continue;
-				bridge[bi] = 1;
-				bridge[bj] = 1;
+				UV i = cand[c][0], j = cand[c][1];
+				if (i < 1 || i + 4 >= n_res) continue;
+				if (j < i + 3 || j + 1 >= n_res) continue;
+				if (n == cap) {
+					cap = cap ? cap * 2 : 64;
+					Renew(p, cap, dssp_pair);
+				}
+				p[n].i = i; p[n].j = j;
+				n++;
 			}
 		}
 	}
-	/*A bridge next to another bridge is a strand; one on its own is an isolated
-	bridge.  Both outrank every letter but the alpha helix.*/
-	for (i = 0; i < s->n_res; i++) {
-		bool run;
-		if (!bridge[i]) continue;
-		if (ss[i] == SS_HELIX) continue;
-		run = (i > 0 && bridge[i - 1] && same_chain(s, i - 1, i))
-		   || (i + 1 < s->n_res && bridge[i + 1] && same_chain(s, i, i + 1));
-		ss[i] = run ? SS_STRAND : SS_BRIDGE;
+	if (n > 1) {
+		qsort(p, (size_t)n, sizeof(dssp_pair), dssp_pair_cmp);
+		//the same pair is reached from several bonds; keep one of each
+		for (w = 1, d = 1; d < n; d++)
+			if (p[d].i != p[w - 1].i || p[d].j != p[w - 1].j) p[w++] = p[d];
+		n = w;
 	}
+	*out = p;
+	return n;
+}
 
-	//the 3-10 helix, and then the pi helix, each only where its whole run is free
-	for (i = 1; i < s->n_res; i++) {
-		UV j;
-		bool free_run = TRUE;
-		if (!(n_turn(s, i - 1, 3) && n_turn(s, i, 3))) continue;
-		for (j = i; j < i + 3 && j < s->n_res; j++)
-			if (ss[j] != SS_COIL) free_run = FALSE;
-		if (!free_run) continue;
-		for (j = i; j < i + 3 && j < s->n_res; j++) ss[j] = SS_G310;
-	}
-	for (i = 1; i < s->n_res; i++) {
-		UV j;
-		bool free_run = TRUE;
-		if (!(n_turn(s, i - 1, 5) && n_turn(s, i, 5))) continue;
-		for (j = i; j < i + 5 && j < s->n_res; j++)
-			if (ss[j] != SS_COIL) free_run = FALSE;
-		if (!free_run) continue;
-		for (j = i; j < i + 5 && j < s->n_res; j++) ss[j] = SS_PI;
-	}
+/*The beta secondary structure, onto `ss'.
 
-	//turns: any residue spanned by an n-turn that nothing stronger claimed
-	for (i = 0; i < s->n_res; i++) {
-		for (k = 3; k <= 5; k++) {
-			UV j;
-			if (!n_turn(s, i, k)) continue;
-			for (j = i + 1; j < i + k && j < s->n_res; j++)
-				if (ss[j] == SS_COIL) ss[j] = SS_TURN;
+mdtraj's MProtein::CalculateBetaSheets(): find the bridges, join the ladders
+that a bulge separates, then write E over every residue between the ends of a
+ladder and B over a bridge that stands alone.*/
+static void dssp_sheets(pTHX_ UV n_res, const UV *CSP_RESTRICT seg,
+                        const UV *CSP_RESTRICT acc, const dssp_res *CSP_RESTRICT bb,
+                        char *CSP_RESTRICT ss)
+{
+	dssp_pair *CSP_RESTRICT cand = NULL;
+	dssp_bridge *CSP_RESTRICT br = NULL;
+	UV ncand, nbr = 0, cap = 0, c, x, y;
+
+	ncand = dssp_candidates(aTHX_ n_res, acc, &cand);
+	for (c = 0; c < ncand; c++) {
+		UV i = cand[c].i, j = cand[c].j;
+		unsigned char type = dssp_test_bridge(n_res, seg, acc, j, i);
+		bool found = FALSE;
+		if (type == BR_NONE || !bb[i].whole || !bb[j].whole) continue;
+		for (x = 0; x < nbr; x++) {
+			if (type != br[x].type || i != br[x].i_last + 1) continue;
+			if (type == BR_PARA && br[x].j_last + 1 == j) {
+				br[x].i_last = i; br[x].j_last = j; br[x].n_i++;
+				found = TRUE;
+				break;
+			}
+			if (type == BR_ANTI && br[x].j_first > 0 && br[x].j_first - 1 == j) {
+				br[x].i_last = i; br[x].j_first = j; br[x].n_i++;
+				found = TRUE;
+				break;
+			}
+		}
+		if (found) continue;
+		if (nbr == cap) {
+			cap = cap ? cap * 2 : 32;
+			Renew(br, cap, dssp_bridge);
+		}
+		br[nbr].type = type;
+		br[nbr].chain_i = seg[i];
+		br[nbr].i_first = br[nbr].i_last = i;
+		br[nbr].j_first = br[nbr].j_last = j;
+		br[nbr].n_i = 1;
+		br[nbr].seq = nbr;
+		nbr++;
+	}
+	Safefree(cand);
+
+	//join the ladders a beta bulge separates
+	if (nbr > 1) qsort(br, (size_t)nbr, sizeof(dssp_bridge), dssp_bridge_cmp);
+	for (x = 0; x < nbr; x++) {
+		for (y = x + 1; y < nbr; y++) {
+			/*IV and not UV: mdtraj's are ints and three of the tests below are
+			written to be false when the difference comes out negative, which is
+			the ordinary case for two ladders that do not overlap.  Read at
+			unsigned width a negative difference is an enormous positive one and
+			every one of those tests flips.*/
+			IV ibi = (IV)br[x].i_first, iei = (IV)br[x].i_last;
+			IV jbi = (IV)br[x].j_first, jei = (IV)br[x].j_last;
+			IV ibj = (IV)br[y].i_first, iej = (IV)br[y].i_last;
+			IV jbj = (IV)br[y].j_first, jej = (IV)br[y].j_last;
+			bool bulge;
+			if (br[x].type != br[y].type) continue;
+			if (seg[(UV)(ibi < ibj ? ibi : ibj)] != seg[(UV)(iei > iej ? iei : iej)])
+				continue;
+			if (seg[(UV)(jbi < jbj ? jbi : jbj)] != seg[(UV)(jei > jej ? jei : jej)])
+				continue;
+			if (ibj - iei >= 6 || (iei >= ibj && ibi <= iej)) continue;
+			if (br[x].type == BR_PARA)
+				bulge = (jbj > jbi)
+				     && ((jbj - jei < 6 && ibj - iei < 3) || (jbj - jei < 3));
+			else
+				bulge = (jbj < jbi)
+				     && ((jbi - jej < 6 && ibj - iei < 3) || (jbi - jej < 3));
+			if (!bulge) continue;
+			br[x].i_last = (UV)iej;
+			br[x].n_i += br[y].n_i;
+			if (br[x].type == BR_PARA) br[x].j_last = (UV)jej;
+			else                       br[x].j_first = (UV)jbj;
+			for (c = y; c + 1 < nbr; c++) br[c] = br[c + 1];
+			nbr--;
+			y--;
 		}
 	}
 
-	//bends, last: the chain turns through more than 70 degrees between the two
-	//CA atoms two either side of this one
-	for (i = 2; i + 2 < s->n_res; i++) {
-		NV u[3], v[3], lu = 0.0, lv = 0.0, dot = 0.0;
-		if (ss[i] != SS_COIL) continue;
-		if (!bb[i].whole || !bb[i - 2].whole || !bb[i + 2].whole) continue;
-		if (!same_chain(s, i - 2, i + 2)) continue;
-		for (k = 0; k < 3; k++) {
-			u[k] = bb[i].ca[k]     - bb[i - 2].ca[k];
-			v[k] = bb[i + 2].ca[k] - bb[i].ca[k];
-			lu += u[k] * u[k];
-			lv += v[k] * v[k];
-			dot += u[k] * v[k];
+	for (x = 0; x < nbr; x++) {
+		char lt = (br[x].n_i > 1) ? SS_STRAND : SS_BRIDGE;
+		UV r;
+		for (r = br[x].i_first; r <= br[x].i_last; r++)
+			if (ss[r] != SS_STRAND) ss[r] = lt;
+		for (r = br[x].j_first; r <= br[x].j_last; r++)
+			if (ss[r] != SS_STRAND) ss[r] = lt;
+	}
+	Safefree(br);
+}
+
+//mdtraj's helix_flag_t, at its own values: what an n-turn makes of a residue
+#define HX_NONE  0
+#define HX_START 1
+#define HX_END   2
+#define HX_BOTH  3 //a turn ends here and another begins
+#define HX_MID   4
+#define HX_BEGINS(f) ((f) == HX_START || (f) == HX_BOTH)
+
+/*Is the chain bent at i?  The angle between the CA of i-2, i and i+2, past 70
+degrees.  mdtraj's MProtein::CalculateBends(), in its own arithmetic: see the
+head of this block for why the width matters and why acos is not acosf.*/
+static bool dssp_is_bend(UV n_res, const UV *CSP_RESTRICT seg,
+                         const dssp_res *CSP_RESTRICT bb, UV i)
+{
+	float u[3], v[3], du, dv, prod, cosangle, kappa;
+	if (i < 2 || i + 2 >= n_res) return FALSE;
+	if (seg[i - 2] != seg[i + 2]) return FALSE;
+	if (!bb[i - 2].whole || !bb[i].whole || !bb[i + 2].whole) return FALSE;
+	dssp_sub3(bb[i - 2].ca, bb[i].ca, u);
+	dssp_sub3(bb[i].ca, bb[i + 2].ca, v);
+	du = dssp_dot3(u, u);
+	dv = dssp_dot3(v, v);
+	prod = du * dv;   //rounded to float before the root, as mdtraj's sqrtf() has it
+	cosangle = dssp_dot3(u, v) / (float)sqrt((double)prod);
+	if (cosangle < -1.0f) cosangle = -1.0f;
+	else if (cosangle > 1.0f) cosangle = 1.0f;
+	kappa = (float)acos((double)cosangle);
+	return (double)kappa > DSSP_BEND;
+}
+
+/*The helices, the turns and the bends, onto `ss'.
+
+mdtraj's MProtein::CalculateAlphaHelices() with inPreferPiHelices set, which is
+what the port hardcodes.  The order is the answer: the alpha helices go down
+first and over whatever the sheets left, then the 3-10 helices only where the
+whole run of three is free, then the pi helices only where the whole run of five
+is free or alpha helix -- which is what preferring pi helices means, and is why
+a pi helix can overwrite an alpha one and a 3-10 helix can never overwrite
+anything.  Turns and bends come last, over coil alone.*/
+static void dssp_helices(pTHX_ UV n_res, const UV *CSP_RESTRICT seg,
+                         const UV *CSP_RESTRICT acc, const dssp_res *CSP_RESTRICT bb,
+                         char *CSP_RESTRICT ss)
+{
+	unsigned char *CSP_RESTRICT hf = NULL;
+	UV i, j, first;
+	unsigned short int stride, k;
+
+	Newxz(hf, n_res * 3, unsigned char);
+	//the n-turns, chain by chain and then stride by stride, as mdtraj walks them
+	first = 0;
+	while (first < n_res) {
+		UV last = first;
+		while (last < n_res && seg[last] == seg[first]) last++;
+		for (stride = 3; stride <= 5; stride++) {
+			unsigned short int off = (unsigned short int)(stride - 3);
+			for (i = first; i < last; i++) {
+				UV t = i + stride;
+				if (t >= n_res || !dssp_bonded(n_res, acc, t, i) || seg[t] != seg[i])
+					continue;
+				hf[t * 3 + off] = HX_END;
+				for (j = i + 1; j < t; j++)
+					if (hf[j * 3 + off] == HX_NONE) hf[j * 3 + off] = HX_MID;
+				hf[i * 3 + off] = (hf[i * 3 + off] == HX_END) ? HX_BOTH : HX_START;
+			}
 		}
-		lu = nv_sqrt(lu); lv = nv_sqrt(lv);
-		if (!(lu > 0.0) || !(lv > 0.0)) continue;
-		dot /= lu * lv;
-		if (dot > 1.0) dot = 1.0; else if (dot < -1.0) dot = -1.0;
-		if (nv_acos(dot) * 180.0 / CSP_PI > 70.0) ss[i] = SS_BEND;
+		first = last;
+	}
+
+	for (i = 1; i + 4 < n_res; i++)
+		if (HX_BEGINS(hf[i * 3 + 1]) && HX_BEGINS(hf[(i - 1) * 3 + 1]))
+			for (j = i; j <= i + 3; j++) ss[j] = SS_HELIX;
+
+	for (i = 1; i + 3 < n_res; i++) {
+		bool empty = TRUE;
+		if (!(HX_BEGINS(hf[i * 3]) && HX_BEGINS(hf[(i - 1) * 3]))) continue;
+		for (j = i; empty && j <= i + 2; j++)
+			empty = (ss[j] == SS_COIL || ss[j] == SS_G310);
+		if (!empty) continue;
+		for (j = i; j <= i + 2; j++) ss[j] = SS_G310;
+	}
+
+	for (i = 1; i + 5 < n_res; i++) {
+		bool empty = TRUE;
+		if (!(HX_BEGINS(hf[i * 3 + 2]) && HX_BEGINS(hf[(i - 1) * 3 + 2]))) continue;
+		for (j = i; empty && j <= i + 4; j++)
+			empty = (ss[j] == SS_COIL || ss[j] == SS_PI || ss[j] == SS_HELIX);
+		if (!empty) continue;
+		for (j = i; j <= i + 4; j++) ss[j] = SS_PI;
+	}
+
+	for (i = 1; i + 1 < n_res; i++) {
+		bool turn = FALSE;
+		if (ss[i] != SS_COIL || !bb[i].whole) continue;
+		for (stride = 3; stride <= 5 && !turn; stride++)
+			for (k = 1; k < stride && !turn; k++)
+				turn = (i >= k) && HX_BEGINS(hf[(i - k) * 3 + stride - 3]);
+		if (turn) ss[i] = SS_TURN;
+		else if (dssp_is_bend(n_res, seg, bb, i)) ss[i] = SS_BEND;
+	}
+	Safefree(hf);
+}
+
+/*dssp_compute() -- the eight-letter assignment, and the roll-up of it.
+
+`ss' goes onto each residue, with `ss_simple' beside it: mdtraj's three-state
+reduction, H for the three helices, E for the two sheet letters and C for
+everything else.  A residue with no backbone to speak of gets neither key rather
+than a letter saying it is coil, because it is not coil, it is not protein.
+
+What comes back is the same assignment read the other way round: chain id, then
+letter, then the positions in that chain's residue_order of the residues that
+have it.  A chain with no assigned residue is not a key, and neither is a letter
+no residue in the chain has.  The position is counted off this walk rather than
+off residue_order itself, which is the same number for any structure this module
+built: set_build() takes the chains in chain_order and each chain's residues in
+residue_order, and drops one only if the structure it was handed has a key in
+residue_order with no residue behind it.*/
+static HV *dssp_compute(pTHX_ structset *CSP_RESTRICT s, bool store)
+{
+	HV *out = newHV();
+	UV *CSP_RESTRICT seg = NULL;
+	UV *CSP_RESTRICT acc = NULL;
+	float *CSP_RESTRICT en = NULL;
+	char *CSP_RESTRICT ss = NULL;
+	dssp_res *CSP_RESTRICT bb = NULL;
+	UV r, c;
+
+	if (s->n_res == 0) return out;
+	Newx(seg, s->n_res, UV);
+	Newxz(bb, s->n_res, dssp_res);
+	Newx(acc, s->n_res * DSSP_KEEP, UV);
+	Newx(en,  s->n_res * DSSP_KEEP, float);
+	Newx(ss,  s->n_res, char);
+	for (r = 0; r < s->n_res; r++) ss[r] = SS_COIL;
+
+	dssp_segments(aTHX_ s, seg);
+	dssp_read(aTHX_ s, bb, seg);
+	dssp_hbonds(aTHX_ s, bb, acc, en);
+	//the sheets first and the helices over them, which is mdtraj's order and
+	//not the priority list's: an alpha helix overwrites an E, a pi helix
+	//overwrites an alpha helix, and a 3-10 helix overwrites nothing
+	dssp_sheets(aTHX_ s->n_res, seg, acc, bb, ss);
+	dssp_helices(aTHX_ s->n_res, seg, acc, bb, ss);
+
+	for (c = 0; c < s->n_chain; c++) {
+		SV *cid = hvf_sv(aTHX_ s->chain_hv[c], "id", 2);
+		HV *per = NULL;
+		if (!cid) continue;
+		for (r = s->chain_first[c]; r < s->chain_last[c]; r++) {
+			SV **have;
+			AV *list;
+			if (!bb[r].whole) continue;
+			if (!per) per = newHV();
+			have = hv_fetch(per, &ss[r], 1, 0);
+			if (have && *have && SvROK(*have) && SvTYPE(SvRV(*have)) == SVt_PVAV) {
+				list = (AV *)SvRV(*have);
+			} else {
+				list = newAV();
+				(void)hv_store(per, &ss[r], 1, newRV_noinc((SV *)list), 0);
+			}
+			av_push(list, newSVuv(r - s->chain_first[c]));
+		}
+		if (per) (void)hv_store_ent(out, cid, newRV_noinc((SV *)per), 0);
 	}
 
 	if (store) {
-		for (i = 0; i < s->n_res; i++) {
+		for (r = 0; r < s->n_res; r++) {
 			char simple;
-			(void)hv_delete(s->res_hv[i], "ss", 2, G_DISCARD);
-			(void)hv_delete(s->res_hv[i], "ss_simple", 9, G_DISCARD);
-			if (!bb[i].whole) continue; //not protein: it has no secondary structure
-			simple = (ss[i] == SS_HELIX || ss[i] == SS_G310 || ss[i] == SS_PI) ? 'H'
-			       : (ss[i] == SS_STRAND || ss[i] == SS_BRIDGE) ? 'E' : 'C';
-			(void)hv_stores(s->res_hv[i], "ss", newSVpvn(&ss[i], 1));
-			(void)hv_stores(s->res_hv[i], "ss_simple", newSVpvn(&simple, 1));
+			(void)hv_delete(s->res_hv[r], "ss", 2, G_DISCARD);
+			(void)hv_delete(s->res_hv[r], "ss_simple", 9, G_DISCARD);
+			if (!bb[r].whole) continue; //not protein: it has no secondary structure
+			simple = (ss[r] == SS_HELIX || ss[r] == SS_G310 || ss[r] == SS_PI) ? 'H'
+			       : (ss[r] == SS_STRAND || ss[r] == SS_BRIDGE) ? 'E' : 'C';
+			(void)hv_stores(s->res_hv[r], "ss", newSVpvn(&ss[r], 1));
+			(void)hv_stores(s->res_hv[r], "ss_simple", newSVpvn(&simple, 1));
 		}
 	}
-	Safefree(ss);
-	Safefree(bridge);
+	Safefree(seg); Safefree(bb); Safefree(acc); Safefree(en); Safefree(ss);
+	return out;
 }
 
 //an option that is a number, with the default the caller wrote down
@@ -5254,6 +5838,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	AV *bs = NULL;
 	AV *cont = NULL;
 	AV *hb = NULL;
+	HV *ssq = NULL;
 	const bool want_sasa  = opt_bool(aTHX_ o, "sasa", TRUE);
 	const bool want_iface = opt_bool(aTHX_ o, "interface", TRUE);
 	const bool want_shape = opt_bool(aTHX_ o, "shape", TRUE);
@@ -5397,18 +5982,21 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 		dihedrals(aTHX_ &s, bond, phospho);
 	}
 
-	if (want_hb || want_ssq) {
+	if (want_hb) {
 		backbone *CSP_RESTRICT bb = NULL;
 		const NV bond = opt_nv(aTHX_ o, "peptide_bond", CSP_PEPTIDE_BOND);
 		Newxz(bb, s.n_res ? s.n_res : 1, backbone);
 		backbone_read(aTHX_ &s, bb, bond);
 		ks_compute(aTHX_ &s, bb);
-		if (want_ssq) dssp_compute(aTHX_ &s, bb, store);
 		Safefree(bb);
-		if (want_hb) {
-			hb = hbond_list(aTHX_ &s);
-			sv_2mortal((SV *)hb);
-		}
+		hb = hbond_list(aTHX_ &s);
+		sv_2mortal((SV *)hb);
+	}
+	//the secondary structure reads a hydrogen bond table of its own; see the
+	//head of that block for why it cannot be the one above
+	if (want_ssq) {
+		ssq = dssp_compute(aTHX_ &s, store);
+		sv_2mortal((SV *)ssq);
 	}
 
 	if (want_cont) {
@@ -5514,6 +6102,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	if (want_bs) (void)hv_stores(out, "base_stacks", newRV_inc((SV *)bs));
 	if (want_cont) (void)hv_stores(out, "contacts", newRV_inc((SV *)cont));
 	if (want_hb) (void)hv_stores(out, "hbonds", newRV_inc((SV *)hb));
+	if (want_ssq) (void)hv_stores(out, "dssp", newRV_inc((SV *)ssq));
 	LEAVE;
 	return out;
 }

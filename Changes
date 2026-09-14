@@ -38,13 +38,31 @@ Revision history for Chem-Structure-Parser
      kcal/mol over 1A42, 1A22, 1AHW and 3AU6.
 
    - secondary structure: ss and ss_simple on every residue, the Kabsch-Sander
-     dictionary read off those bonds.  This is the one number in the module
-     that does not reproduce its reference exactly -- 96.9% of residues
-     eight-state and 98.2% three-state against mdtraj's compute_dssp() over
-     3,314 residues, the residual being beta sheet extension across bulges,
-     which mdtraj's implementation does and this does not.  t/features.t bounds
-     the disagreement rather than asserting equality, and the documentation
-     says so.
+     dictionary.  This is mdtraj's compute_dssp() letter for letter -- its
+     dssp.cpp (itself DSSP 2.2.0, ported by Robert T. McGibbon) transcribed
+     function for function, on a hydrogen bond table built to mdtraj's rules
+     rather than to this module's, computing in the float32 and the nanometre
+     mdtraj computes in because the assignment turns on two comparisons against
+     constants and one bond either way is worth several residues' letters.
+     t/features.t demands equality on every residue of every structure in
+     t/data rather than bounding a disagreement.
+
+     Measured over every tenth entry of PDBbind v2020 -- 1,011 of the 1,012
+     read, the other being a file mdtraj will not open -- the two give the same
+     letter for all 619,067 residues that have a backbone.
+
+   - new: structure_dssp(), the same assignment read the other way round --
+     chain id, then DSSP letter, then the positions in that chain's
+     residue_order of the residues that have it.  That is the shape to take a
+     whole fold in at once, where ss on each residue is the shape to read while
+     walking them.  structure_info($file, 'dssp') reads a file and hands back
+     just that hash, and structure_info($file, dssp => 1) leaves it at
+     $info->{dssp} alongside everything else.
+
+     A plain string in second place to structure_info() is new, and names a
+     view: the file is read, the view is taken out of it, and the rest is
+     thrown away.  It cannot be confused with an option -- a file name followed
+     by an even number of arguments was never anything but a mistake before.
 
    - half-sphere exposure: hse_up and hse_down on every standard amino acid
      residue, after Biopython's HSExposureCB.  Exact.
@@ -129,11 +147,16 @@ Revision history for Chem-Structure-Parser
    first, at the 1.8 A Biopython's PPBuilder uses.  Four collinear atoms get no
    torsion either, rather than the zero atan2(0, 0) returns.
 
- - t/data gains ss.pdb and fold.pdb, with their mmCIF twins: five cysteines of
-   1AHW, two of them bonded and one not, and sixty consecutive residues of 1A42
-   that hold an alpha helix, a 3-10 helix, two strands and the turns between
-   them.  Without the second, the hydrogen bonds and the secondary structure
-   would have had almost nothing in t/data to be tested on.
+ - t/data gains ss.pdb, fold.pdb and sheet.pdb, with their mmCIF twins: five
+   cysteines of 1AHW, two of them bonded and one not; sixty consecutive residues
+   of 1A42 that hold an alpha helix, a 3-10 helix and the turns and bends around
+   them; and sixty of 1H1V that hold, when read on their own, every one of the
+   eight DSSP letters -- the two strands of a ladder, an isolated bridge, and
+   the pi helix, which is the one letter a structure has to be looked for to
+   find.  Without the second the hydrogen bonds would have had almost nothing in
+   t/data to be tested on, and without the third the beta half of the secondary
+   structure -- the bridges, the ladders and the bulges between them, which is
+   most of the code -- would have had nothing at all.
 
  - and rna.pdb, duplex.pdb and wobble.pdb, likewise with their twins: six
    nucleotides of 1MSY's GUAA tetraloop, which is where the riboses are, four

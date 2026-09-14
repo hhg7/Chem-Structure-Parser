@@ -42,7 +42,7 @@ use File::Basename 'dirname';
 use File::Spec;
 use Chem::Structure::Parser qw(
 	structure_info structure_features structure_sasa structure_pi_stacking
-	structure_disulfides structure_base_pairs
+	structure_disulfides structure_base_pairs structure_dssp
 );
 
 my $dir = File::Spec->catdir(dirname(__FILE__), 'data');
@@ -579,22 +579,17 @@ sub compare {
 			"$file: chain $cid buries what it lost");
 	}
 
-	# Secondary structure.  This is the one place the module does not reproduce
-	# its reference exactly, and the test says so in numbers rather than passing
-	# quietly: the assignment is the Kabsch-Sander dictionary built on the
-	# hydrogen bonds checked above, and it agrees with mdtraj's DSSP on 96.9% of
-	# residues eight-state and 98.2% three-state over five real entries.  The
-	# residual is almost all beta sheet extension -- mdtraj's implementation
-	# joins ladders across bulges, which is a rule past the 1983 paper's core
-	# definitions and is not implemented here.  See the head of the block in
-	# Parser.xs.
+	# Secondary structure.  Exactly mdtraj's, letter for letter: the assignment
+	# is mdtraj's own dssp.cpp transcribed, on a hydrogen bond table built to
+	# mdtraj's rules rather than to this module's, and there is nothing to be
+	# within a tolerance of.  A residue that disagrees is a bug, not a rounding.
 	#
-	# The bound is 8% per structure, which is more than twice the worst observed
-	# (4.5% on 1AHW's eight-state) and would still catch a whole helix or strand
-	# going missing.  It is a bound on a known and documented shortfall, not a
-	# tolerance widened to make a failure go away.
+	# sheet.pdb is the one with the whole dictionary in it -- H, G, I, E, B, T,
+	# S and coil, all eight -- and it is here for this comparison: the beta half
+	# of the assignment is most of the code, and before it was added no fixture
+	# had a strand in it.
 	if (%want_dssp) {
-		my ($n, $bad8, $bad3) = (0, 0, 0);
+		my ($n, $bad) = (0, 0);
 		my %simple = (H => 'H', G => 'H', I => 'H', E => 'E', B => 'E',
 		              T => 'C', S => 'C', '_' => 'C');
 		for my $ri (sort { $a <=> $b } keys %want_dssp) {
@@ -608,18 +603,47 @@ sub compare {
 			}
 			$got = '_' if $got eq ' ';
 			$n++;
-			$bad8++ if $got ne $want;
-			$bad3++ if ($simple{$got} || 'C') ne ($simple{$want} || 'C');
+			if ($got ne $want) {
+				$bad++;
+				fail("$file: residue $ri is $want to mdtraj and $got here")
+					if $bad <= 5;   # one failure per residue, up to five, then the count
+			}
 			is($r->{ss_simple}, $simple{$got}, "$file: residue $ri three-state letter")
 				if $r->{ss_simple} ne ($simple{$got} || 'C');
 		}
-		if ($n) {
-			cmp_ok($bad8 / $n, '<', 0.08,
-				sprintf('%s: eight-state agrees with mdtraj on %.1f%% of %d residues',
-					$file, 100 * (1 - $bad8 / $n), $n));
-			cmp_ok($bad3 / $n, '<', 0.05,
-				sprintf('%s: three-state agrees on %.1f%%', $file, 100 * (1 - $bad3 / $n)));
+		is($bad, 0, sprintf('%s: every one of %d residues has mdtraj\'s DSSP letter', $file, $n))
+			if $n;
+
+		# and the roll-up is the same assignment read the other way round: chain,
+		# then letter, then where in that chain's residue_order the residues with
+		# it are.  Every residue that has a letter is in it exactly once.
+		my $dssp = structure_dssp($info);
+		my %seen;
+		for my $cid (sort keys %$dssp) {
+			for my $lt (sort keys %{ $dssp->{$cid} }) {
+				my $order = $info->{chains}{$cid}{residue_order};
+				for my $ix (@{ $dssp->{$cid}{$lt} }) {
+					my $r = $info->{chains}{$cid}{residues}{ $order->[$ix] };
+					$seen{"$cid/$ix"}++;
+					is($r->{ss}, $lt, "$file: $cid index $ix is filed under '$lt'")
+						if !defined $r->{ss} || $r->{ss} ne $lt;
+				}
+			}
 		}
+		my $lettered = 0;
+		for my $cid (@{ $info->{chain_order} }) {
+			my $order = $info->{chains}{$cid}{residue_order};
+			for my $ix (0 .. $#$order) {
+				next unless defined $info->{chains}{$cid}{residues}{ $order->[$ix] }{ss};
+				$lettered++;
+				fail("$file: $cid index $ix has a letter and is not in the roll-up")
+					unless $seen{"$cid/$ix"};
+			}
+		}
+		is(scalar(grep { $seen{$_} != 1 } keys %seen), 0,
+			"$file: no residue is in the roll-up twice");
+		is(scalar keys %seen, $lettered,
+			"$file: the roll-up holds every residue that has a letter, and nothing else");
 	}
 
 	# Disulfides.  The frozen answer is mdtraj's rule with its units made
