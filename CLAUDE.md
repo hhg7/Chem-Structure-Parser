@@ -300,11 +300,15 @@ prevent is still prevented, by hand.
   recognisable, not that it is bug-compatible. Perl appends `at FILE line N.`
   to a `die` without a trailing newline, which is where autodie put the same
   information, so the location survives too.
-- **`croak` where the caller's line is the useful one.** The rest of the module
-  already croaks for an argument it will not accept (`structure_info: 'file'
-  does not exist`); a failed `open` on a file the caller named belongs to the
-  caller in the same way. Use `die` only inside the private helpers, where the
-  module's own line is what a bug report needs.
+- **`die`, and name the function in the message.** The Perl half loads no
+  `Carp` and croaks nowhere: every one of its thirty-six error sites is a
+  plain `die` whose message begins with the function the caller called
+  (`structure_info: 'file' does not exist`), so the name says whose complaint
+  it is where the appended `at FILE line N.` says only where the check lives.
+  The XS half croaks, because a croak is what an XSUB has. Match what is there
+  rather than introducing `Carp` for one new call; changing all thirty-six
+  over is a decision to take on purpose, in one edit, with `t/errors.t`
+  rewritten to match, and not a thing to drift into.
 - **A method call was never autodie's job.** `IO::Uncompress::Gunzip->new` and
   `$z->read` are not builtins and were unchecked even when the pragma was
   loaded, which is why `_slurp_maybe_gzipped()` checks them itself. Keep that

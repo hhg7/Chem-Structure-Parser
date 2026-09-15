@@ -789,8 +789,12 @@ sub _options {
 			unless (reftype($o{chains}) || '') eq 'ARRAY';
 		die "$who: chains is empty" unless @{ $o{chains} };
 	}
+	# 0 is a model number and not a mistake: an ensemble numbered from 0 is
+	# unusual and legal, which is why the XS takes a negative number rather than
+	# zero as its "every model" sentinel.  The message said positive and the
+	# test has always accepted 0; it is the message that was wrong.
 	if (defined $o{model} && $o{model} ne 'all') {
-		die "$who: model must be a positive integer or 'all', not '$o{model}'"
+		die "$who: model must be a whole number or 'all', not '$o{model}'"
 			unless $o{model} =~ /\A[0-9]+\z/;
 	}
 	return \%o;
@@ -860,7 +864,16 @@ sub _slurp_maybe_gzipped {
 			or die "Chem::Structure::Parser: cannot gunzip '$file': "
 			       . do { no warnings 'once'; $IO::Uncompress::Gunzip::GunzipError };
 		my ($text, $buf) = ('', '');
-		while ($z->read($buf, 65536) > 0) {
+		# read() returns 0 at the end of the stream and a negative number on
+		# error, so a `> 0' loop reads a truncated or corrupt archive as a short
+		# file: half of mini.pdb.gz came back as a structure with no atoms in it
+		# and nothing said so.  That is the failure autodie existed to stop, on a
+		# method autodie never covered, so it is checked here.
+		while (1) {
+			my $n = $z->read($buf, 65536);
+			die "Can't read from '$file': '" . $z->error . "'"
+				unless defined $n && $n >= 0;
+			last if $n == 0;
 			$text .= $buf;
 			last if defined $limit && length($text) >= $limit;
 		}
@@ -914,11 +927,22 @@ sub _read {
 # is MODEL 7, would otherwise come back empty for the default model => 1.  The
 # parse says which model numbers it saw, so ask again for the first real one
 # rather than handing back a structure with no atoms in it.
+#
+# A file with no MODEL records has one model and it is model 1 -- that is what
+# the parse read its atoms under -- so it is the fall-back for that file as
+# model 0 is for the ensemble numbered from 0.  Without it the rule held for an
+# ensemble and not for the crystal structures that are most of the archive:
+# model => 2 of a file with no MODEL records handed back a structure with no
+# atoms and no chains and said nothing, which is the answer this exists to
+# prevent.  Nothing is read twice to get it: the model the caller asked for is
+# already in the list for every file that was emptied by something else -- a
+# chains or waters option, or a file with no coordinates at all -- and those
+# return here untouched.
 sub _retry_model {
 	my ($p, $o, $parse, $src) = @_;
 	return $p if $p->{n_atoms} || $o->{model} eq 'all';
-	my $nums = $p->{model_numbers};
-	return $p unless @$nums && !grep { $_ == $o->{model} } @$nums;
+	my $nums = @{ $p->{model_numbers} } ? $p->{model_numbers} : [ 1 ];
+	return $p if grep { $_ == $o->{model} } @$nums;
 	my $x = _xs_options($o);
 	$x->{model} = $nums->[0];
 	my $q = $parse->($src, $x);
@@ -1041,11 +1065,17 @@ sub _assemble {
 
 	for my $r (0 .. $#$rf) {
 		my ($i0, $i1) = ($rf->[$r], $rl->[$r]);
-		my $m   = $model->[$i0];
-		my $cid = $chain->[$i0];
-		my $rn  = $resname->[$i0];
-		my $num = $resseq->[$i0];
-		my $ic  = $icode->[$i0];
+		# Where the residue's identity is.  The parse emits it once per residue
+		# when it is building the atom hashes and once per atom when it is
+		# building columns, because that is the shape each caller is asking for
+		# -- and either way it is read here, at the residue.  The six fields
+		# were a third of everything the parse built; see the note in the XS.
+		my $ri  = $atom_of ? $r : $i0;
+		my $m   = $model->[$ri];
+		my $cid = $chain->[$ri];
+		my $rn  = $resname->[$ri];
+		my $num = $resseq->[$ri];
+		my $ic  = $icode->[$ri];
 		my $key = (defined $num ? $num : '') . $ic;
 
 		my $mm = $by_model{$m} ||= { chains => {}, chain_order => [] };
@@ -1079,7 +1109,7 @@ sub _assemble {
 				key        => $key,
 				one        => res1($rn),
 				type       => $type,
-				hetero     => $het->[$i0],
+				hetero     => $het->[$ri],
 				standard   => ($STANDARD{$rn} ? 1 : 0),
 				modified   => (($type eq 'amino_acid' || $type eq 'nucleotide') && !$STANDARD{$rn}) ? 1 : 0,
 				n_atoms    => 0,
@@ -1102,7 +1132,7 @@ sub _assemble {
 		$res->{_sb}      += $rsb->[$r] if defined $rsb->[$r];
 		$res->{_nb}      += $rnb->[$r];
 		$c->{n_atoms}    += $n;
-		if ($het->[$i0]) {    # the record type is part of a residue's identity
+		if ($het->[$ri]) {    # the record type is part of a residue's identity
 			$c->{n_hetatm} += $n;
 			$st->{n_hetatm} += $n;
 		}
@@ -1241,7 +1271,7 @@ sub _finish_chains {
 			# coordinates alone, so a chain answers the same whether it was
 			# read from a PDB file or an mmCIF one and whether or not the
 			# headers were parsed.
-			my (@gaps, @missing, %numbered);
+			my (@gaps, %missing, %numbered);
 			my @nums = grep { defined } map { $_->{number} } @poly;
 			$numbered{$_} = 1 for @nums;
 			my $budget = @nums ? $nums[-1] - $nums[0] + 1 - keys %numbered : 0;
@@ -1251,15 +1281,20 @@ sub _finish_chains {
 				my $n = $b->{number} - $a->{number} - 1;
 				next if $n < 1 || $n > $budget;
 				push @gaps, { after => $a->{key}, before => $b->{key}, missing => $n };
-				push @missing, ($a->{number} + 1) .. ($b->{number} - 1);
+				# the numbers the jump passes over, less any the chain turns out
+				# to have after all.  A polymer numbered out of order -- the
+				# same thing the budget above is for -- has jumps that overlap
+				# each other and jumps that pass over a residue further down the
+				# list, and a set rather than a list is what keeps "is 47
+				# modelled?" answerable: no number appears twice and no number
+				# appears that the chain has.
+				$missing{$_} = 1
+					for grep { !$numbered{$_} } ($a->{number} + 1) .. ($b->{number} - 1);
 			}
-			# a residue numbered out of line with the rest can leave the list
-			# out of order, and ascending is the whole use of it
-			@missing = sort { $a <=> $b } @missing
-				if grep { $missing[$_] < $missing[ $_ - 1 ] } 1 .. $#missing;
 			$c->{gaps}             = \@gaps;
 			$c->{n_gaps}           = scalar @gaps;
-			$c->{missing_residues} = \@missing;
+			# ascending, and numbers rather than the strings a hash key is
+			$c->{missing_residues} = [ map { $_ + 0 } sort { $a <=> $b } keys %missing ];
 		}
 	}
 	return $info;
@@ -2165,9 +2200,20 @@ sub _c {
 	return $s;
 }
 
+# _n($field) -- a numeric field as a number, or undef where it is not one.
+#
+# The pattern spells a number rather than "digits and dots", which is what it
+# used to say: [\d.]+ also matches '1.2.3' and a lone '.', neither of which is
+# something Perl will add.  Under warnings FATAL => 'all' that is not a wrong
+# answer but a dead read -- a CRYST1 whose cell edge is written '1.2.3' took
+# the whole structure down with "Argument isn't numeric in addition".  Fields
+# of that shape are in the archive: 5m04 writes its pH as '5.4.-5.8'.  A field
+# that is not a number is now the undef it always meant.  '1.' and '.5' still
+# read as numbers, as they always did and as Perl does.
 sub _n {
 	my $v = _t($_[0]);
-	return $v =~ /\A[-+]?[\d.]+(?:[eE][-+]?\d+)?\z/ ? $v + 0 : undef;
+	return $v =~ /\A[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?\z/
+	     ? $v + 0 : undef;
 }
 
 # continuation records: text from column $from on, glued back together.  A
@@ -2365,7 +2411,7 @@ mdtraj's C<compute_dssp()> letter for letter — see C<structure_dssp>.
 
 The coordinate section is parsed in C, because across a directory of
 structures it is millions of lines: the largest entry in PDBbind v2020 is
-33 MB and 411,648 atom records, and it reads in about 1.5 seconds. The header
+33 MB and 411,648 atom records, and it reads in about a second. The header
 records are parsed in Perl, because they are irregular and there are only a
 few dozen of them in a file.
 
@@ -2923,23 +2969,29 @@ For a very large structure the options are the difference between a hash of
 hashes that fits in memory and one that does not. The largest entry in PDBbind
 v2020 is 2wy2: 33 MB, 64 models, 411,648 atom records.
 
- structure_info($f)                # model 1 only    50 MB    0.07 s
- structure_info($f, model => 'all')                 711 MB    1.4 s
- structure_info($f, model => 'all', atoms => 0)     418 MB    0.9 s
+ structure_info($f)                # model 1 only    47 MB    0.20 s
+ structure_info($f, model => 'all')                 514 MB    1.06 s
+ structure_info($f, model => 'all', atoms => 0)     408 MB    0.74 s
+
+The chains are built from one model whichever of those is asked for — C<models>
+is the rest of them — so the physical properties in the first two rows cost the
+same, and the third has none to compute.
 
 C<features> is the expensive one, and it is on by default because a structure's
 surface, size and contacts are as much a part of what it is as its sequence, and
 a caller who has to know to ask mostly does not. What it costs is measured, over
 60 structures of PDBbind:
 
- structure_info($f, features => 0)         1.50 s   214,000 atoms/s
- structure_info($f)                       16.38 s    19,500 atoms/s   10.9x
- ... with interface => 0                  10.67 s    30,000 atoms/s    7.1x
- ... with sasa => 0                        4.01 s    80,000 atoms/s    2.7x
+ structure_info($f, features => 0)         1.30 s   246,000 atoms/s
+ structure_info($f)                       10.77 s    29,700 atoms/s    8.3x
+ ... with interface => 0                  10.02 s    32,000 atoms/s    7.7x
+ ... with sasa => 0                        3.80 s    84,000 atoms/s    2.9x
 
 Nearly all of it is the solvent-accessible surface, at 960 sphere points per
-atom; everything else together is 2.7 times the read. C<< interface =E<gt> 0 >> drops the
-per-chain surfaces and takes a third off the whole thing.
+atom; everything else together is 2.9 times the read. C<< interface =E<gt> 0 >> drops the
+per-chain surfaces, which is a fourteenth of the whole: an atom with no
+neighbour outside its own chain has the same surface alone as it has in the
+structure, and only the ones that do have such a neighbour are computed twice.
 
 C<< features =E<gt> 0 >> is what to reach for when reading a directory for its headers or
 its sequences. C<< atoms =E<gt> 0 >> turns them off on its own — there are no coordinates

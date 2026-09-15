@@ -6,15 +6,15 @@ reader that slices the same columns in the same order and builds the same
 nested hash — not a straw man, just the same job done per line in Perl —
 reading 200 structures from PDBbind v2020, best of three:
 
-    structure_info                           6.30 s     168,000 atoms/s
-    structure_info, atoms => 0               4.05 s     262,000 atoms/s
-    the XS parse alone                       1.97 s     538,000 atoms/s
-    the same reader, in pure Perl            5.48 s     193,000 atoms/s
-    pure Perl, and the same statistics       7.14 s     148,000 atoms/s
+    structure_info, features => 0            4.81 s     221,000 atoms/s
+    structure_info, atoms => 0               3.55 s     299,000 atoms/s
+    the XS parse alone                       1.51 s     704,000 atoms/s
+    the same reader, in pure Perl            5.32 s     198,000 atoms/s
+    pure Perl, and the same statistics       6.95 s     152,000 atoms/s
 
-**The parse is 2.8x the same parse written in Perl.** That is what the C buys.
+**The parse is 3.5x the same parse written in Perl.** That is what the C buys.
 
-`structure_info()` as a whole lands at 0.9x the plain Perl reader and 1.1x the
+`structure_info()` as a whole lands at 1.1x the plain Perl reader and 1.4x the
 one that also gathers the statistics — while doing a good deal more than
 either: the header records, SEQRES, the gaps between the declared sequence and
 the modelled one, chain typing, ligand and ion classification. Building a hash
@@ -22,12 +22,24 @@ of hashes out of what was read costs what it costs in any language, because
 the hashes are the answer. Reading is the part worth writing in C, and reading
 is the part that got faster.
 
-Two rounds of that measurement changed the code. The first showed the whole
+Three rounds of that measurement changed the code. The first showed the whole
 read coming out *slower* than the naive Perl reader, because every per-atom
 statistic was being gathered in Perl over data C had just finished reading;
 those moved into the parse. The second showed each atom being built twice —
 once as columns in C, once as a hash in Perl — and the parse now builds the
 hash itself, which took another 25% off both the time and the memory.
+
+The third counted the SVs. A residue's identity — its name, its chain, its
+number, its insertion code, whether it is a HETATM, which model it is in — was
+built once per atom and read once per residue, and six strings and integers
+per atom against six per residue was a third of everything the parse built.
+Building it where it is read took the 200-file parse above from 1.95 s to
+1.59 s and the peak memory of the largest entry in the set — 4fqr, 90,792
+atoms — from 153 MB to 126 MB, and the whole `structure_info()` read of it
+from 168 MB to 141 MB. A caller of the low-level parse who asks for columns
+still gets one entry per atom, because there the columns are the answer;
+`t/parse.t` reads four fixtures in both shapes and asserts they say the same
+thing.
 
 # What is written in C, and what is not
 
@@ -42,7 +54,10 @@ disagree.
 The per-atom result is columnar — one array per field rather than one hash per
 atom — which is both faster to build and about an order of magnitude smaller
 while it is being built. Perl turns it into the nested hash afterwards, and
-only for the atoms that were kept.
+only for the atoms that were kept. That is the shape a caller of the low-level
+parse gets; when the caller wants the atom hashes, the parse builds those
+directly and emits the residue's identity once per residue rather than once per
+atom, which is where Perl reads it either way.
 
 Everything else is Perl. The header records are irregular, they are a few
 dozen lines per file rather than hundreds of thousands, and they are where the
@@ -77,17 +92,25 @@ left as the file wrote it rather than dressed up as one.
 `benchmark.pl` measures these too.  Over 60 structures of PDBbind v2020, with
 everything the module computes by default:
 
-    structure_info, features => 0     1.50 s    214,000 atoms/s
-    structure_info, the default      16.38 s     19,500 atoms/s   10.9x
-      ... with interface => 0        10.67 s     30,000 atoms/s    7.1x
-      ... with sasa => 0              4.01 s     80,000 atoms/s    2.7x
+    structure_info, features => 0     1.30 s    246,000 atoms/s
+    structure_info, the default      10.77 s     29,700 atoms/s    8.3x
+      ... with interface => 0        10.02 s     32,000 atoms/s    7.7x
+      ... with sasa => 0              3.80 s     84,000 atoms/s    2.9x
 
-So the properties cost eleven times the read, and **nearly all of that is the
+So the properties cost eight times the read, and **nearly all of that is the
 surface**: everything else together -- the shape, the torsion angles, the
 contacts, the exposure, the hydrogen bonds, the secondary structure, the
-disulfides and the ring geometry -- comes to 2.7x the read between them.  Inside
-the surface, the per-chain runs that give the buried area are a third of it,
-which is why `interface` is an option of its own.
+disulfides and the ring geometry -- comes to 2.9x the read between them.
+
+The per-chain runs that give the buried area used to be a third of what the
+properties cost and are now a fourteenth -- 0.75 s of the 10.77 above, where
+they were 5.7 s of 16.38.  An atom's surface is decided by the atoms whose spheres reach it, so
+an atom with no neighbour outside its own chain has the same surface with the
+other chains there and taken away; the whole-structure run marks the ones that
+do have such a neighbour, and only those are computed again.  `interface` stays
+an option because it is still the difference between one surface and two, and
+because a caller who does not want the buried area should not pay for it at
+all.
 
 That ratio is what decided where the work goes.
 
@@ -116,6 +139,13 @@ contacts, and the CA atoms again for the secondary structure -- and
 the bridge search in the secondary structure avoids one entirely by reading its
 candidates out of the hydrogen bond list, which is linear in the bonds where the
 obvious search is quadratic in the residues.
+
+A grid is not enough on its own: the contacts walked it once per residue and
+found that residue's own atoms by scanning the whole heavy-atom array, which is
+residues times atoms and was 2.25 s of 4fqr's 11,406 residues and 88,416 heavy
+atoms.  The atoms of a residue are one contiguous run of that array -- the walk
+that built it went residue by residue -- so walking the run instead is 0.15 s
+for the same pairs.
 
 **The secondary structure counts the hydrogen bonds twice, on purpose.**
 `structure_hbonds()` reports the bonds this module believes in -- a donor has to

@@ -66,7 +66,7 @@ mdtraj's `compute_dssp()` letter for letter — see `structure_dssp`.
 
 The coordinate section is parsed in C, because across a directory of
 structures it is millions of lines: the largest entry in PDBbind v2020 is
-33 MB and 411,648 atom records, and it reads in about 1.5 seconds. The header
+33 MB and 411,648 atom records, and it reads in about a second. The header
 records are parsed in Perl, because they are irregular and there are only a
 few dozen of them in a file.
 
@@ -531,23 +531,29 @@ For a very large structure the options are the difference between a hash of
 hashes that fits in memory and one that does not. The largest entry in PDBbind
 v2020 is 2wy2: 33 MB, 64 models, 411,648 atom records.
 
-    structure_info($f)                # model 1 only    50 MB    0.07 s
-    structure_info($f, model => 'all')                 711 MB    1.4 s
-    structure_info($f, model => 'all', atoms => 0)     418 MB    0.9 s
+    structure_info($f)                # model 1 only    47 MB    0.20 s
+    structure_info($f, model => 'all')                 514 MB    1.06 s
+    structure_info($f, model => 'all', atoms => 0)     408 MB    0.74 s
+
+The chains are built from one model whichever of those is asked for — `models`
+is the rest of them — so the physical properties in the first two rows cost the
+same, and the third has none to compute.
 
 `features` is the expensive one, and it is on by default because a structure's
 surface, size and contacts are as much a part of what it is as its sequence, and
 a caller who has to know to ask mostly does not. What it costs is measured, over
 60 structures of PDBbind:
 
-    structure_info($f, features => 0)         1.50 s   214,000 atoms/s
-    structure_info($f)                       16.38 s    19,500 atoms/s   10.9x
-    ... with interface => 0                  10.67 s    30,000 atoms/s    7.1x
-    ... with sasa => 0                        4.01 s    80,000 atoms/s    2.7x
+    structure_info($f, features => 0)         1.30 s   246,000 atoms/s
+    structure_info($f)                       10.77 s    29,700 atoms/s    8.3x
+    ... with interface => 0                  10.02 s    32,000 atoms/s    7.7x
+    ... with sasa => 0                        3.80 s    84,000 atoms/s    2.9x
 
 Nearly all of it is the solvent-accessible surface, at 960 sphere points per
-atom; everything else together is 2.7 times the read. `interface => 0` drops the
-per-chain surfaces and takes a third off the whole thing.
+atom; everything else together is 2.9 times the read. `interface => 0` drops the
+per-chain surfaces, which is a fourteenth of the whole: an atom with no
+neighbour outside its own chain has the same surface alone as it has in the
+structure, and only the ones that do have such a neighbour are computed twice.
 
 `features => 0` is what to reach for when reading a directory for its headers or
 its sequences. `atoms => 0` turns them off on its own — there are no coordinates

@@ -22,6 +22,34 @@ BEGIN {
 }
 use Chem::Structure::Parser;
 
+# Devel::Cover, under which there is no leak count to take.
+#
+# Test::LeakTrace's CAVEATS say it "does not work with Devel::Cover", and
+# leaks_cmp_ok() carries the guard for it: where the runops routine is not
+# perl's own it reports 'skipped (under Devel::Cover)' and tests nothing.
+# Devel::Cover 1.52 installs no runops routine, so that guard never fires and
+# every statement it has instrumented is counted as a leak instead -- `cover -t'
+# failed 65 of this file's 85 tests, each reported leak one of Devel::Cover's
+# own per-statement counters (an IV holding a pointer) attributed to a line of
+# Parser.pm.  They are not this module's SVs and no arrangement of this module's
+# reference counts would make them go away.
+#
+# ~/Scripts/stats/t/01.t writes `unless $INC{'Devel/Cover.pm'}' on each call.
+# Spelled that way here the blocks would not run at all, and a coverage run
+# would then have no figure for the paths several of them are the only caller
+# of, so the guard is in one place and runs the block anyway: what is dropped is
+# the count, which is the only part Devel::Cover has made meaningless.
+if (exists $INC{'Devel/Cover.pm'}) {
+	no warnings 'redefine';    # the same prototype, so no mismatch to warn about
+	*no_leaks_ok = sub (&;$) {
+		my ($block, $description) = @_;
+		my $ok = eval { $block->(); 1 };
+		diag($@) unless $ok;
+		ok($ok, (defined $description ? "$description: " : '')
+		        . 'skipped (under Devel::Cover)');
+	};
+}
+
 #--------
 # the XS parse
 #--------

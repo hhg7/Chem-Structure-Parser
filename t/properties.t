@@ -57,6 +57,52 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 		'so the documented fast path still works';
 }
 
+# ---- each accessor on a structure that has nothing cached ----------------
+#
+# The block above reaches every one of these through the cache, which is one
+# line of each of them.  This is the other line: a structure read with
+# features => 0 has nothing to hand back, so each computes its own and only its
+# own -- which is the call a caller who wants one property of a structure they
+# already have makes, and the only way into most of these bodies.
+{
+	my $off = structure_info("$data/fold.pdb", features => 0);
+	my $all = structure_info("$data/fold.pdb");
+
+	is_deeply(structure_contacts($off), $all->{features}{contacts},
+		'structure_contacts computes the same list the read would have');
+	is_deeply(structure_dssp($off), $all->{features}{dssp},
+		'and structure_dssp the same secondary structure');
+	is_deeply(structure_hbonds($off), $all->{features}{hbonds},
+		'and structure_hbonds the same bonds');
+	is_deeply(structure_sasa($off), $all->{features}{sasa},
+		'and structure_sasa the same surface');
+	is_deeply(structure_disulfides($off), $all->{features}{disulfides},
+		'and structure_disulfides the same list');
+	is_deeply(structure_pi_stacking($off), $all->{features}{pi_stacking},
+		'and structure_pi_stacking the same pairs');
+	is_deeply(structure_base_pairs($off), $all->{features}{base_pairs},
+		'and structure_base_pairs the same pairs');
+	is_deeply(structure_base_stacks($off), $all->{features}{base_stacks},
+		'and structure_base_stacks the same stacks');
+
+	# computing one of them writes only its own share into the structure: the
+	# secondary structure goes onto the residues, the contacts count with it,
+	# and the surface does not
+	my $one = structure_info("$data/fold.pdb", features => 0);
+	structure_dssp($one);
+	my $r = $one->{chains}{A}{residues}{ $one->{chains}{A}{residue_order}[5] };
+	ok(defined $r->{ss}, 'structure_dssp leaves the letter on the residue');
+	ok(!defined $r->{sasa}, 'and nothing the surface would have written');
+
+	# structure_dssp() has no options at all, so anything named is a mistake
+	throws_ok { structure_dssp($all, probe => 1.4) } qr/unknown option/,
+		'structure_dssp takes no options and says so';
+	throws_ok { structure_contacts($all, probe => 1.4) } qr/unknown option/,
+		'and structure_contacts takes only its own';
+	throws_ok { structure_hbonds($all, probe => 1.4) } qr/unknown option/,
+		'and so does structure_hbonds';
+}
+
 # ---- the rest of the properties -------------------------------------------
 {
 	my $i = structure_info("$data/fold.pdb");
@@ -85,6 +131,27 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 	cmp_ok(abs($c->{sasa_alone} - $c->{sasa}), '<', 1e-9,
 		'a structure of one chain has the same surface alone as together');
 	cmp_ok(abs($f->{sasa}{buried}), '<', 1e-9, 'and buries nothing');
+
+	# and a structure of several: a chain's isolated surface is what the same
+	# chain read on its own has, which is the definition and is also a different
+	# road to it -- the chain is read out of the file again, into its own
+	# structure, and its whole surface computed from scratch.  The interface
+	# pass does not compute every atom twice: an atom with no neighbour outside
+	# its own chain has the same surface either way and keeps the one it has, so
+	# this is what says the ones it does compute are the right ones.
+	for my $stem (qw(mini duplex)) {
+		my $whole = structure_info("$data/$stem.pdb");
+		next unless @{ $whole->{chain_order} } > 1;
+		for my $cid (@{ $whole->{chain_order} }) {
+			my $solo = structure_info("$data/$stem.pdb", features => 0, chains => [ $cid ]);
+			# 0 is what the difference measures on every fixture and on the 131
+			# chains of the 32 multi-chain entries of PDBbind v2020 it was run
+			# over: the two compute the same sum of the same per-atom areas
+			cmp_ok(abs(structure_sasa($solo)->{total} - $whole->{chains}{$cid}{sasa_alone}),
+				'<', 1e-9,
+				"$stem chain $cid: its surface alone is its surface read alone");
+		}
+	}
 
 	# torsion angles
 	my @with_phi = grep { defined $c->{residues}{$_}{phi} } @{ $c->{residue_order} };
@@ -129,12 +196,89 @@ my $data = dirname(abs_path(__FILE__)) . '/data';
 		cmp_ok($b->{energy}, '>=', -9.9, 'and none is stronger than the floor')
 			if $b->{energy} < -9.9;
 	}
+	{
+		# the floor is not decoration: Kabsch and Sander's energy is a sum of
+		# reciprocal distances, so two atoms refined on top of each other send
+		# it to minus infinity.  mdtraj clips at -9.9 kcal/mol and so does this.
+		# The atom is moved in the structure rather than written into a fixture
+		# because a deposited file with two atoms at one position is not a
+		# fixture anybody would recognise, and this is the one case the clip is
+		# for.
+		my $j = structure_info("$data/fold.pdb", features => 0);
+		my $ch = $j->{chains}{A};
+		my @rk = @{ $ch->{residue_order} };
+		my ($first, $third) = @{ $ch->{residues} }{ @rk[0, 2] };
+		@{ $first->{atoms}{O} }{qw(x y z)} = @{ $third->{atoms}{N} }{qw(x y z)};
+		my @floored = grep { $_->{energy} <= -9.9 } @{ structure_hbonds($j) };
+		is(scalar @floored, 1, 'an acceptor sitting on a donor gives one bond at the floor');
+		# -9.9 is a C double literal in the XS and whatever an NV is here, and
+		# on a long double or __float128 perl those are not the same number:
+		# the floor comes back as -9.90000000000000036, the double -9.9
+		# widened.  That is the constant to clip at -- mdtraj's is a float --
+		# so this compares to within the gap between the two, which is 3.6e-16
+		# on perl-5.12.5 (-Duselongdouble) and 0 on a double perl.
+		cmp_ok(abs($floored[0]{energy} + 9.9), '<', 1e-14,
+			'and the floor is the number, not an infinity');
+	}
 
 	# contacts and exposure
 	cmp_ok(scalar @{ $f->{contacts} }, '>', 50, 'and residue contacts');
 	for my $ct (@{ $f->{contacts} }) {
 		cmp_ok($ct->{distance}, '<=', 4.5, 'no contact is past the cutoff')
 			if $ct->{distance} > 4.5;
+	}
+	# The contact list against the definition itself, spelled out in Perl: every
+	# pair of residues, every pair of their heavy atoms, the shortest distance.
+	# mdtraj's answer is what t/features.t holds the numbers to; what this holds
+	# is the machinery underneath them -- a cell grid, and a walk that takes a
+	# residue's atoms to be one contiguous run of the heavy-atom array.  Neither
+	# is visible in a comparison that only ever sees what came out.
+	{
+		my %want;
+		my @res;
+		for my $cid (@{ $i->{chain_order} }) {
+			my $ch = $i->{chains}{$cid};
+			for my $rk (@{ $ch->{residue_order} }) {
+				my $r = $ch->{residues}{$rk};
+				my @a;
+				for my $an (@{ $r->{atom_order} }) {
+					my $a = $r->{atoms}{$an};
+					next unless defined $a->{x};
+					my $e = defined $a->{element} ? $a->{element} : '';
+					push @a, $a unless $e eq 'H' || $e eq 'D';
+				}
+				push @res, [ "$cid/$rk", \@a ];
+			}
+		}
+		for my $p (0 .. $#res) {
+			for my $q ($p + 1 .. $#res) {
+				my $min;
+				for my $a (@{ $res[$p][1] }) {
+					for my $b (@{ $res[$q][1] }) {
+						my $d2 = ($a->{x} - $b->{x}) ** 2
+						       + ($a->{y} - $b->{y}) ** 2
+						       + ($a->{z} - $b->{z}) ** 2;
+						$min = $d2 if !defined $min || $d2 < $min;
+					}
+				}
+				$want{"$res[$p][0]|$res[$q][0]"} = sqrt($min)
+					if defined $min && $min < 4.5 * 4.5;
+			}
+		}
+		my %got = map {; "$_->{chain1}/$_->{residue1}|$_->{chain2}/$_->{residue2}"
+		                 => $_->{distance} } @{ $f->{contacts} };
+		is(scalar keys %got, scalar keys %want,
+			'the grid finds as many contacts as an all-against-all walk');
+		my @wrong = grep { !exists $got{$_} || abs($got{$_} - $want{$_}) > 1e-9 }
+		            sort keys %want;
+		push @wrong, grep { !exists $want{$_} } sort keys %got;
+		# 1e-9 is a formality rather than a measured allowance: the two compute
+		# the same sum of three squares and the largest difference seen is 0 --
+		# over the 251 contacts of the nine fixtures in t/data that have any,
+		# on the default double perl.  What it leaves room for is a compiler
+		# reassociating that sum, not a difference anyone has observed.
+		is(scalar @wrong, 0, 'and the same pairs, at the same distances')
+			or diag(join "\n", @wrong[0 .. ($#wrong > 4 ? 4 : $#wrong)]);
 	}
 	my $n_hse = grep { defined $c->{residues}{$_}{hse_up} } @{ $c->{residue_order} };
 	cmp_ok($n_hse, '>', 50, 'and half-sphere exposure on most residues');
@@ -458,6 +602,50 @@ for my $pair ([ 'stack.pdb', 'stack.cif' ], [ 'bases.pdb', 'bases.cif' ],
 		'and a stacking threshold nothing to structure_sasa';
 }
 
+# ---- the same limits, checked again in the XS ------------------------------
+#
+# Every croak above is Perl's, and the XS repeats the ones it cannot work with
+# -- a probe of -1 or a phosphodiester bond of 0 would be a nonsense grid
+# rather than a wrong answer.  Nothing that goes through the public functions
+# can reach them, because _feature_options() has already refused; _features()
+# is the XSUB underneath and is what a caller reaching past that would hit, so
+# it is asked directly here.  Written out rather than left to the Perl above,
+# because a guard nothing tests is a guard nobody knows has stopped compiling.
+{
+	my $i = structure_info("$data/fold.pdb", features => 0);
+	# an array and not a hash: two of these are refused by the same message,
+	# and a hash would keep one of the two
+	my @refused = (
+		[ 'probe must not be negative'       => { probe => -1 } ],
+		[ 'points must be between'           => { points => 0 } ],
+		[ 'points must be between'           => { points => 10_000_001 } ],
+		[ 'peptide_bond must be a positive'  => { peptide_bond => 0, dihedrals => 1 } ],
+		[ 'phosphodiester_bond must be a positive' => { phosphodiester_bond => -1, dihedrals => 1 } ],
+		[ 'contact_distance must be a positive'    => { contact_distance => 0 } ],
+		[ 'disulfide_distance must not be negative' => { disulfide_distance => -1 } ],
+		[ 'base_pair_hbond must be a positive'      => { base_pair_hbond => 0 } ],
+		[ 'base_pair_stagger must not be negative'  => { base_pair_stagger => -1 } ],
+		[ 'base_stack_distance must be a positive'  => { base_stack_distance => 0 } ],
+		[ 'base_stack_omega must be between'        => { base_stack_omega => 181 } ],
+	);
+	for my $case (@refused) {
+		my ($msg, $opt) = @$case;
+		throws_ok { Chem::Structure::Parser::_features($i, $opt, 'xs') }
+			qr/\Qxs: $msg\E/, "the XS refuses it too: $msg";
+	}
+	throws_ok { Chem::Structure::Parser::_features([], {}, 'xs') }
+		qr/structure must be a hash reference/,
+		'and refuses a structure that is not a hash reference';
+	throws_ok { Chem::Structure::Parser::_features($i, [], 'xs') }
+		qr/options must be a hash reference/,
+		'and options that are not one';
+	# who => undef is the documented default, which is what the module passes
+	# when it has nothing better to call the caller
+	throws_ok { Chem::Structure::Parser::_features($i, { probe => -1 }, undef) }
+		qr/\Qstructure_features: probe\E/,
+		'with no name to complain in, it complains as structure_features';
+}
+
 # ---- the two base pair thresholds are the whole of the rule ---------------
 #
 # wobble.pdb is twelve nucleotides of 1MSY whose own annotation records six
@@ -479,6 +667,132 @@ for my $pair ([ 'stack.pdb', 'stack.cif' ], [ 'bases.pdb', 'bases.cif' ],
 	# plane, which is a helical rise and is the whole reason the stagger is
 	# tested at all
 	structure_features($i);
+}
+
+# ---- a pair needs every atom the pairing names --------------------------
+#
+# A base whose density ran out, or that was modelled without one of its
+# exocyclic atoms, is not a base pair with a bond missing: it is not a pair at
+# all, and the rule is the same one an incomplete aromatic ring gets.  Taking
+# the atom out of the structure rather than writing a fixture keeps the
+# comparison to one thing -- everything else about the two reads is identical.
+{
+	my $i = structure_info("$data/wobble.pdb", features => 0);
+	my $before = structure_base_pairs($i);
+	my $p = $before->[0];
+	my $r = $i->{chains}{ $p->{chain1} }{residues}{ $p->{residue1} };
+	my $gone = $p->{hbonds}[0]{atom1};
+	delete $r->{atoms}{$gone};
+	my $after = structure_base_pairs($i);
+	is(scalar @$after, scalar(@$before) - 1,
+		"a pair missing its $gone is one pair fewer, not one bond fewer");
+	is_deeply([ map { "$_->{residue1}|$_->{residue2}" } @$after ],
+	          [ map { "$_->{residue1}|$_->{residue2}" } @{$before}[ 1 .. $#$before ] ],
+		'and the pairs that still have their atoms are untouched');
+	# the stacking reads the ring rather than the pairing atoms, and O6 is not
+	# one of the ring's, so the same structure still stacks
+	cmp_ok(scalar @{ structure_base_stacks($i) }, '>', 0,
+		'while the stacks, which read the ring, are unaffected');
+}
+
+# ---- files a depositor should not write, and does ------------------------
+{
+	# an element field that spells no element.  It is kept as the file wrote it
+	# -- dressing 'Xx' up as an element would be inventing chemistry -- and the
+	# atom is counted so that a caller can see how much of the structure the
+	# properties had no radius or mass for.
+	my $prefix = 'ATOM      1  CA  ALA A   1      10.000  10.000  10.000  1.00 20.00';
+	is(length $prefix, 66, 'the record prefix ends where the B-factor does');
+	my $i = structure_info_string(
+		$prefix . (' ' x 10) . "XX\n"
+		. 'ATOM      2  CB  ALA A   1      11.000  10.000  10.000  1.00 20.00' . (' ' x 10) . "C\n");
+	is($i->{chains}{A}{residues}{1}{atoms}{CA}{element}, 'XX',
+		'an element field that is not an element is kept as it was written');
+	is($i->{features}{n_no_element}, 1, 'and counted as one the properties could not place');
+	is($i->{stats}{elements}{XX}, 1, 'the tally has it under its own name');
+}
+{
+	# A coordinate of 'inf'.  strtod reads it, so it arrives as an NV infinity
+	# and the cell grid cannot be built from the extent: the doubling loop in
+	# grid_build() gives up after its bounded number of turns and falls back to
+	# one cell, which is the whole reason that counter is there.  What this
+	# checks is that the read finishes and answers, rather than looping or
+	# casting an infinity to an integer.
+	my $t = "ATOM      1  N   ALA A   1         inf  10.000  10.000  1.00 20.00           N\n"
+	      . "ATOM      2  CA  ALA A   1      11.000  10.000  10.000  1.00 20.00           C\n"
+	      . "ATOM      3  C   ALA A   1      12.000  10.000  10.000  1.00 20.00           C\n"
+	      . "ATOM      4  O   ALA A   1      13.000  10.000  10.000  1.00 20.00           O\n";
+	my $i = structure_info_string($t, features => 0);
+	ok($i->{chains}{A}{residues}{1}{atoms}{N}{x} == 9**9**9,
+		'a coordinate of inf is read as an infinity');
+	my $f;
+	lives_ok { $f = structure_features($i, points => 24) }
+		'and the properties of a structure with one still finish';
+	ok(defined $f->{sasa}{total}, 'with a surface for the atoms that have a position');
+}
+{
+	# A structure a caller built by hand, with a residue that has no name and no
+	# single-letter code.  Nothing this module reads is missing them, so this is
+	# the shape of an $info assembled somewhere else -- and the walk has to take
+	# it as it finds it rather than reading a key that is not there.
+	my $info = {
+		chain_order => ['A'],
+		chains      => {
+			A => {
+				# no n_atoms: a chain this module read always has one, and the
+				# walk sizes its arrays from it, so a structure that does not
+				# say is the case where that has to give way to what is there
+				id => 'A',
+				residue_order => ['1'],
+				residues => {
+					1 => {
+						# the second atom has no element either, which is the
+						# other half of the same question: a radius and a mass
+						# have to come from somewhere, and mdtraj's own fallback
+						# of 2 A is what they come from
+						atom_order => [ 'CA', 'CB' ],
+						atoms => {
+							CA => { x => 0, y => 0, z => 0, element => 'C' },
+							CB => { x => 1.5, y => 0, z => 0 },
+						},
+					},
+				},
+			},
+		},
+	};
+	my $f;
+	lives_ok { $f = structure_features($info) }
+		'a structure with a residue that has no name is walked anyway';
+	is($f->{n_atoms}, 2,
+		'and both its atoms, though the chain never said how many it had');
+	is($f->{n_no_element}, 1,
+		'the one with no element is counted as one the properties could not place');
+	ok(!defined $info->{chains}{A}{residues}{1}{rsa},
+		'a residue with no letter gets no relative accessibility rather than a wrong one');
+}
+{
+	# A chain capped with a residue the name table has never heard of.  gemmi
+	# and mdtraj put the TER after such a cap, and so does this: the DSSP chain
+	# is cut after the last polymer residue and then walked forward over
+	# anything peptide-bonded to what comes before it.  1CMX ends chains B and D
+	# with a GLZ -- a glycine capped at the carboxyl -- which is where the rule
+	# comes from; here the last residue of fold.pdb is renamed to it.
+	my $txt = do { open my $fh, '<', "$data/fold.pdb" or die $!; local $/; <$fh> };
+	my @lines = split /\n/, $txt;
+	my ($last) = map { substr($_, 22, 4) + 0 } grep { /\AATOM/ } reverse @lines;
+	my $capped = join("\n", map {
+		(/\AATOM/ && substr($_, 22, 4) + 0 == $last)
+			? 'HETATM' . substr($_, 6, 11) . 'GLZ' . substr($_, 20)
+			: $_
+	} @lines) . "\n";
+	my $plain = structure_info("$data/fold.pdb");
+	my $cap   = structure_info_string($capped);
+	is($cap->{chains}{A}{residues}{$last}{type}, 'ligand',
+		'a cap the table does not know is not typed as an amino acid');
+	is_deeply($cap->{features}{dssp}, $plain->{features}{dssp},
+		'but it is part of its chain: every residue keeps the letter it had');
+	ok(defined $cap->{chains}{A}{residues}{$last}{ss},
+		'and the cap itself is assigned rather than left out of the chain');
 }
 
 # ---- the phosphodiester cutoff is the whole of the linkage rule ----------

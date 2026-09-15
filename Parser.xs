@@ -333,20 +333,34 @@ static STRLEN fld(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLE
 
 /*str2iv() -- integers, exactly, without going through a double.  '*****'
 (what a serial number becomes once it overflows five columns) and anything
-else non-numeric report failure rather than a wrong number.*/
+else non-numeric report failure rather than a wrong number.
+
+A number too big for an IV is declined for the same reason and not wrapped.
+The accumulator is a UV tested before each digit, because a signed overflow is
+undefined behaviour rather than a wrap: the fields a PDB record gives this are
+four and five columns wide and cannot reach it, but an mmCIF value is free-form
+and nothing stops a file writing twenty digits of _atom_site.id.  One did, in
+t/numbers.t, and came back as 200376420520689663 and a negative residue
+number.*/
 static bool str2iv(const char *CSP_RESTRICT s, STRLEN n, IV *CSP_RESTRICT out)
 {
 	bool neg = FALSE, seen = FALSE;
-	IV v = 0;
+	UV v = 0, limit;
 	STRLEN i = 0;
 	if (i < n && (s[i] == '+' || s[i] == '-')) { neg = (s[i] == '-'); i++; }
+	//one more magnitude on the negative side, which is where IV_MIN lives
+	limit = neg ? (UV)IV_MAX + 1 : (UV)IV_MAX;
 	for (; i < n; i++) {
+		UV d;
 		if (!isdigit((unsigned char)s[i])) return FALSE;
-		v = v * 10 + (s[i] - '0');
+		d = (UV)(s[i] - '0');
+		if (v > (limit - d) / 10) return FALSE;
+		v = v * 10 + d;
 		seen = TRUE;
 	}
 	if (!seen) return FALSE;
-	*out = neg ? -v : v;
+	//IV_MIN is not -(IV)v: its magnitude has no positive IV to be negated from
+	*out = neg ? (v == (UV)IV_MAX + 1 ? IV_MIN : -(IV)v) : (IV)v;
 	return TRUE;
 }
 
@@ -464,7 +478,7 @@ static bool fld_iv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRL
 {
 	const char *s;
 	STRLEN n = fld(line, llen, from, to, &s);
-	return n ? str2iv(s, n, out) : 0;
+	return n ? str2iv(s, n, out) : FALSE;
 }
 
 static bool fld_nv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRLEN to,
@@ -472,7 +486,7 @@ static bool fld_nv(const char *CSP_RESTRICT line, STRLEN llen, STRLEN from, STRL
 {
 	const char *s;
 	STRLEN n = fld(line, llen, from, to, &s);
-	return n ? str2nv(s, n, out) : 0;
+	return n ? str2nv(s, n, out) : FALSE;
 }
 
 /*charge_ok() -- columns 79-80 hold a digit and a sign, '1+' as the format
@@ -766,16 +780,16 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 		if (llen == 0) continue;
 
 		if (llen >= 6 && (memcmp(line, "ATOM  ", 6) == 0 || memcmp(line, "HETATM", 6) == 0)) {
-			const char *s;
-			const char *nm_raw;
+			const char *s, *nm_raw;
 			STRLEN nm_rawlen, n;
-			char elbuf[4];
+			char elbuf[4], chain[4], icode[2], resname[8];;
 			STRLEN ellen;
 			bool het = (line[0] == 'H');
 			res_info ri;
-			bool known;
-			IV iv;
-			char chain[4], icode[2], resname[8];
+			bool known, have_rs;
+			//the residue number, read once: the boundary test below wants it,
+			//and so does whichever of the two shapes the record is emitted in
+			IV rs = 0;
 			STRLEN resname_len;
 
 			if (het) n_het_rec++; else n_atom_rec++;
@@ -798,7 +812,6 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 			if (want_chain) {
 				if (!hv_exists(want_chain, chain, (I32)strlen(chain))) { n_skipped++; continue; }
 			}
-
 			//atom name, columns 13-16, kept untrimmed for the element rule
 			nm_rawlen = 0;
 			nm_raw = line;
@@ -807,7 +820,6 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				nm_raw = line + 12;
 				nm_rawlen = to - 12 + 1;
 			}
-
 			//element, columns 77-78, guessed from the name when absent
 			ellen = fld(line, llen, 76, 77, &s);
 			if (ellen) {
@@ -836,9 +848,8 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 			matter of flushing what is already there.  Everything the test needs
 			is read from the record's own columns.*/
 			{
-				IV rs = 0;
 				bool changed;
-				fld_iv(line, llen, 22, 25, &rs);
+				have_rs = fld_iv(line, llen, 22, 25, &rs);
 				icode[0] = (llen > 26 && line[26] != ' ') ? line[26] : '\0';
 				icode[1] = '\0';
 				changed = !have_res
@@ -864,6 +875,18 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 					my_strlcpy(p_resname, resname, sizeof(p_resname));
 					cur_chain = chain_tally(aTHX_ chain_elements, cur_model,
 					                        chain, strlen(chain));
+					/*and the residue's identity, once, where the residue
+					begins: see the note where the atom's own fields are
+					emitted for why this is per residue in this shape and per
+					atom in the other*/
+					if (build_atoms) {
+						av_push(col[C_RESNAME], newSVpvn(resname, resname_len));
+						av_push(col[C_CHAIN],   newSVpvn(chain, strlen(chain)));
+						av_push(col[C_RESSEQ],  have_rs ? newSViv(rs) : newSVsv(&PL_sv_undef));
+						av_push(col[C_ICODE],   newSVpvn(icode, icode[0] ? 1 : 0));
+						av_push(col[C_HET],     newSViv(het));
+						av_push(col[C_MODEL],   newSViv(cur_model));
+					}
 				}
 			}
 
@@ -885,12 +908,11 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				alt_n = fld(line, llen, 16, 16, &alt_s);
 				chg_n = fld(line, llen, 78, 79, &chg_s);
 				if (!charge_ok(chg_s, chg_n)) chg_n = 0;
-
-				/*The sums and extremes are gathered here rather than in Perl
-				because they have to touch every atom whether or not the caller
-				wanted per-atom hashes.  Doing them in the loop that is already
-				reading the numbers costs nothing; doing them again in Perl
-				costs more than the whole parse.*/
+	/*The sums and extremes are gathered here rather than in Perl
+	because they have to touch every atom whether or not the caller
+	wanted per-atom hashes.  Doing them in the loop that is already
+	reading the numbers costs nothing; doing them again in Perl
+	costs more than the whole parse.*/
 				if (have_xyz) {
 					rsx += xv; rsy += yv; rsz += zv; rnc++;
 					if (!have_bbox) {
@@ -950,16 +972,25 @@ parse hands to anyone calling it directly.*/
 				}
 			}
 
-/*The residue's identity.  Perl reads these at the index a residue
-starts on, once per residue rather than once per atom, but they are
-emitted per atom because that is where they are read from.*/
-			av_push(col[C_RESNAME], newSVpvn(resname, resname_len));
-			av_push(col[C_CHAIN], newSVpvn(chain, strlen(chain)));
-			if (fld_iv(line, llen, 22, 25, &iv)) av_push(col[C_RESSEQ], newSViv(iv));
-			else                                 av_push(col[C_RESSEQ], newSVsv(&PL_sv_undef));
-			av_push(col[C_ICODE], newSVpvn(icode, icode[0] ? 1 : 0));
-			av_push(col[C_HET], newSViv(het));
-			av_push(col[C_MODEL], newSViv(cur_model));
+/*The residue's identity, per atom, for the columnar shape.  In the
+other shape it was emitted at the residue boundary above, one entry
+per residue rather than one per atom: it is read at the index a
+residue starts on either way, and six strings and integers per atom
+against six per residue was a third of everything the parse built:
+reading the coordinate section of 200 entries of PDBbind v2020 went
+from 1.95 s to 1.59 s, and the peak memory of parsing the largest of
+them (4fqr, 90,792 atoms) from 153 MB to 126 MB.  Per atom is still
+what a caller who asked for columns gets, because there the columns
+are the answer.  The line number below stays per atom in both, being
+a fact about the record rather than about the residue.*/
+			if (!build_atoms) {
+				av_push(col[C_RESNAME], newSVpvn(resname, resname_len));
+				av_push(col[C_CHAIN], newSVpvn(chain, strlen(chain)));
+				av_push(col[C_RESSEQ], have_rs ? newSViv(rs) : newSVsv(&PL_sv_undef));
+				av_push(col[C_ICODE], newSVpvn(icode, icode[0] ? 1 : 0));
+				av_push(col[C_HET], newSViv(het));
+				av_push(col[C_MODEL], newSViv(cur_model));
+			}
 			if (keep_lineno) av_push(col[C_LINENO], newSVuv(lineno));
 
 			n_atom++;
@@ -968,10 +999,8 @@ emitted per atom because that is where they are read from.*/
 
 		if (llen >= 6 && memcmp(line, "ANISOU", 6) == 0) {
 			n_anisou++;
-			if (!keep_anisou) continue;
-			//fall through to meta
+			if (!keep_anisou) continue;//fall through to meta
 		}
-
 		if (llen >= 5 && memcmp(line, "MODEL", 5) == 0) {
 			IV m;
 			n_models++;
@@ -980,7 +1009,6 @@ emitted per atom because that is where they are read from.*/
 			continue;
 		}
 		if (llen >= 6 && memcmp(line, "ENDMDL", 6) == 0) continue;
-
 		if (llen >= 3 && memcmp(line, "TER", 3) == 0) {
 			HV *t = newHV();
 			const char *s;
@@ -1435,6 +1463,15 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 		my_strlcpy(st->p_resname, resname, sizeof(st->p_resname));
 		st->cur_chain = chain_tally(aTHX_ st->chain_elements, st->cur_model,
 		                            chain, chain_len);
+		//and the residue's identity, once per residue, as parse_buf() emits it
+		if (st->build_atoms) {
+			av_push(st->col[C_RESNAME], newSVpvn(resname, resname_len));
+			av_push(st->col[C_CHAIN],   newSVpvn(chain, chain_len));
+			av_push(st->col[C_RESSEQ],  have_rs ? newSViv(rs) : newSVsv(&PL_sv_undef));
+			av_push(st->col[C_ICODE],   newSVpvn(icode, icode[0] ? 1 : 0));
+			av_push(st->col[C_HET],     newSViv(het));
+			av_push(st->col[C_MODEL],   newSViv(st->cur_model));
+		}
 	}
 
 	have_xyz = v[A_X] && v[A_Y] && v[A_Z]
@@ -1498,12 +1535,14 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 		av_push(st->col[C_CHARGE],  newSVpvn(chgbuf, chg_n));
 	}
 
-	av_push(st->col[C_RESNAME], newSVpvn(resname, resname_len));
-	av_push(st->col[C_CHAIN],   newSVpvn(chain, chain_len));
-	av_push(st->col[C_RESSEQ],  have_rs ? newSViv(rs) : newSVsv(&PL_sv_undef));
-	av_push(st->col[C_ICODE],   newSVpvn(icode, icode[0] ? 1 : 0));
-	av_push(st->col[C_HET],     newSViv(het));
-	av_push(st->col[C_MODEL],   newSViv(st->cur_model));
+	if (!st->build_atoms) {
+		av_push(st->col[C_RESNAME], newSVpvn(resname, resname_len));
+		av_push(st->col[C_CHAIN],   newSVpvn(chain, chain_len));
+		av_push(st->col[C_RESSEQ],  have_rs ? newSViv(rs) : newSVsv(&PL_sv_undef));
+		av_push(st->col[C_ICODE],   newSVpvn(icode, icode[0] ? 1 : 0));
+		av_push(st->col[C_HET],     newSViv(het));
+		av_push(st->col[C_MODEL],   newSViv(st->cur_model));
+	}
 	st->n_atom++;
 }
 
@@ -1561,15 +1600,13 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	cif_lex lx;
 	cif_tok tk;
 	size_t i;
-	bool keep_meta;
+	bool keep_meta, have_single = FALSE;;
 	UV lineno = 0;
 	SV *block = NULL;
-	const char *v[A_NFIELD];
+	const char *v[A_NFIELD], *sv_[A_NFIELD];
 	STRLEN vn[A_NFIELD];
 	//an _atom_site table written as plain tags rather than as a loop_
-	const char *sv_[A_NFIELD];
 	STRLEN svn_[A_NFIELD];
-	bool have_single = FALSE;
 
 	Zero(&st, 1, cif_state);
 	for (i = 0; i < NCOL; i++)  col[i] = newAV();
@@ -2385,10 +2422,12 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 			rn = hvf_sv(aTHX_ r, "resname", 7);
 			if (rn) {
 				STRLEN rl;
-				res_info ri;
+				//not `ri', which is this loop's own counter, nor `info',
+				//which is the structure this walk was handed
+				res_info named;
 				const char *rp = SvPV_const(rn, rl);
 				s->res_key[s->n_res] = res_key(rp, rl);
-				s->res_type[s->n_res] = res_lookup(rp, rl, &ri) ? ri.type : RT_OTHER;
+				s->res_type[s->n_res] = res_lookup(rp, rl, &named) ? named.type : RT_OTHER;
 			} else {
 				s->res_key[s->n_res] = 0;
 				s->res_type[s->n_res] = RT_OTHER;
@@ -2409,29 +2448,47 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 				unsigned char apolar;
 				if (!as || !*as || !SvOK(*as)) continue;
 				a = hvf_ent_hv(aTHX_ atoms, *as);
-				if (!a || s->n_atom >= cap_atom) continue;
+				if (!a) continue;
+	/*The chain's n_atoms counts records and so is an upper bound on
+	the atoms its residues hold -- for every structure this module
+	read.  One assembled somewhere else can say less than it holds,
+	or not say at all, and the answer then has to be about the atoms
+	that are there rather than about the number the chain claimed:
+	the arrays grow instead of the walk stopping.  Never reached for
+	a structure this module built, which is why the first pass sizes
+	from the counts at all.*/
+				if (s->n_atom >= cap_atom) {
+					cap_atom = cap_atom ? cap_atom * 2 : 16;
+					Renew(s->x,   cap_atom, NV);
+					Renew(s->y,   cap_atom, NV);
+					Renew(s->z,   cap_atom, NV);
+					Renew(s->rad, cap_atom, NV);
+					Renew(s->mass, cap_atom, NV);
+					Renew(s->apolar, cap_atom, unsigned char);
+					Renew(s->atom_hv, cap_atom, HV *);
+				}
 				xs = hvf_sv(aTHX_ a, "x", 1);
 				ys = hvf_sv(aTHX_ a, "y", 1);
 				zs = hvf_sv(aTHX_ a, "z", 1);
-				//an atom whose line was truncated before the coordinates has
-				//no position, and a position is what every one of these
-				//calculations is about; it is left out and counted nowhere
+	/*an atom whose line was truncated before the coordinates has
+	no position, and a position is what every one of these
+	calculations is about; it is left out and counted nowhere*/
 				if (!xs || !ys || !zs) continue;
 				es = hvf_sv(aTHX_ a, "element", 7);
 				apolar = 0;
 				if (es) {
 					STRLEN el;
 					const char *ep_s = SvPV_const(es, el);
-					/*Carbon and sulphur are the apolar surface and everything
-					else is the polar one, which is the split Chothia, C (1974)
-					Nature 248:338 made when he first added a protein's buried
-					surface up.  Only the symbol decides it, so a sulphur that
-					is part of a sulphate counts as apolar here; a caller who
-					wants a chemistry-aware split has the per-atom areas.
+	/*Carbon and sulphur are the apolar surface and everything
+	else is the polar one, which is the split Chothia, C (1974)
+	Nature 248:338 made when he first added a protein's buried
+	surface up.  Only the symbol decides it, so a sulphur that
+	is part of a sulphate counts as apolar here; a caller who
+	wants a chemistry-aware split has the per-atom areas.
 
-					Asked of the packed key rather than of the field, so that a
-					field written " C" or "c" answers the same as "C" -- the
-					same normalisation the radius lookup just did.*/
+	Asked of the packed key rather than of the field, so that a
+	field written " C" or "c" answers the same as "C" -- the
+	same normalisation the radius lookup just did.*/
 					if (!elem_prop_of(ep_s, el, &ep)) {
 						ep.vdw = CSP_VDW_DEFAULT;
 						ep.mass = 0.0;
@@ -2504,7 +2561,7 @@ covers a point and stops at the first that does.
 
 The cell count is capped at eight per atom so that the grid cannot cost more
 memory than the coordinates it indexes -- a thin, extended structure in a large
-box would otherwise want more cells than there are atoms to put in them.*/
+box would otherwise want more cells than there are atoms to put in them*/
 typedef struct {
 	UV *start; //ncell + 1 offsets into idx
 	UV *idx;   //point indices, grouped by cell
@@ -2608,7 +2665,7 @@ area an atom contributes is 4*pi*r^2 times the fraction of its points that no
 other atom covers, and that fraction is only as good as the points are evenly
 spread.  mdtraj's own note says as much -- points that repelled each other to an
 energy minimum would be better and would cost more than the rest of the
-calculation.*/
+calculation*/
 static void sasa_sphere(NV *CSP_RESTRICT pts, UV n)
 {
 	const NV inc = CSP_PI * (3.0 - nv_sqrt((NV)5.0));
@@ -2624,6 +2681,22 @@ static void sasa_sphere(NV *CSP_RESTRICT pts, UV n)
 		pts[3 * i + 2] = nv_sin(phi) * r;
 	}
 }
+
+/*What the kernel is asked to do besides the surface itself, or NULL for the
+plain run.  All three exist for the interface pass below, which runs the kernel
+again over each chain alone: an atom whose every neighbour is in its own chain
+has the same surface either way, so the whole-structure run marks the ones that
+have a neighbour outside it and the per-chain runs compute those and leave the
+rest of the array as they found it.  Over 60 entries of PDBbind v2020 that took
+the pass from 5.7 seconds to 0.75.*/
+typedef struct {
+	//one chain index per atom, so a neighbour can be asked which chain it is in
+	const UV *CSP_RESTRICT chain_of;
+	//set to 1 for an atom that has a neighbour outside its own chain
+	unsigned char *CSP_RESTRICT cross;
+	//when given, an atom whose flag is 0 is left alone: area[i] is not written
+	const unsigned char *CSP_RESTRICT only;
+} sasa_aux;
 
 /*sasa_compute() -- Shrake and Rupley, as mdtraj computes it.
 
@@ -2645,14 +2718,27 @@ at one point and covers an open region of measure zero around it.
 The rotation of the neighbour list is mdtraj's and is kept: consecutive points
 on the spiral are close together, so the atom that covered the last one is the
 one most likely to cover this one, and starting the scan there rather than at
-the beginning is most of the kernel's speed.*/
+the beginning is most of the kernel's speed.
+
+The neighbours are copied out of the coordinate arrays rather than kept as
+indices into them, with the square of each one's radius worked out while it is
+being copied.  The innermost loop is the whole cost of the surface -- it runs
+once per sphere point per neighbour, which over a structure is billions of
+times -- and as indices each turn of it was four loads scattered across four
+arrays by a number the compiler cannot predict, plus a multiply to square a
+radius that does not change.  Copied, it is four sequential loads and no
+multiply.  The arithmetic is identical: ra * ra computed once per neighbour is
+the same NV as ra * ra computed once per point.*/
 static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y,
                         const NV *CSP_RESTRICT z, const NV *CSP_RESTRICT rad, UV n,
-                        const NV *CSP_RESTRICT pts, UV npts, NV *CSP_RESTRICT area)
+                        const NV *CSP_RESTRICT pts, UV npts, NV *CSP_RESTRICT area,
+                        const sasa_aux *CSP_RESTRICT aux)
 {
-	UV *CSP_RESTRICT nbr = NULL;
-	/*grown by doubling as needed; 64 covers every atom of a protein, where the
-	neighbour count runs to the low tens, without a single reallocation*/
+	/*the neighbours of the atom being worked on: position and squared radius,
+	grown by doubling as needed.  64 covers every atom of a protein, where the
+	neighbour count runs to the low tens, without a single reallocation.*/
+	NV *CSP_RESTRICT nx = NULL, *CSP_RESTRICT ny = NULL, *CSP_RESTRICT nz = NULL;
+	NV *CSP_RESTRICT nr2 = NULL;
 	UV nbr_cap = 64;
 	cell_grid g;
 	NV rmax = 0.0, constant;
@@ -2661,19 +2747,24 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 	if (n == 0) return;
 	for (i = 0; i < n; i++) if (rad[i] > rmax) rmax = rad[i];
 	grid_build(aTHX_ &g, x, y, z, n, 2.0 * rmax);
-	Newx(nbr, nbr_cap, UV);
+	Newx(nx,  nbr_cap, NV);
+	Newx(ny,  nbr_cap, NV);
+	Newx(nz,  nbr_cap, NV);
+	Newx(nr2, nbr_cap, NV);
 	constant = 4.0 * CSP_PI / (NV)npts;
 
 	for (i = 0; i < n; i++) {
 		const NV xi = x[i], yi = y[i], zi = z[i], ri = rad[i];
 		UV n_nbr = 0, acc = 0, k_closest = 0, j;
-		UV cx = grid_axis(xi - g.x0, g.cell, g.nx);
-		UV cy = grid_axis(yi - g.y0, g.cell, g.ny);
-		UV cz = grid_axis(zi - g.z0, g.cell, g.nz);
-		UV ax0 = cx ? cx - 1 : 0, ax1 = (cx + 1 < g.nx) ? cx + 1 : g.nx - 1;
-		UV ay0 = cy ? cy - 1 : 0, ay1 = (cy + 1 < g.ny) ? cy + 1 : g.ny - 1;
-		UV az0 = cz ? cz - 1 : 0, az1 = (cz + 1 < g.nz) ? cz + 1 : g.nz - 1;
-		UV bx, by, bz;
+		UV cx, cy, cz, ax0, ax1, ay0, ay1, az0, az1, bx, by, bz;
+		//an atom the caller has already answered for: area[i] is left as it was
+		if (aux && aux->only && !aux->only[i]) continue;
+		cx = grid_axis(xi - g.x0, g.cell, g.nx);
+		cy = grid_axis(yi - g.y0, g.cell, g.ny);
+		cz = grid_axis(zi - g.z0, g.cell, g.nz);
+		ax0 = cx ? cx - 1 : 0; ax1 = (cx + 1 < g.nx) ? cx + 1 : g.nx - 1;
+		ay0 = cy ? cy - 1 : 0; ay1 = (cy + 1 < g.ny) ? cy + 1 : g.ny - 1;
+		az0 = cz ? cz - 1 : 0; az1 = (cz + 1 < g.nz) ? cz + 1 : g.nz - 1;
 		for (bx = ax0; bx <= ax1; bx++)
 		for (by = ay0; by <= ay1; by++)
 		for (bz = az0; bz <= az1; bz++) {
@@ -2686,8 +2777,20 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 				dx = x[a] - xi; dy = y[a] - yi; dz = z[a] - zi;
 				sum = ri + rad[a];
 				if (dx * dx + dy * dy + dz * dz >= sum * sum) continue;
-				if (n_nbr == nbr_cap) { nbr_cap *= 2; Renew(nbr, nbr_cap, UV); }
-				nbr[n_nbr++] = a;
+				if (n_nbr == nbr_cap) {
+					nbr_cap *= 2;
+					Renew(nx,  nbr_cap, NV);
+					Renew(ny,  nbr_cap, NV);
+					Renew(nz,  nbr_cap, NV);
+					Renew(nr2, nbr_cap, NV);
+				}
+				nx[n_nbr] = x[a]; ny[n_nbr] = y[a]; nz[n_nbr] = z[a];
+				nr2[n_nbr] = rad[a] * rad[a];
+				n_nbr++;
+				//a neighbour in another chain is what makes this atom's surface
+				//depend on that chain being there
+				if (aux && aux->cross && aux->chain_of[a] != aux->chain_of[i])
+					aux->cross[i] = 1;
 			}
 		}
 		for (j = 0; j < npts; j++) {
@@ -2698,13 +2801,10 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 			UV k;
 			for (k = 0; k < n_nbr; k++) {
 				UV kp = k_closest + k;
-				UV a;
-				NV dx, dy, dz, ra;
+				NV dx, dy, dz;
 				if (kp >= n_nbr) kp -= n_nbr;
-				a = nbr[kp];
-				dx = px - x[a]; dy = py - y[a]; dz = pz - z[a];
-				ra = rad[a];
-				if (dx * dx + dy * dy + dz * dz < ra * ra) {
+				dx = px - nx[kp]; dy = py - ny[kp]; dz = pz - nz[kp];
+				if (dx * dx + dy * dy + dz * dz < nr2[kp]) {
 					k_closest = kp;
 					open = FALSE;
 					break;
@@ -2714,7 +2814,7 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 		}
 		area[i] = (NV)acc * constant * ri * ri;
 	}
-	Safefree(nbr);
+	Safefree(nx); Safefree(ny); Safefree(nz); Safefree(nr2);
 	grid_free(aTHX_ &g);
 }
 
@@ -2726,29 +2826,68 @@ there, is the area the two bury between them.  It is one more kernel run per
 chain, and a chain's run touches only that chain's atoms, so all of them
 together cost about what the first run cost -- not the number of chains times
 it.  The chains' atoms are one contiguous run each, which is what makes the
-range the kernel takes enough to say which.*/
+range the kernel takes enough to say which.
+
+Most of those atoms are not asked twice.  An atom's surface is decided by the
+atoms whose spheres reach it, and if every one of those is in its own chain then
+taking the other chains away changes nothing about it: its isolated area *is*
+its area, bit for bit, and computing it again is a thousand sphere points spent
+to arrive at the number already in hand.  The whole-structure run above marks
+the atoms that do have a neighbour in another chain -- the interface and nothing
+else, which on the entries benchmarked is a few per cent of a complex -- and the
+per-chain runs compute those and copy the rest.  What is saved is the sphere
+points; the neighbour search still runs for every atom of the chain, because an
+interface atom needs its neighbours found.*/
 static void sasa_compute(pTHX_ structset *CSP_RESTRICT s, UV npts, bool want_iface)
 {
 	NV *CSP_RESTRICT pts = NULL;
-	UV c;
+	UV *CSP_RESTRICT chain_of = NULL;
+	unsigned char *CSP_RESTRICT cross = NULL;
+	sasa_aux aux;
+	UV c, i;
+	const bool split = want_iface && s->n_chain > 1;
 
 	Newxz(s->area, s->n_atom ? s->n_atom : 1, NV);
 	if (s->n_atom == 0) return;
 	Newx(pts, npts * 3, NV);
 	sasa_sphere(pts, npts);
-	sasa_kernel(aTHX_ s->x, s->y, s->z, s->rad, s->n_atom, pts, npts, s->area);
+	Zero(&aux, 1, sasa_aux);
+	if (split) {
+		//which chain each atom is in, so that the run below can tell a
+		//neighbour of its own chain from one of another
+		Newxz(chain_of, s->n_atom, UV);
+		Newxz(cross, s->n_atom, unsigned char);
+		for (c = 0; c < s->n_chain; c++) {
+			UV r0 = s->chain_first[c], r1 = s->chain_last[c];
+			if (r0 >= r1) continue;
+			for (i = s->res_first[r0]; i < s->res_last[r1 - 1]; i++) chain_of[i] = c;
+		}
+		aux.chain_of = chain_of;
+		aux.cross    = cross;
+	}
+	sasa_kernel(aTHX_ s->x, s->y, s->z, s->rad, s->n_atom, pts, npts, s->area,
+	            split ? &aux : NULL);
 
-	if (want_iface && s->n_chain > 1) {
-		Newxz(s->alone, s->n_atom, NV);
+	if (split) {
+		sasa_aux only;
+		Newx(s->alone, s->n_atom, NV);
+		//every atom starts with the surface it has in the whole structure,
+		//which is the answer for all but the interface
+		Copy(s->area, s->alone, s->n_atom, NV);
+		Zero(&only, 1, sasa_aux);
 		for (c = 0; c < s->n_chain; c++) {
 			UV r0 = s->chain_first[c], r1 = s->chain_last[c], first, last;
 			if (r0 >= r1) continue;
 			first = s->res_first[r0];
 			last  = s->res_last[r1 - 1];
 			if (last <= first) continue;
+			only.only = cross + first;
 			sasa_kernel(aTHX_ s->x + first, s->y + first, s->z + first,
-			            s->rad + first, last - first, pts, npts, s->alone + first);
+			            s->rad + first, last - first, pts, npts, s->alone + first,
+			            &only);
 		}
+		Safefree(chain_of);
+		Safefree(cross);
 	} else if (want_iface) {
 		/*One chain buries nothing against anything: its isolated surface is the
 		surface it already has, and saying so is cheaper than computing it
@@ -3353,8 +3492,8 @@ static AV *base_pairs(pTHX_ structset *CSP_RESTRICT s, NV hb, NV stagger, bool s
 				plane = vec_angle_capped(bases[i].nx, bases[i].ny, bases[i].nz,
 				                         bases[j].nx, bases[j].ny, bases[j].nz);
 				if (plane < 0.0) continue;
-				//the pair is named in the order it is reported, so that the
-				//two letters and the two resname fields read the same way round
+	/*the pair is named in the order it is reported, so that the
+	two letters and the two resname fields read the same way round*/
 				tname[0] = bases[i].one; tname[1] = '-';
 				tname[2] = bases[j].one; tname[3] = '\0';
 				h = newHV();
@@ -4618,30 +4757,29 @@ static AV *contacts_find(pTHX_ structset *CSP_RESTRICT s, NV cut, bool store)
 	AV *out = newAV();
 	unsigned char *CSP_RESTRICT heavy = NULL;
 	NV *CSP_RESTRICT hx = NULL, *CSP_RESTRICT hy = NULL, *CSP_RESTRICT hz = NULL;
-	UV *CSP_RESTRICT hres = NULL, *CSP_RESTRICT hidx = NULL;
+	UV *CSP_RESTRICT hres = NULL;
 	touch *CSP_RESTRICT near = NULL;
 	UV near_cap = 32;
 	cell_grid g;
-	UV n = 0, i, r;
+	UV n = 0, i, r, lo;
 
 	if (s->n_atom == 0) return out;
 	Newx(heavy, s->n_atom, unsigned char);
 	for (i = 0; i < s->n_atom; i++)
 		heavy[i] = atom_is_h(aTHX_ s->atom_hv[i]) ? 0 : 1;
 	Newx(hx, s->n_atom, NV); Newx(hy, s->n_atom, NV); Newx(hz, s->n_atom, NV);
-	Newx(hres, s->n_atom, UV); Newx(hidx, s->n_atom, UV);
+	Newx(hres, s->n_atom, UV);
 	for (r = 0; r < s->n_res; r++) {
 		for (i = s->res_first[r]; i < s->res_last[r]; i++) {
 			if (!heavy[i]) continue;
 			hx[n] = s->x[i]; hy[n] = s->y[i]; hz[n] = s->z[i];
 			hres[n] = r;
-			hidx[n] = i;
 			n++;
 		}
 	}
 	Safefree(heavy);
 	if (n == 0) {
-		Safefree(hx); Safefree(hy); Safefree(hz); Safefree(hres); Safefree(hidx);
+		Safefree(hx); Safefree(hy); Safefree(hz); Safefree(hres);
 		return out;
 	}
 	grid_build(aTHX_ &g, hx, hy, hz, n, cut);
@@ -4651,11 +4789,19 @@ static AV *contacts_find(pTHX_ structset *CSP_RESTRICT s, NV cut, bool store)
 		for (r = 0; r < s->n_res; r++)
 			(void)hv_stores(s->res_hv[r], "n_contacts", newSVuv(0));
 
+	/*The heavy atoms were gathered residue by residue, so one residue's are one
+	run of them and hres is never anything but ascending: `lo' walks that run
+	forward rather than each residue scanning the whole array for its own atoms.
+	The scan was the whole cost of this function on anything large -- residues
+	times heavy atoms, which is 4fqr's 11,406 by 88,416 -- and asking for the
+	contacts of that entry took 2.25 s.  It is 0.15 s this way and finds the
+	same pairs: the loop body has not changed, only how it is reached.*/
+	lo = 0;
 	for (r = 0; r < s->n_res; r++) {
-		UV n_near = 0, k;
-		for (i = 0; i < n; i++) {
+		UV n_near = 0, k, hi = lo;
+		while (hi < n && hres[hi] == r) hi++;
+		for (i = lo; i < hi; i++) {
 			UV bx, by, bz, ci, cj, ck;
-			if (hres[i] != r) continue;
 			ci = grid_axis(hx[i] - g.x0, g.cell, g.nx);
 			cj = grid_axis(hy[i] - g.y0, g.cell, g.ny);
 			ck = grid_axis(hz[i] - g.z0, g.cell, g.nz);
@@ -4700,10 +4846,11 @@ static AV *contacts_find(pTHX_ structset *CSP_RESTRICT s, NV cut, bool store)
 				if (b && *b) sv_setuv(*b, SvUV(*b) + 1);
 			}
 		}
+		lo = hi;
 	}
 	Safefree(near);
 	grid_free(aTHX_ &g);
-	Safefree(hx); Safefree(hy); Safefree(hz); Safefree(hres); Safefree(hidx);
+	Safefree(hx); Safefree(hy); Safefree(hz); Safefree(hres);
 	return out;
 }
 
@@ -4720,12 +4867,12 @@ static void hse_compute(pTHX_ structset *CSP_RESTRICT s, NV radius)
 	Newx(cares, s->n_res, UV);
 	for (r = 0; r < s->n_res; r++) {
 		HV *at;
-		/*One of the twenty, not merely an amino acid.  Biopython's
-		CaPPBuilder.build_peptides() runs with aa_only => 1, which keeps only
-		the standard names, so a selenomethionine is invisible to HSExposureCB
-		-- it neither gets a figure nor counts towards anybody else's.  Matching
-		that is what lets t/features.t hold this to it; the cost is that a
-		structure full of modified residues gets a count that ignores them.*/
+	/*One of the twenty, not merely an amino acid.  Biopython's
+	CaPPBuilder.build_peptides() runs with aa_only => 1, which keeps only
+	the standard names, so a selenomethionine is invisible to HSExposureCB
+	-- it neither gets a figure nor counts towards anybody else's.  Matching
+	that is what lets t/features.t hold this to it; the cost is that a
+	structure full of modified residues gets a count that ignores them*/
 		if (s->res_type[r] != RT_AA || !s->res_std[r]) continue;
 		at = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
 		if (!at) continue;
@@ -4880,7 +5027,7 @@ static void ks_compute(pTHX_ structset *CSP_RESTRICT s, const backbone *CSP_REST
 	NV *CSP_RESTRICT cx = NULL, *CSP_RESTRICT cy = NULL, *CSP_RESTRICT cz = NULL;
 	UV *CSP_RESTRICT which = NULL;
 	cell_grid g;
-	UV n = 0, r, k;
+	UV n = 0, r;
 
 	Newx(s->ks_acc, s->n_res ? s->n_res * CSP_KS_KEEP : 1, UV);
 	Newx(s->ks_e,   s->n_res ? s->n_res * CSP_KS_KEEP : 1, NV);
@@ -4904,7 +5051,7 @@ static void ks_compute(pTHX_ structset *CSP_RESTRICT s, const backbone *CSP_REST
 	}
 	grid_build(aTHX_ &g, cx, cy, cz, n, CSP_KS_CA);
 
-	for (k = 0; k < n; k++) {
+	for (UV k = 0; k < n; k++) {
 		UV d = which[k];
 		NV h[3], len;
 		UV bx, by, bz, ci, cj, ck;
@@ -5328,7 +5475,7 @@ static void dssp_hbonds(pTHX_ structset *CSP_RESTRICT s, const dssp_res *CSP_RES
 	NV *CSP_RESTRICT cx = NULL, *CSP_RESTRICT cy = NULL, *CSP_RESTRICT cz = NULL;
 	UV *CSP_RESTRICT which = NULL;
 	cell_grid g;
-	UV n = 0, r, k;
+	UV n = 0, r;
 
 	for (r = 0; r < s->n_res * DSSP_KEEP; r++) { acc[r] = s->n_res; en[r] = 0.0f; }
 	if (s->n_res == 0) return;
@@ -5347,7 +5494,7 @@ static void dssp_hbonds(pTHX_ structset *CSP_RESTRICT s, const dssp_res *CSP_RES
 	}
 	grid_build(aTHX_ &g, cx, cy, cz, n, 0.9001);   //nm; see the head of this function
 
-	for (k = 0; k < n; k++) {
+	for (UV k = 0; k < n; k++) {
 		UV i = which[k];
 		UV bx, by, bz, ci, cj, ck;
 		ci = grid_axis(cx[k] - g.x0, g.cell, g.nx);
@@ -5471,10 +5618,9 @@ static UV dssp_candidates(pTHX_ UV n_res, const UV *CSP_RESTRICT acc,
 {
 	dssp_pair *CSP_RESTRICT p = NULL;
 	UV cap = 0, n = 0, d, w;
-	unsigned short int k, c;
 	if (n_res < 6) { *out = NULL; return 0; }
 	for (d = 0; d < n_res; d++) {
-		for (k = 0; k < DSSP_KEEP; k++) {
+		for (unsigned short k = 0; k < DSSP_KEEP; k++) {
 			UV a = acc[d * DSSP_KEEP + k], cand[8][2];
 			if (a >= n_res) continue;
 			{
@@ -5491,7 +5637,7 @@ static UV dssp_candidates(pTHX_ UV n_res, const UV *CSP_RESTRICT acc,
 				cand[6][0] = d;   cand[6][1] = a;
 				cand[7][0] = a;   cand[7][1] = d;
 			}
-			for (c = 0; c < 8; c++) {
+			for (unsigned short c = 0; c < 8; c++) {
 				UV i = cand[c][0], j = cand[c][1];
 				if (i < 1 || i + 4 >= n_res) continue;
 				if (j < i + 3 || j + 1 >= n_res) continue;
@@ -6251,8 +6397,7 @@ aa1to3(one)
 	OUTPUT:
 		RETVAL
 
-SV *
-res1(name)
+SV *res1(name)
 	SV *name
 	PREINIT:
 		STRLEN n;
@@ -6267,8 +6412,7 @@ res1(name)
 	OUTPUT:
 		RETVAL
 
-SV *
-res_type(name)
+SV *res_type(name)
 	SV *name
 	PREINIT:
 		STRLEN n;
@@ -6287,8 +6431,7 @@ res_type(name)
 	OUTPUT:
 		RETVAL
 
-bool
-is_single_ion(chain, id = &PL_sv_undef)
+bool is_single_ion(chain, id = &PL_sv_undef)
 	SV *chain
 	SV *id
 	CODE:
@@ -6299,8 +6442,7 @@ is_single_ion(chain, id = &PL_sv_undef)
 	OUTPUT:
 		RETVAL
 
-SV *
-_features(info, opts, who)
+SV * _features(info, opts, who)
 	SV *info
 	SV *opts
 	SV *who

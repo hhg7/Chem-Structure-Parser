@@ -16,3 +16,9 @@
 
 # Release archives
 ^Chem-Structure-Parser-.*\.tar\.gz$
+
+# Coverage
+^cover_db/
+\.gcov$
+\.gcda$
+\.gcno$

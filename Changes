@@ -283,6 +283,106 @@ Revision history for Chem-Structure-Parser
    checked where they are made, dying in autodie's own words, so a failure
    says exactly what it used to say.  Nothing a caller can see changes.
 
+ - fixed: a truncated or corrupt .gz was read as a short file and not as the
+   error it is.  IO::Uncompress::Gunzip's read() returns a negative number for
+   one, where the loop reading the archive took anything not positive for the
+   end of the stream: half of a gzipped entry came back as a structure with no
+   atoms in it and nothing said so.  It now dies, naming the file and what the
+   decompressor said was wrong with it.  A directory of downloads is where such
+   a file is found, and a silent half-read of one is the worst answer available.
+
+ - fixed: an integer field too big for an IV wrapped instead of being declined.
+   No PDB record can reach it -- a serial number has five columns and a residue
+   number four -- but an mmCIF value is free-form, and twenty digits of
+   _atom_site.id came back as 200376420520689663 and twenty-one digits of
+   auth_seq_id as a negative residue number.  A number that does not fit is now
+   undef, which is what '*****' in an overflowed PDB column already gave, and
+   IV_MAX and IV_MIN still read back exactly.
+
+ - fixed: a numeric field of digits and dots that is not a number took the whole
+   read down.  The pattern behind CRYST1's cell, a HELIX length and every mmCIF
+   number matched '1.2.3' and then added it to zero, which under
+   warnings FATAL => 'all' is fatal rather than merely wrong.  Fields of that
+   shape are in the archive -- 5m04 writes its pH as '5.4.-5.8' -- and one now
+   reads as the undef that says the file gave no number, leaving the fields
+   beside it alone.
+
+ - fixed: model => 2 of a file with no MODEL records came back with no atoms and
+   no chains and said nothing.  Asking for a model that is not there falls back
+   to the first one, but the fall-back read the list of model numbers the file
+   declared, and a crystal structure declares none: its one model is model 1.
+   It now falls back for those too, which is most of the archive.  A structure
+   emptied by something else -- a chains list that matches nothing, a file with
+   no coordinates -- is untouched and is not read a second time.
+
+ - structure_contacts() no longer takes time proportional to the residues times
+   the atoms.  Each residue scanned the whole heavy-atom array to find its own,
+   though the atoms of a residue are one contiguous run of it; walking that run
+   instead took the contacts of 4fqr -- 11,406 residues, 88,416 heavy atoms --
+   from 2.25 seconds to 0.15, and the whole feature walk of that entry from 5.98
+   to 3.87, the rest of which is the solvent-accessible surface.  It finds the
+   same pairs: t/features.t compares them with mdtraj's, as it did before, and
+   they are the same pairs an all-against-all walk of the fixtures finds.
+
+ - the parse builds a third fewer SVs.  A residue's identity -- its name, its
+   chain, its number, its insertion code, whether it is a HETATM and which model
+   it is in -- was built once per atom and read once per residue.  It is now
+   built where it is read, which for the shape structure_info() asks for is six
+   strings and integers per residue instead of six per atom: over 200 entries of
+   PDBbind v2020 the coordinate section went from 1.95 to 1.59 seconds, and
+   reading the largest of them (4fqr, 90,792 atoms) from 168 MB of peak memory
+   to 141 and from 0.28 seconds to 0.21.  A caller of the low-level parse that
+   asks for columns still gets one entry per atom, because there the columns are
+   the answer; t/parse.t reads both shapes of four fixtures and asserts they say
+   the same thing.
+
+ - the surface of each chain alone -- the interface half of the properties, and
+   about a third of what they cost -- no longer computes every atom twice.  An
+   atom whose every neighbour is in its own chain has the same surface with the
+   other chains there and taken away, bit for bit, so only the atoms that do
+   have a neighbour across a chain boundary are computed again.  Over 20 entries
+   of PDBbind v2020 the interface pass went from 1.85 seconds to 0.38, and the
+   whole default feature walk of 4fqr from 4.38 seconds to 2.61.  It is the same
+   answer: t/features.t still compares each chain's isolated surface with
+   mdtraj's, and t/properties.t compares it with reading that chain on its own,
+   which agreed to the last bit on all 131 chains of the 32 multi-chain entries
+   of a PDBbind v2020 sample as well as on the fixtures.
+
+ - the sphere-point loop inside the surface reads its neighbours out of four
+   arrays of its own rather than through an index into the structure's, with
+   each neighbour's radius squared once when it is found rather than once per
+   point.  Same comparisons, same answers, about 9% off the surface.
+
+ - fixed: missing_residues could name a residue the chain has.  A polymer
+   numbered out of order has jumps that pass over each other, and the list was
+   the jumps' contents added up rather than the set of numbers the chain does
+   not have -- so a residue modelled out of line could appear in its own chain's
+   missing list, and a number two jumps passed over could appear twice.  It is
+   now a set, ascending.  No chain of the 1,000 entries of PDBbind v2020 this
+   was measured over is affected; a chain numbered out of order is.
+
+ - structure_features() no longer trusts a chain's n_atoms to size its walk.  It
+   is an upper bound for every structure this module reads, and a structure a
+   caller assembled by hand can say less than it holds, or not say at all --
+   where the walk quietly stopped at the count instead of at the atoms.
+
+ - the test suite exercises a good deal more of the module: every name in the
+   residue table rather than a sample of them (150 of them, checked against
+   gemmi 0.7.5 where gemmi's own table carries the name), the mmCIF categories
+   and syntax the fixtures have no use for, the header records an entry has one
+   of, the low-level parse in both of its shapes, and the error paths of the XS
+   entry points.  Statement coverage of the Perl half goes from 96.5% to 99.6%
+   and of the XS from 94.3% to 96.6%, and branch coverage from 82.2% to 88.9%
+   and from 83.1% to 85.6%.
+
+ - t/leaks.t no longer fails under Devel::Cover.  Test::LeakTrace does not work
+   with it and has a guard that says so, but Devel::Cover 1.52 installs no
+   runops routine for the guard to notice, so every statement it had
+   instrumented was counted as a leak and `cover -t' failed 65 of that file's 85
+   tests on Devel::Cover's own counters.  The file now makes the skip itself,
+   running each block anyway so that a coverage run still covers it, and the
+   reference-cycle checks at the foot of it still run for real.
+
 0.02 2026-08-22 CDT
 
  - Fix for Windows: https://www.cpantesters.org/cpan/report/960c8de0-8001-1014-8897-e6a949c55ebf
