@@ -293,11 +293,10 @@ case are forgiven, as they are in res_key(), because the letter usually
 arrives out of a sequence string that has been through something else.*/
 static const char *aa1to3_lookup(const char *CSP_RESTRICT s, STRLEN len)
 {
-	int c;
 	while (len && (*s == ' ' || *s == '\t')) { s++; len--; }
 	while (len && (s[len - 1] == ' ' || s[len - 1] == '\t')) len--;
 	if (len != 1) return NULL;
-	c = toupper((unsigned char)*s);
+	int c = toupper((unsigned char)*s);
 	if (c < 'A' || c > 'Z') return NULL;
 	return aa1to3_name[c - 'A'];
 }
@@ -344,7 +343,7 @@ t/numbers.t, and came back as 200376420520689663 and a negative residue
 number.*/
 static bool str2iv(const char *CSP_RESTRICT s, STRLEN n, IV *CSP_RESTRICT out)
 {
-	bool neg = FALSE, seen = FALSE;
+	bool neg = 0, seen = 0;
 	UV v = 0, limit;
 	STRLEN i = 0;
 	if (i < n && (s[i] == '+' || s[i] == '-')) { neg = (s[i] == '-'); i++; }
@@ -356,7 +355,7 @@ static bool str2iv(const char *CSP_RESTRICT s, STRLEN n, IV *CSP_RESTRICT out)
 		d = (UV)(s[i] - '0');
 		if (v > (limit - d) / 10) return FALSE;
 		v = v * 10 + d;
-		seen = TRUE;
+		seen = 1;
 	}
 	if (!seen) return FALSE;
 	//IV_MIN is not -(IV)v: its magnitude has no positive IV to be negated from
@@ -437,7 +436,7 @@ static bool str2nv_fixed(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT 
 {
 	NV m = 0;
 	STRLEN i = 0, nd = 0, frac = 0;
-	bool neg = FALSE, dot = FALSE;
+	bool neg = 0, dot = 0;
 
 	if (n == 0) return FALSE;
 	if (s[0] == '+' || s[0] == '-') { neg = (s[0] == '-'); i = 1; }
@@ -448,7 +447,7 @@ static bool str2nv_fixed(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT 
 			m = m * 10 + (NV)(c - '0');
 			if (dot) frac++;
 		} else if (c == '.' && !dot) {
-			dot = TRUE;
+			dot = 1;
 		} else {
 			return FALSE; //an exponent, a stray letter, the '*****' of an overflowed field
 		}
@@ -713,10 +712,7 @@ the caller for the duration: slurp()'s Newx() block in _parse_file, and an SV we
 never touch again in _parse_string.  Nothing in here writes through it.*/
 static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RESTRICT opts)
 {
-	HV *out  = newHV();
-	HV *meta = newHV();
-	HV *elements = newHV();
-	HV *chain_elements = newHV();
+	HV *out  = newHV(), *meta = newHV(), *elements = newHV(), *chain_elements = newHV();
 	/*the tally of the chain the current residue belongs to, refreshed at each
 	residue boundary; see chain_tally()*/
 	HV *cur_chain = NULL;
@@ -730,7 +726,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	UV n_hydrogen = 0, n_water_atom = 0, bn = 0;
 	NV bmin = 0, bmax = 0, bsum = 0;
 	NV xmin = 0, ymin = 0, zmin = 0, xmax = 0, ymax = 0, zmax = 0;
-	bool have_bbox = FALSE, have_res = FALSE;
+	bool have_bbox = 0, have_res = 0;
 	//the residue being accumulated
 	NV rsx = 0, rsy = 0, rsz = 0, rsb = 0;
 	UV rnc = 0, rnb = 0;
@@ -746,20 +742,20 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	//previous kept atom's residue identity, for boundary detection
 	char p_chain[8], p_icode[4], p_resname[8];
 	IV p_resseq = 0, p_model = 0;
-	bool p_het = FALSE;
+	bool p_het = 0;
 	STRLEN pos = 0;
 
 	/*a negative model number means every model.  Zero cannot be the sentinel:
 	an ensemble whose models are numbered from 0 is unusual but legal, and
 	"model 0" would then quietly mean "all of them".*/
 	want_model  = opt_iv(aTHX_ opts, "model", 1);
-	keep_h      = opt_bool(aTHX_ opts, "hydrogens", TRUE);
-	keep_water  = opt_bool(aTHX_ opts, "waters", TRUE);
-	keep_het    = opt_bool(aTHX_ opts, "hetatm", TRUE);
-	keep_meta   = opt_bool(aTHX_ opts, "meta", TRUE);
-	keep_anisou = opt_bool(aTHX_ opts, "anisou", FALSE);
-	keep_lineno = opt_bool(aTHX_ opts, "lineno", FALSE);
-	build_atoms = opt_bool(aTHX_ opts, "atom_hashes", FALSE);
+	keep_h      = opt_bool(aTHX_ opts, "hydrogens", 1);
+	keep_water  = opt_bool(aTHX_ opts, "waters", 1);
+	keep_het    = opt_bool(aTHX_ opts, "hetatm", 1);
+	keep_meta   = opt_bool(aTHX_ opts, "meta", 1);
+	keep_anisou = opt_bool(aTHX_ opts, "anisou", 0);
+	keep_lineno = opt_bool(aTHX_ opts, "lineno", 0);
+	build_atoms = opt_bool(aTHX_ opts, "atom_hashes", 0);
 	{
 		SV *c = opt_get(aTHX_ opts, "chains");
 		if (c && SvROK(c) && SvTYPE(SvRV(c)) == SVt_PVHV) want_chain = (HV *)SvRV(c);
@@ -826,27 +822,27 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				STRLEN k;
 				if (ellen > 2) ellen = 2;
 				for (k = 0; k < ellen; k++) elbuf[k] = (char)toupper((unsigned char)s[k]);
-				/*and not believed unless it spells an element.  A file written
-				before the element column existed keeps the entry id in columns
-				73-80 instead, so what sits where the element goes is '1G' and
-				every atom in pdb1gdr reads as element '1' -- which also stops
-				hydrogens => 0 from finding the hydrogens.  A field that is not
-				letters is not an element, and the atom name knows better.*/
+	/*and not believed unless it spells an element.  A file written
+	before the element column existed keeps the entry id in columns
+	73-80 instead, so what sits where the element goes is '1G' and
+	every atom in pdb1gdr reads as element '1' -- which also stops
+	hydrogens => 0 from finding the hydrogens.  A field that is not
+	letters is not an element, and the atom name knows better.*/
 				for (k = 0; k < ellen; k++) {
 					if (!isALPHA(elbuf[k])) { ellen = 0; break; }
 				}
 			}
 			if (!ellen) ellen = guess_element(nm_raw, nm_rawlen, elbuf);
-			/*settled: the one spelling everything downstream sees, so that the
-			atom's own element, the whole-structure tally and the per-chain
-			tally cannot disagree about what to call a zinc*/
+	/*settled: the one spelling everything downstream sees, so that the
+	atom's own element, the whole-structure tally and the per-chain
+	tally cannot disagree about what to call a zinc*/
 			elem_case(elbuf, ellen);
 			if (!keep_h && ellen == 1 && (elbuf[0] == 'H' || elbuf[0] == 'D')) { n_skipped++; continue; }
 
-			/*kept.  The residue boundary is settled first, before this atom has
-			been added to anything, so that closing the previous residue is a
-			matter of flushing what is already there.  Everything the test needs
-			is read from the record's own columns.*/
+	/*kept.  The residue boundary is settled first, before this atom has
+	been added to anything, so that closing the previous residue is a
+	matter of flushing what is already there.  Everything the test needs
+	is read from the record's own columns.*/
 			{
 				bool changed;
 				have_rs = fld_iv(line, llen, 22, 25, &rs);
@@ -866,7 +862,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 					}
 					rsx = rsy = rsz = rsb = 0; rnc = rnb = 0;
 					av_push(res_first, newSVuv(n_atom));
-					have_res = TRUE;
+					have_res = 1;
 					p_resseq = rs;
 					p_model  = cur_model;
 					p_het    = het;
@@ -875,10 +871,10 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 					my_strlcpy(p_resname, resname, sizeof(p_resname));
 					cur_chain = chain_tally(aTHX_ chain_elements, cur_model,
 					                        chain, strlen(chain));
-					/*and the residue's identity, once, where the residue
-					begins: see the note where the atom's own fields are
-					emitted for why this is per residue in this shape and per
-					atom in the other*/
+	/*and the residue's identity, once, where the residue
+	begins: see the note where the atom's own fields are
+	emitted for why this is per residue in this shape and per
+	atom in the other*/
 					if (build_atoms) {
 						av_push(col[C_RESNAME], newSVpvn(resname, resname_len));
 						av_push(col[C_CHAIN],   newSVpvn(chain, strlen(chain)));
@@ -889,7 +885,6 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 					}
 				}
 			}
-
 			//the atom's own fields
 			{
 				const char *nm_s, *alt_s, *chg_s;
@@ -917,7 +912,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 					rsx += xv; rsy += yv; rsz += zv; rnc++;
 					if (!have_bbox) {
 						xmin = xmax = xv; ymin = ymax = yv; zmin = zmax = zv;
-						have_bbox = TRUE;
+						have_bbox = 1;
 					} else {
 						if (xv < xmin) xmin = xv; else if (xv > xmax) xmax = xv;
 						if (yv < ymin) ymin = yv; else if (yv > ymax) ymax = yv;
@@ -1118,7 +1113,7 @@ Where the two formats disagree about how to write the same fact, this reader
 converts to what the PDB reader would have produced: a formal charge of -1 comes
 back as "1-", auth_* identifiers are preferred over label_* ones because auth_*
 is what the PDB record carried, and a `.' or `?' -- mmCIF for "not applicable"
-and "unknown" -- comes back as the empty field the PDB record would have had.*/
+and "unknown" -- comes back as the empty field the PDB record would have had*/
 
 //the token kinds the lexer below returns
 #define CT_EOF   0 //end of the buffer
@@ -1173,7 +1168,7 @@ is an ordinary character in a value.*/
 static void cif_next(cif_lex *CSP_RESTRICT lx, cif_tok *CSP_RESTRICT t)
 {
 	const char *p = lx->p, *end = lx->end;
-	t->quoted = FALSE;
+	t->quoted = 0;
 	for (;;) {
 		while (p < end && cif_space(*p)) p++;
 		if (p >= end) { lx->p = end; t->kind = CT_EOF; t->s = end; t->n = 0; return; }
@@ -1196,7 +1191,7 @@ static void cif_next(cif_lex *CSP_RESTRICT lx, cif_tok *CSP_RESTRICT t)
 		t->s = s;
 		t->n = (STRLEN)(q - s);
 		t->kind = CT_VALUE;
-		t->quoted = TRUE;
+		t->quoted = 1;
 		return;
 	}
 
@@ -1215,7 +1210,7 @@ static void cif_next(cif_lex *CSP_RESTRICT lx, cif_tok *CSP_RESTRICT t)
 		t->s = s;
 		t->n = (STRLEN)(q - s);
 		t->kind = CT_VALUE;
-		t->quoted = TRUE;
+		t->quoted = 1;
 		lx->p = q < end ? q + 1 : end;
 		return;
 	}
@@ -1322,20 +1317,16 @@ row can be handed to one function.  A loop_ is the ordinary way to write the
 table and a run of plain tags is the legal way to write a table with one row in
 it; both end up in cif_atom_row() rather than in two copies of it.*/
 typedef struct {
-	AV **col;
-	AV **res_sum;
-	AV *res_first, *res_last, *atom_hv, *model_nums;
+	AV **col, **res_sum, *res_first, *res_last, *atom_hv, *model_nums;
 	HV *elements, *chain_elements, *want_chain;
 	//the tally of the chain the current residue belongs to; see chain_tally()
 	HV *cur_chain;
 	UV n_hydrogen, n_water_atom, bn;
-	NV bmin, bmax, bsum;
-	NV xmin, ymin, zmin, xmax, ymax, zmax;
+	NV bmin, bmax, bsum, xmin, ymin, zmin, xmax, ymax, zmax;
 	bool have_bbox;
 	NV rsx, rsy, rsz, rsb;
-	UV rnc, rnb;
+	UV rnc, rnb, n_models, n_anisou, n_skipped, n_atom, n_atom_rec, n_het_rec;
 	//counted up only; the numbers read out of the file stay signed, as in parse_buf
-	UV n_models, n_anisou, n_skipped, n_atom, n_atom_rec, n_het_rec;
 	IV want_model, cur_model;
 	bool have_res, seen_model, keep_h, keep_water, keep_het, keep_anisou, build_atoms;
 	char p_chain[8], p_icode[4], p_resname[8];
@@ -1359,22 +1350,20 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 	const char *CSP_RESTRICT nm_s, *CSP_RESTRICT alt_s;
 	STRLEN nm_n, alt_n;
 	res_info ri;
-	bool known, het, changed;
+	bool known, het, changed, have_rs, have_serial, have_occ, have_xyz, have_b;
 	IV rs = 0, serial = 0, model = 1;
-	bool have_rs, have_serial, have_occ, have_xyz, have_b;
 	NV xv = 0, yv = 0, zv = 0, ov = 0, bv = 0;
-
 	//which model this row belongs to, counted before anything can skip the row
 	if (v[A_MODEL] && str2iv(v[A_MODEL], vn[A_MODEL], &model)) {
 		if (!st->seen_model || model != st->cur_model) {
 			st->cur_model = model;
-			st->seen_model = TRUE;
+			st->seen_model = 1;
 			st->n_models++;
 			av_push(st->model_nums, newSViv(model));
 		}
 	} else if (!st->seen_model) {
 		st->cur_model = 1;
-		st->seen_model = TRUE;
+		st->seen_model = 1;
 		st->n_models++;
 		av_push(st->model_nums, newSViv(1));
 	}
@@ -1432,7 +1421,7 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 
 	//kept.  auth_seq_id is the residue number the PDB record carried; label_seq_id
 	//is the position in the entity, and is null for everything that is not polymer
-	have_rs = FALSE;
+	have_rs = 0;
 	if (v[A_ASEQ])      have_rs = str2iv(v[A_ASEQ], vn[A_ASEQ], &rs);
 	if (!have_rs && v[A_LSEQ]) have_rs = str2iv(v[A_LSEQ], vn[A_LSEQ], &rs);
 	if (!have_rs) rs = 0;
@@ -1454,7 +1443,7 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 		st->rsx = st->rsy = st->rsz = st->rsb = 0;
 		st->rnc = st->rnb = 0;
 		av_push(st->res_first, newSVuv(st->n_atom));
-		st->have_res = TRUE;
+		st->have_res = 1;
 		st->p_resseq = rs;
 		st->p_model  = st->cur_model;
 		st->p_het    = het;
@@ -1487,7 +1476,7 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 		st->rsx += xv; st->rsy += yv; st->rsz += zv; st->rnc++;
 		if (!st->have_bbox) {
 			st->xmin = st->xmax = xv; st->ymin = st->ymax = yv; st->zmin = st->zmax = zv;
-			st->have_bbox = TRUE;
+			st->have_bbox = 1;
 		} else {
 			if (xv < st->xmin) st->xmin = xv; else if (xv > st->xmax) st->xmax = xv;
 			if (yv < st->ymin) st->ymin = yv; else if (yv > st->ymax) st->ymax = yv;
@@ -1599,8 +1588,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	cif_state st;
 	cif_lex lx;
 	cif_tok tk;
-	size_t i;
-	bool keep_meta, have_single = FALSE;;
+	bool keep_meta, have_single = 0;;
 	UV lineno = 0;
 	SV *block = NULL;
 	const char *v[A_NFIELD], *sv_[A_NFIELD];
@@ -1609,6 +1597,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	STRLEN svn_[A_NFIELD];
 
 	Zero(&st, 1, cif_state);
+	size_t i;
 	for (i = 0; i < NCOL; i++)  col[i] = newAV();
 	for (i = 0; i < NRSUM; i++) res_sum[i] = newAV();
 	for (i = 0; i < A_NFIELD; i++) { sv_[i] = NULL; svn_[i] = 0; }
@@ -1663,7 +1652,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 			STRLEN *CSP_RESTRICT tagn = NULL;
 			short int *CSP_RESTRICT fld_of = NULL; //a column this reader ignores is -1
 			size_t ntags = 0, cap = 16; //an _atom_site loop has 21 tags: one Renew
-			bool is_atom = FALSE, is_aniso = FALSE, keep_loop = FALSE;
+			bool is_atom = 0, is_aniso = 0, keep_loop = 0;
 			const char *CSP_RESTRICT cat = NULL;
 			STRLEN catn = 0;
 			AV *rows = NULL;
@@ -1693,9 +1682,9 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 				is_atom  = (catn == 10 && cif_iskw(cat, catn, "_atom_site", 10));
 				is_aniso = (catn == 20 && cif_iskw(cat, catn, "_atom_site_anisotrop", 20));
 			}
-			/*_atom_site_anisotrop is as long as the atom table and is wanted about
-			as often as ANISOU is, which is to say hardly ever; it is counted
-			always and kept only when the caller asked for it*/
+	/*_atom_site_anisotrop is as long as the atom table and is wanted about
+	as often as ANISOU is, which is to say hardly ever; it is counted
+	always and kept only when the caller asked for it*/
 			keep_loop = keep_meta && !is_atom && (!is_aniso || st.keep_anisou);
 			if (keep_loop) rows = cif_loop_av(aTHX_ loops, cat, catn);
 
@@ -1752,7 +1741,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 			if (tk.kind != CT_VALUE) { lx.p = save; continue; }   //a tag with no value
 			if (catn == 10 && cif_iskw(tag, catn, "_atom_site", 10)) {
 				short int f = cif_atom_field(item, itemn);
-				if (f >= 0 && !cif_null(&tk)) { sv_[f] = tk.s; svn_[f] = tk.n; have_single = TRUE; }
+				if (f >= 0 && !cif_null(&tk)) { sv_[f] = tk.s; svn_[f] = tk.n; have_single = 1; }
 				continue;
 			}
 			if (catn == 20 && cif_iskw(tag, catn, "_atom_site_anisotrop", 20)) {
@@ -1764,14 +1753,11 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 		}
 		//a stray value with no tag in front of it: nothing to attach it to
 	}
-
 	if (have_single) cif_atom_row(aTHX_ &st, sv_, svn_);
-
 	if (st.have_res) {
 		av_push(st.res_last, newSVuv(st.n_atom - 1));
 		flush_residue(aTHX_ res_sum, st.rsx, st.rsy, st.rsz, st.rnc, st.rsb, st.rnb);
 	}
-
 	(void)hv_stores(out, "atoms", newRV_noinc((SV *)st.atom_hv));
 	for (i = 0; i < NRSUM; i++)
 		(void)hv_store(out, res_sum_name[i], (I32)strlen(res_sum_name[i]),
@@ -2276,10 +2262,12 @@ for the same reason.*/
 typedef struct {
 	//per atom
 	NV *x, *y, *z;
-	NV *rad;      //van der Waals radius plus the probe, angstrom
-	NV *area;     //solvent-accessible surface, angstrom^2; NULL until computed
-	NV *alone;    //the same with the other chains taken away; NULL unless asked for
-	NV *mass;     //dalton; 0.0 for an atom whose element has no mass
+	//rad, mass and apolar are all read off the element, and are all NULL for a
+	//set built coords_only -- see set_build()
+	NV *rad;   //van der Waals radius plus the probe, angstrom
+	NV *area;  //solvent-accessible surface, angstrom^2; NULL until computed
+	NV *alone; //the same with the other chains taken away; NULL unless asked for
+	NV *mass;  //dalton; 0.0 for an atom whose element has no mass
 	unsigned char *apolar; //1 = carbon or sulphur, 0 = everything else
 	HV **atom_hv; //the atom hash the row was read from, for writing back
 	UV n_atom;
@@ -2334,9 +2322,17 @@ second walk of the same hashes.
 
 Croaks rather than returning an empty set when there are atom records to be had
 and no atom hashes to read them from: that is a structure read with atoms => 0,
-and the only thing wrong with it is that nobody said so.*/
+and the only thing wrong with it is that nobody said so.
+
+coords_only says the caller wants positions and nothing else: rad, mass and
+apolar are left unallocated and NULL, and the element field they are all three
+derived from is not fetched.  That is one hash lookup and one element-table
+search per atom, and 2 NV + 1 byte per atom of memory, spent on three arrays
+structure_rmsd() never reads -- and it has every structure in the call in
+memory at once, which is what makes the per-atom bytes worth the parameter.
+probe is meaningless then and is not read.*/
 static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
-                      NV probe, const char *CSP_RESTRICT who)
+                      NV probe, bool coords_only, const char *CSP_RESTRICT who)
 {
 	AV *order = hvf_av(aTHX_ info, "chain_order", 11);
 	HV *chains = hvf_hv(aTHX_ info, "chains", 6);
@@ -2367,9 +2363,11 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 	Newx(s->x,   cap_atom ? cap_atom : 1, NV);
 	Newx(s->y,   cap_atom ? cap_atom : 1, NV);
 	Newx(s->z,   cap_atom ? cap_atom : 1, NV);
-	Newx(s->rad, cap_atom ? cap_atom : 1, NV);
-	Newx(s->mass, cap_atom ? cap_atom : 1, NV);
-	Newx(s->apolar, cap_atom ? cap_atom : 1, unsigned char);
+	if (!coords_only) {
+		Newx(s->rad, cap_atom ? cap_atom : 1, NV);
+		Newx(s->mass, cap_atom ? cap_atom : 1, NV);
+		Newx(s->apolar, cap_atom ? cap_atom : 1, unsigned char);
+	}
 	Newx(s->atom_hv, cap_atom ? cap_atom : 1, HV *);
 	Newx(s->res_hv,    cap_res ? cap_res : 1, HV *);
 	Newx(s->res_first, cap_res ? cap_res : 1, UV);
@@ -2462,9 +2460,11 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 					Renew(s->x,   cap_atom, NV);
 					Renew(s->y,   cap_atom, NV);
 					Renew(s->z,   cap_atom, NV);
-					Renew(s->rad, cap_atom, NV);
-					Renew(s->mass, cap_atom, NV);
-					Renew(s->apolar, cap_atom, unsigned char);
+					if (!coords_only) {
+						Renew(s->rad, cap_atom, NV);
+						Renew(s->mass, cap_atom, NV);
+						Renew(s->apolar, cap_atom, unsigned char);
+					}
 					Renew(s->atom_hv, cap_atom, HV *);
 				}
 				xs = hvf_sv(aTHX_ a, "x", 1);
@@ -2474,9 +2474,14 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 	no position, and a position is what every one of these
 	calculations is about; it is left out and counted nowhere*/
 				if (!xs || !ys || !zs) continue;
-				es = hvf_sv(aTHX_ a, "element", 7);
+				es = coords_only ? NULL : hvf_sv(aTHX_ a, "element", 7);
 				apolar = 0;
-				if (es) {
+				ep.vdw = CSP_VDW_DEFAULT;
+				ep.mass = 0.0;
+				if (coords_only) {
+					//nothing derived from the element is wanted, and the
+					//tally of atoms that spell none is one of those things
+				} else if (es) {
 					STRLEN el;
 					const char *ep_s = SvPV_const(es, el);
 	/*Carbon and sulphur are the apolar surface and everything
@@ -2497,17 +2502,17 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 						apolar = 1;
 					}
 				} else {
-					ep.vdw = CSP_VDW_DEFAULT;
-					ep.mass = 0.0;
 					s->n_no_element++;
 				}
 				s->x[s->n_atom] = SvNV(xs);
 				s->y[s->n_atom] = SvNV(ys);
 				s->z[s->n_atom] = SvNV(zs);
-				s->rad[s->n_atom] = ep.vdw + probe;
-				s->mass[s->n_atom] = ep.mass;
-				s->apolar[s->n_atom] = apolar;
-				s->mass_total += ep.mass;
+				if (!coords_only) {
+					s->rad[s->n_atom] = ep.vdw + probe;
+					s->mass[s->n_atom] = ep.mass;
+					s->apolar[s->n_atom] = apolar;
+					s->mass_total += ep.mass;
+				}
 				s->atom_hv[s->n_atom] = a;
 				s->n_atom++;
 			}
@@ -2533,9 +2538,11 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 		Renew(s->x, s->n_atom, NV);
 		Renew(s->y, s->n_atom, NV);
 		Renew(s->z, s->n_atom, NV);
-		Renew(s->rad, s->n_atom, NV);
-		Renew(s->mass, s->n_atom, NV);
-		Renew(s->apolar, s->n_atom, unsigned char);
+		if (!coords_only) {
+			Renew(s->rad, s->n_atom, NV);
+			Renew(s->mass, s->n_atom, NV);
+			Renew(s->apolar, s->n_atom, unsigned char);
+		}
 		Renew(s->atom_hv, s->n_atom, HV *);
 	}
 }
@@ -2595,13 +2602,13 @@ static void grid_build(pTHX_ cell_grid *CSP_RESTRICT g,
                        const NV *CSP_RESTRICT z, UV n, NV cut)
 {
 	NV xmax, ymax, zmax, cells = 0.0;
-	UV i, ncell, c;
+	UV ncell, c;
 	Zero(g, 1, cell_grid);
 	if (n == 0) return;
 	g->x0 = xmax = x[0];
 	g->y0 = ymax = y[0];
 	g->z0 = zmax = z[0];
-	for (i = 1; i < n; i++) {
+	for (UV i = 1; i < n; i++) {
 		if (x[i] < g->x0) g->x0 = x[i]; else if (x[i] > xmax) xmax = x[i];
 		if (y[i] < g->y0) g->y0 = y[i]; else if (y[i] > ymax) ymax = y[i];
 		if (z[i] < g->z0) g->z0 = z[i]; else if (z[i] > zmax) zmax = z[i];
@@ -2635,7 +2642,7 @@ static void grid_build(pTHX_ cell_grid *CSP_RESTRICT g,
 	ncell = g->nx * g->ny * g->nz;
 	Newxz(g->start, ncell + 1, UV);
 	Newx(g->idx, n, UV);
-	for (i = 0; i < n; i++) {
+	for (UV i = 0; i < n; i++) {
 		c = (grid_axis(x[i] - g->x0, g->cell, g->nx) * g->ny
 		   + grid_axis(y[i] - g->y0, g->cell, g->ny)) * g->nz
 		   + grid_axis(z[i] - g->z0, g->cell, g->nz);
@@ -2647,7 +2654,7 @@ static void grid_build(pTHX_ cell_grid *CSP_RESTRICT g,
 		UV run = 0;
 		for (c = 0; c < ncell; c++) { UV t = g->start[c]; g->start[c] = run; run += t; }
 	}
-	for (i = 0; i < n; i++) {
+	for (UV i = 0; i < n; i++) {
 		c = (grid_axis(x[i] - g->x0, g->cell, g->nx) * g->ny
 		   + grid_axis(y[i] - g->y0, g->cell, g->ny)) * g->nz
 		   + grid_axis(z[i] - g->z0, g->cell, g->nz);
@@ -2742,10 +2749,9 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 	UV nbr_cap = 64;
 	cell_grid g;
 	NV rmax = 0.0, constant;
-	UV i;
 
 	if (n == 0) return;
-	for (i = 0; i < n; i++) if (rad[i] > rmax) rmax = rad[i];
+	for (UV i = 0; i < n; i++) if (rad[i] > rmax) rmax = rad[i];
 	grid_build(aTHX_ &g, x, y, z, n, 2.0 * rmax);
 	Newx(nx,  nbr_cap, NV);
 	Newx(ny,  nbr_cap, NV);
@@ -2753,7 +2759,7 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 	Newx(nr2, nbr_cap, NV);
 	constant = 4.0 * CSP_PI / (NV)npts;
 
-	for (i = 0; i < n; i++) {
+	for (UV i = 0; i < n; i++) {
 		const NV xi = x[i], yi = y[i], zi = z[i], ri = rad[i];
 		UV n_nbr = 0, acc = 0, k_closest = 0, j;
 		UV cx, cy, cz, ax0, ax1, ay0, ay1, az0, az1, bx, by, bz;
@@ -2797,7 +2803,7 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 			const NV px = xi + ri * pts[3 * j];
 			const NV py = yi + ri * pts[3 * j + 1];
 			const NV pz = zi + ri * pts[3 * j + 2];
-			bool open = TRUE;
+			bool open = 1;
 			UV k;
 			for (k = 0; k < n_nbr; k++) {
 				UV kp = k_closest + k;
@@ -2806,7 +2812,7 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 				dx = px - nx[kp]; dy = py - ny[kp]; dz = pz - nz[kp];
 				if (dx * dx + dy * dy + dz * dz < nr2[kp]) {
 					k_closest = kp;
-					open = FALSE;
+					open = 0;
 					break;
 				}
 			}
@@ -3019,10 +3025,10 @@ static UV rings_find(pTHX_ structset *CSP_RESTRICT s, ring_t *CSP_RESTRICT *CSP_
 			NV px[RING_MAX], py[RING_MAX], pz[RING_MAX];
 			NV cx = 0.0, cy = 0.0, cz = 0.0, ux, uy, uz, vx, vy, vz, wx, wy, wz, wl;
 			unsigned short int i, na = defs[d].n;
-			bool whole = TRUE;
+			bool whole = 1;
 			for (i = 0; i < na; i++) {
 				if (!atom_xyz(aTHX_ atoms, defs[d].atom[i], &px[i], &py[i], &pz[i])) {
-					whole = FALSE;
+					whole = 0;
 					break;
 				}
 				cx += px[i]; cy += py[i]; cz += pz[i];
@@ -3195,7 +3201,7 @@ static AV *pi_stacking(pTHX_ structset *CSP_RESTRICT s, const pi_opt *CSP_RESTRI
 			for (p = g.start[cell]; p < g.start[cell + 1]; p++) {
 				UV j = g.idx[p];
 				NV vx, vy, vz, d, plane, ang_i, ang_j, inter = 0.0;
-				bool face, edge = FALSE;
+				bool face, edge = 0;
 				const char *kind;
 				HV *h;
 				if (j <= i) continue; //each pair once
@@ -3385,8 +3391,8 @@ static const bp_def *bp_kind_of(char x, char y, bool *CSP_RESTRICT swapped)
 {
 	unsigned short int i;
 	for (i = 0; i < (unsigned short int)C_ARRAY_LENGTH(bp_kinds); i++) {
-		if (bp_kinds[i].a == x && bp_kinds[i].b == y) { *swapped = FALSE; return &bp_kinds[i]; }
-		if (bp_kinds[i].a == y && bp_kinds[i].b == x) { *swapped = TRUE;  return &bp_kinds[i]; }
+		if (bp_kinds[i].a == x && bp_kinds[i].b == y) { *swapped = 0; return &bp_kinds[i]; }
+		if (bp_kinds[i].a == y && bp_kinds[i].b == x) { *swapped = 1;  return &bp_kinds[i]; }
 	}
 	return NULL;
 }
@@ -3452,11 +3458,11 @@ static AV *base_pairs(pTHX_ structset *CSP_RESTRICT s, NV hb, NV stagger, bool s
 			for (p = g.start[cell]; p < g.start[cell + 1]; p++) {
 				UV j = g.idx[p];
 				const bp_def *kind;
-				bool swapped = FALSE;
+				bool swapped = 0;
 				NV vx, vy, vz, d, plane, sag_i, sag_j, sag;
 				NV bond[CSP_BP_BONDS];
 				unsigned short int k;
-				bool whole = TRUE;
+				bool whole = 1;
 				char tname[4];
 				HV *h;
 				AV *hbs;
@@ -3477,12 +3483,12 @@ static AV *base_pairs(pTHX_ structset *CSP_RESTRICT s, NV hb, NV stagger, bool s
 					NV ax, ay, az, bx2, by2, bz2, dx, dy, dz;
 					if (!atom_xyz(aTHX_ bases[i].atoms, an, &ax, &ay, &az)
 					 || !atom_xyz(aTHX_ bases[j].atoms, bn, &bx2, &by2, &bz2)) {
-						whole = FALSE;
+						whole = 0;
 						break;
 					}
 					dx = bx2 - ax; dy = by2 - ay; dz = bz2 - az;
 					bond[k] = nv_sqrt(dx * dx + dy * dy + dz * dz);
-					if (bond[k] > hb) { whole = FALSE; break; }
+					if (bond[k] > hb) { whole = 0; break; }
 				}
 				if (!whole) continue;
 				sag_i = nv_fabs(vx * bases[i].nx + vy * bases[i].ny + vz * bases[i].nz);
@@ -3736,7 +3742,7 @@ static UV stacks_find(pTHX_ structset *CSP_RESTRICT s, nucbase_t *CSP_RESTRICT *
 		NV cx = 0.0, cy = 0.0, cz = 0.0, tot = 0.0;
 		NV ax, ay, az, bx, by, bz, wx, wy, wz, wl;
 		unsigned short int i;
-		bool whole = TRUE;
+		bool whole = 1;
 		if (s->res_type[r] != RT_NUC) continue;
 		if (!nucbase_of(s->res_one[r], &def)) continue;
 		atoms = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
@@ -3749,7 +3755,7 @@ static UV stacks_find(pTHX_ structset *CSP_RESTRICT s, nucbase_t *CSP_RESTRICT *
 			NV px, py, pz;
 			if (!atom_xyz(aTHX_ atoms, def->atom[i], &px, &py, &pz)
 			 || !elem_prop_of(def->atom[i], 1, &ep) || !(ep.mass > 0.0)) {
-				whole = FALSE;
+				whole = 0;
 				break;
 			}
 			cx += ep.mass * px; cy += ep.mass * py; cz += ep.mass * pz;
@@ -3905,20 +3911,20 @@ static AV *base_stacks(pTHX_ structset *CSP_RESTRICT s, NV dist_cut, NV omega_cu
 			for (p = g.start[cell]; p < g.start[cell + 1]; p++) {
 				UV j = g.idx[p];
 				NV vx, vy, vz, d0, d1, d2, cosw, omega, xi = 0.0, score;
-				bool have_xi = FALSE;
+				bool have_xi = 0;
 				char tname[4];
 				HV *h;
 				unsigned short int k;
 				if (j <= i) continue; //each pair once, the earlier residue first
-				//two conformers of one residue are not two bases
+	//two conformers of one residue are not two bases
 				if (bases[i].res == bases[j].res) continue;
 				vx = cx[j] - cx[i]; vy = cy[j] - cy[i]; vz = cz[j] - cz[i];
 				d0 = nv_sqrt(vx * vx + vy * vy + vz * vz);
 				if (d0 > dist_cut || !(d0 > 0.0)) continue;
-				/*d2: the 5' base's two normals are its centre of mass plus and
-				minus a x b, and the one that lands nearer the 3' base's centre
-				of mass is the one equation 9 wants -- the base has two faces
-				and the 3' base is over one of them.*/
+	/*d2: the 5' base's two normals are its centre of mass plus and
+	minus a x b, and the one that lands nearer the 3' base's centre
+	of mass is the one equation 9 wants -- the base has two faces
+	and the 3' base is over one of them.*/
 				d1 = bases[i].nlen;
 				d2 = 0.0;
 				for (k = 0; k < 2; k++) {
@@ -3929,22 +3935,22 @@ static AV *base_stacks(pTHX_ structset *CSP_RESTRICT s, NV dist_cut, NV omega_cu
 					const NV e = nv_sqrt(ex * ex + ey * ey + ez * ez);
 					if (k == 0 || e < d2) d2 = e;
 				}
-				//equation 9, the law of cosines.  The cosine is clamped before
-				//acos() sees it for the reason vec_angle_capped() clamps its
-				//own: a value a fraction of an ulp outside [-1, 1] is a NaN
-				//that would travel all the way out to the caller.
+	/*equation 9, the law of cosines.  The cosine is clamped before
+	acos() sees it for the reason vec_angle_capped() clamps its
+	own: a value a fraction of an ulp outside [-1, 1] is a NaN
+	that would travel all the way out to the caller*/
 				cosw = (d0 * d0 + d1 * d1 - d2 * d2) / (2.0 * d0 * d1);
 				if (cosw > 1.0) cosw = 1.0; else if (cosw < -1.0) cosw = -1.0;
 				omega = nv_acos(cosw) * to_deg;
 				if (omega <= omega_cut) {
-					/*equation 10 as PDB_stacker computes it: the 3' base's
-					normal is redrawn from the 5' base's centre of mass, so the
-					vector compared is (CoM3 - CoM5) +/- n3, and the smaller of
-					the two answers is Xi.  atan2(|u x v|, |u . v|) rather than
-					the arcsine the paper prints: it is the same angle for
-					vectors this cannot fold past 90 degrees, and it keeps its
-					precision near 0, which is where a good stack sits and where
-					an arcsine of a quotient near 0 has the least of it.*/
+	/*equation 10 as PDB_stacker computes it: the 3' base's
+	normal is redrawn from the 5' base's centre of mass, so the
+	vector compared is (CoM3 - CoM5) +/- n3, and the smaller of
+	the two answers is Xi.  atan2(|u x v|, |u . v|) rather than
+	the arcsine the paper prints: it is the same angle for
+	vectors this cannot fold past 90 degrees, and it keeps its
+	precision near 0, which is where a good stack sits and where
+	an arcsine of a quotient near 0 has the least of it.*/
 					for (k = 0; k < 2; k++) {
 						const NV sign = k ? -1.0 : 1.0;
 						const NV ux = bases[i].nx, uy = bases[i].ny, uz = bases[i].nz;
@@ -3959,7 +3965,7 @@ static AV *base_stacks(pTHX_ structset *CSP_RESTRICT s, NV dist_cut, NV omega_cu
 						NV t;
 						if (!(nv_fabs(dp) > 0.0) && !(cr > 0.0)) continue;
 						t = nv_atan2(cr, nv_fabs(dp)) * to_deg;
-						if (!have_xi || t < xi) { xi = t; have_xi = TRUE; }
+						if (!have_xi || t < xi) { xi = t; have_xi = 1; }
 					}
 				}
 				score = have_xi ? stack_score(d0, omega, xi, dist_cut, omega_cut) : 0.0;
@@ -4451,7 +4457,7 @@ static void nuc_torsions(pTHX_ HV *CSP_RESTRICT me, HV *CSP_RESTRICT my_at,
 	};
 	const NV to_deg = 180.0 / CSP_PI;
 	NV p[4][3], v, nu[5];
-	bool have_nu = TRUE;
+	bool have_nu = 1;
 	unsigned short int k;
 
 	for (k = 0; k < (unsigned short int)C_ARRAY_LENGTH(nuc_keys); k++)
@@ -4493,7 +4499,7 @@ static void nuc_torsions(pTHX_ HV *CSP_RESTRICT me, HV *CSP_RESTRICT my_at,
 	for (k = 0; k < 5; k++) {
 		if (four_atoms(aTHX_ my_at, NULL, nu_n[k], here, p)
 		    && dihedral4(p[0], p[1], p[2], p[3], &nu[k])) continue;
-		have_nu = FALSE;
+		have_nu = 0;
 		break;
 	}
 	if (have_nu) {
@@ -4574,7 +4580,7 @@ static void chain_torsions(pTHX_ HV *CSP_RESTRICT chain,
 	for (k = 0; k < NTORS; k++) {
 		col[k] = newAV();
 		len[k] = strlen(tors_name[k]);
-		any[k] = FALSE;
+		any[k] = 0;
 		//n undefs, of which the loop below fills in the ones there are
 		if (n) av_fill(col[k], (SSize_t)n - 1);
 	}
@@ -4583,7 +4589,7 @@ static void chain_torsions(pTHX_ HV *CSP_RESTRICT chain,
 			SV *v = hvf_sv(aTHX_ res[i], tors_name[k], len[k]);
 			if (!v) continue;
 			(void)av_store(col[k], (SSize_t)i, newSVsv(v));
-			any[k] = TRUE;
+			any[k] = 1;
 		}
 	for (k = 0; k < NTORS; k++) {
 		if (any[k])
@@ -4980,15 +4986,15 @@ static void backbone_read(pTHX_ structset *CSP_RESTRICT s, backbone *CSP_RESTRIC
 	for (r = 0; r < s->n_res; r++) {
 		HV *at = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
 		backbone *b = &bb[r];
-		b->whole = FALSE;
+		b->whole = 0;
 		b->proline = (s->res_key[r] == K3('P','R','O'));
-		b->linked = FALSE;
+		b->linked = 0;
 		if (!at) continue;
 		if (!atom_xyz(aTHX_ at, "N",  &b->n[0],  &b->n[1],  &b->n[2]))  continue;
 		if (!atom_xyz(aTHX_ at, "CA", &b->ca[0], &b->ca[1], &b->ca[2])) continue;
 		if (!atom_xyz(aTHX_ at, "C",  &b->c[0],  &b->c[1],  &b->c[2]))  continue;
 		if (!atom_xyz(aTHX_ at, "O",  &b->o[0],  &b->o[1],  &b->o[2]))  continue;
-		b->whole = TRUE;
+		b->whole = 1;
 	}
 	for (r = 1; r < s->n_res; r++)
 		bb[r].linked = peptide_linked(aTHX_ s->res_hv[r - 1], s->res_hv[r], bond);
@@ -5389,19 +5395,19 @@ static void dssp_read(pTHX_ structset *CSP_RESTRICT s, dssp_res *CSP_RESTRICT bb
 		if (!at) continue;
 		if (atom_xyz(aTHX_ at, "N", &x, &y, &z)) {
 			b->n[0] = dssp_nm(x); b->n[1] = dssp_nm(y); b->n[2] = dssp_nm(z);
-			b->has_n = TRUE;
+			b->has_n = 1;
 		}
 		if (atom_xyz(aTHX_ at, "CA", &x, &y, &z)) {
 			b->ca[0] = dssp_nm(x); b->ca[1] = dssp_nm(y); b->ca[2] = dssp_nm(z);
-			b->has_ca = TRUE;
+			b->has_ca = 1;
 		}
 		if (atom_xyz(aTHX_ at, "C", &x, &y, &z)) {
 			b->c[0] = dssp_nm(x); b->c[1] = dssp_nm(y); b->c[2] = dssp_nm(z);
-			b->has_c = TRUE;
+			b->has_c = 1;
 		}
 		if (atom_xyz(aTHX_ at, "O", &x, &y, &z)) {
 			b->o[0] = dssp_nm(x); b->o[1] = dssp_nm(y); b->o[2] = dssp_nm(z);
-			b->has_o = TRUE;
+			b->has_o = 1;
 		}
 		b->whole = b->has_n && b->has_ca && b->has_c && b->has_o;
 	}
@@ -5421,7 +5427,7 @@ static void dssp_read(pTHX_ structset *CSP_RESTRICT s, dssp_res *CSP_RESTRICT bb
 			float step = u * DSSP_H;
 			b->h[k] = b->n[k] + step;
 		}
-		b->donor = TRUE;
+		b->donor = 1;
 	}
 }
 
@@ -5678,18 +5684,18 @@ static void dssp_sheets(pTHX_ UV n_res, const UV *CSP_RESTRICT seg,
 	for (c = 0; c < ncand; c++) {
 		UV i = cand[c].i, j = cand[c].j;
 		unsigned char type = dssp_test_bridge(n_res, seg, acc, j, i);
-		bool found = FALSE;
+		bool found = 0;
 		if (type == BR_NONE || !bb[i].whole || !bb[j].whole) continue;
 		for (x = 0; x < nbr; x++) {
 			if (type != br[x].type || i != br[x].i_last + 1) continue;
 			if (type == BR_PARA && br[x].j_last + 1 == j) {
 				br[x].i_last = i; br[x].j_last = j; br[x].n_i++;
-				found = TRUE;
+				found = 1;
 				break;
 			}
 			if (type == BR_ANTI && br[x].j_first > 0 && br[x].j_first - 1 == j) {
 				br[x].i_last = i; br[x].j_first = j; br[x].n_i++;
-				found = TRUE;
+				found = 1;
 				break;
 			}
 		}
@@ -5829,7 +5835,7 @@ static void dssp_helices(pTHX_ UV n_res, const UV *CSP_RESTRICT seg,
 			for (j = i; j <= i + 3; j++) ss[j] = SS_HELIX;
 
 	for (i = 1; i + 3 < n_res; i++) {
-		bool empty = TRUE;
+		bool empty = 1;
 		if (!(HX_BEGINS(hf[i * 3]) && HX_BEGINS(hf[(i - 1) * 3]))) continue;
 		for (j = i; empty && j <= i + 2; j++)
 			empty = (ss[j] == SS_COIL || ss[j] == SS_G310);
@@ -5838,7 +5844,7 @@ static void dssp_helices(pTHX_ UV n_res, const UV *CSP_RESTRICT seg,
 	}
 
 	for (i = 1; i + 5 < n_res; i++) {
-		bool empty = TRUE;
+		bool empty = 1;
 		if (!(HX_BEGINS(hf[i * 3 + 2]) && HX_BEGINS(hf[(i - 1) * 3 + 2]))) continue;
 		for (j = i; empty && j <= i + 4; j++)
 			empty = (ss[j] == SS_COIL || ss[j] == SS_PI || ss[j] == SS_HELIX);
@@ -5847,7 +5853,7 @@ static void dssp_helices(pTHX_ UV n_res, const UV *CSP_RESTRICT seg,
 	}
 
 	for (i = 1; i + 1 < n_res; i++) {
-		bool turn = FALSE;
+		bool turn = 0;
 		if (ss[i] != SS_COIL || !bb[i].whole) continue;
 		for (stride = 3; stride <= 5 && !turn; stride++)
 			for (k = 1; k < stride && !turn; k++)
@@ -6004,7 +6010,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	NV gyr[3][3], moment[3];
 	NV cx = 0.0, cy = 0.0, cz = 0.0, mx = 0.0, my = 0.0, mz = 0.0;
 	NV rg = 0.0, rg_mass = 0.0;
-	bool have_rg_mass = FALSE;
+	bool have_rg_mass = 0;
 	UV i, r, c;
 
 	if (probe < 0.0) croak("%s: probe must not be negative", who);
@@ -6017,7 +6023,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	ENTER;
 	Zero(&s, 1, structset);
 	SAVEDESTRUCTOR_X(set_free_cb, &s);
-	set_build(aTHX_ info, &s, probe, who);
+	set_build(aTHX_ info, &s, probe, FALSE, who);
 
 	if (want_sasa) {
 		sasa_compute(aTHX_ &s, (UV)points, want_iface);
@@ -6099,7 +6105,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 			sum += s.mass[i] * (dx * dx + dy * dy + dz * dz);
 		}
 		rg_mass = nv_sqrt(sum / mass_total);
-		have_rg_mass = TRUE;
+		have_rg_mass = 1;
 	}
 
 	if (want_pi) {
@@ -6249,6 +6255,727 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	if (want_cont) (void)hv_stores(out, "contacts", newRV_inc((SV *)cont));
 	if (want_hb) (void)hv_stores(out, "hbonds", newRV_inc((SV *)hb));
 	if (want_ssq) (void)hv_stores(out, "dssp", newRV_inc((SV *)ssq));
+	LEAVE;
+	return out;
+}
+
+/*Comparing two structures: RMSD.
+
+Everything above this point answers a question about one structure.  This
+answers the one question that takes two: given two copies of the same molecule
+-- two models of an NMR ensemble, the same protein solved twice, a docked pose
+and the crystallographic one -- how far apart are they?
+
+The answer is the root mean square deviation over the atoms the two have in
+common, after the rigid-body move that makes it as small as it can be.  It is
+three separate jobs, and two of them are somebody else's:
+
+  pairing        which atom of one structure is which atom of the other.  Keyed
+                 on the chain, the residue as this module keys it and the atom
+                 name -- the identity the file itself gives an atom -- so two
+                 models of one ensemble pair exactly and two files of the same
+                 protein pair over whatever they have in common.  Nothing is
+                 aligned and nothing is guessed: an atom that is not in both
+                 structures under the same name is not in the answer.
+  superposition  Theobald, D L (2005) Acta Cryst A61(4):478-80, the quaternion
+                 characteristic polynomial, as its reference implementation
+                 qcprot.c (Liu, P; Agrafiotis, D K; Theobald, D L (2010)
+                 J Comput Chem 31(7):1561-3) writes it and as Biopython 1.85
+                 ships it in Bio/PDB/qcprot.py.  The inner-product matrix of
+                 the two centred point sets, the quartic whose largest root is
+                 the maximum of the rotation's trace, Newton-Raphson for that
+                 root, and the eigenvector of the 4x4 key matrix for the
+                 quaternion the rotation is built from.
+  the deviation  measured, not inferred; see qcp_rotation() for why.
+
+t/rmsd.t compares the whole of it against Biopython's QCPSuperimposer and
+SVDSuperimposer and against gemmi 0.7.5's superpose_positions, on the fixtures
+in t/data and on the NMR ensembles of PDBbind v2020.
+
+Angstrom throughout, as everything else here is.*/
+
+//which atoms take part.  The option is spelled out in Perl; these are what it
+//comes down to here.
+#define RS_ALL      0 //every atom the two structures share
+#define RS_HEAVY    1 //all but hydrogen and deuterium
+#define RS_BACKBONE 2 //N CA C O of an amino acid, P O5' C5' C4' C3' O3' of a nucleotide
+#define RS_CA       3 //CA of an amino acid, P of a nucleotide
+
+//how the atoms of one structure are matched to the atoms of the other
+#define RM_KEY   0 //by chain, residue and atom name: the identity in the file
+#define RM_ORDER 1 //by position in the walk: the nth selected atom of each
+
+/*One atom, as the pairing sees it: three interned strings and the row the
+position is in.
+
+Interned rather than compared as text because the comparison happens
+n log n times per structure and then once more per pair of structures, and
+because an integer triple is a key qsort() can order without a call back into
+perl.  The table is one per call, so two structures agree on an id exactly when
+they agree on the string.*/
+typedef struct {
+	U32 chain; //the chain id
+	U32 res;   //the residue key: its number and insertion code, as this module files it
+	U32 name;  //the atom name
+	UV  idx;   //the atom's row in its structset
+} rmsd_key;
+
+static int rmsd_key_cmp(const void *pa, const void *pb)
+{
+	/*No CSP_RESTRICT and no const on the parameters beyond what qsort asks
+	for: the prototype is the C library's, not this file's.*/
+	const rmsd_key *a = (const rmsd_key *)pa;
+	const rmsd_key *b = (const rmsd_key *)pb;
+	if (a->chain != b->chain) return (a->chain < b->chain) ? -1 : 1;
+	if (a->res   != b->res)   return (a->res   < b->res)   ? -1 : 1;
+	if (a->name  != b->name)  return (a->name  < b->name)  ? -1 : 1;
+	return 0;
+}
+
+//the same order, without going through qsort's void pointers
+static int rmsd_key_ord(const rmsd_key *CSP_RESTRICT a, const rmsd_key *CSP_RESTRICT b)
+{
+	if (a->chain != b->chain) return (a->chain < b->chain) ? -1 : 1;
+	if (a->res   != b->res)   return (a->res   < b->res)   ? -1 : 1;
+	if (a->name  != b->name)  return (a->name  < b->name)  ? -1 : 1;
+	return 0;
+}
+
+/*rmsd_intern() -- a string to a small integer, the same integer for the same
+string for as long as the table lives.
+
+One table for every structure in the call, so that an id compares equal across
+structures.  A missing or undefined field interns as 0 and so matches another
+missing one, which is what a blank chain id has to do: the PDB writes one as a
+space and mmCIF as a dot, and both come back here as the empty string.*/
+static U32 rmsd_intern(pTHX_ HV *CSP_RESTRICT tab, SV *CSP_RESTRICT sv, U32 *CSP_RESTRICT next)
+{
+	STRLEN len;
+	const char *s;
+	SV **slot;
+	if (!sv) return 0;
+	s = SvPV_const(sv, len);
+	//hv_fetch with lval: the entry is created holding an undef SV when the
+	//string is new, which is what tells a new id from one already given out
+	slot = hv_fetch(tab, s, (I32)len, 1);
+	if (!slot || !*slot) croak("structure_rmsd: out of memory interning an atom name");
+	if (!SvOK(*slot)) sv_setuv(*slot, (UV)++(*next));
+	return (U32)SvUV(*slot);
+}
+
+/*rmsd_name_is() -- is this atom called that?
+
+Written out rather than strEQ because a prime in a nucleotide's atom name is
+written ' in a modern file and * in an old one -- O5' and O5* are the same
+atom, and a file old enough to use * is exactly the kind this module is asked
+to read.  The wanted name is spelled with ' here and matches both.*/
+static bool rmsd_name_is(const char *CSP_RESTRICT s, STRLEN len, const char *CSP_RESTRICT want)
+{
+	STRLEN i;
+	for (i = 0; i < len; i++) {
+		char c = s[i];
+		if (c == '*') c = '\'';
+		if (want[i] == '\0' || want[i] != c) return FALSE;
+	}
+	return want[len] == '\0';
+}
+
+/*rmsd_wanted() -- does this atom take part, under the caller's selection?
+
+RS_BACKBONE and RS_CA name atoms of a polymer, so a ligand, an ion or a water
+is out of both whatever it is called: a HETATM named CA is a calcium ion far
+more often than it is an alpha carbon, and the residue type is what tells them
+apart.
+
+Takes the atom hash rather than its element, because only RS_HEAVY reads one
+and the fetch is per atom: handed the SV instead, every selection pays for a
+hash lookup three of the four never look at.*/
+static bool rmsd_wanted(pTHX_ short int sel, unsigned char rtype,
+                        const char *CSP_RESTRICT name, STRLEN nlen,
+                        HV *CSP_RESTRICT atom)
+{
+	if (sel == RS_ALL) return TRUE;
+	if (sel == RS_HEAVY) {
+		SV *elem = hvf_sv(aTHX_ atom, "element", 7);
+		STRLEN el;
+		const char *e;
+		int c;
+		//an atom whose line was written before the element column existed, or
+		//trimmed before it, has no element to go on and is taken as heavy:
+		//the alternative is dropping an atom because a column is missing
+		if (!elem) return TRUE;
+		e = SvPV_const(elem, el);
+		//both ends: this module's own readers trim the field, and a structure
+		//assembled elsewhere can hand over the column as it stood
+		while (el && (*e == ' ' || *e == '\t')) { e++; el--; }
+		while (el && (e[el - 1] == ' ' || e[el - 1] == '\t')) el--;
+		if (el != 1) return TRUE;
+		c = toupper((unsigned char)*e);
+		return (c != 'H' && c != 'D');
+	}
+	if (rtype == RT_AA) {
+		if (rmsd_name_is(name, nlen, "CA")) return TRUE;
+		if (sel == RS_CA) return FALSE;
+		return rmsd_name_is(name, nlen, "N") || rmsd_name_is(name, nlen, "C")
+		    || rmsd_name_is(name, nlen, "O");
+	}
+	if (rtype == RT_NUC) {
+		if (rmsd_name_is(name, nlen, "P")) return TRUE;
+		if (sel == RS_CA) return FALSE;
+		return rmsd_name_is(name, nlen, "O5'") || rmsd_name_is(name, nlen, "C5'")
+		    || rmsd_name_is(name, nlen, "C4'") || rmsd_name_is(name, nlen, "C3'")
+		    || rmsd_name_is(name, nlen, "O3'");
+	}
+	return FALSE;
+}
+
+/*rmsd_keys() -- the selected atoms of one structure, as pairing keys.
+
+The chain id and the residue key are interned once each per chain and per
+residue rather than once per atom: there are a few dozen of the first and a few
+thousand of the second against several hundred thousand atoms, and the hash
+lookup is the whole cost of this walk.
+
+ids says whether the three identifiers are wanted at all.  RM_ORDER pairs the
+nth atom with the nth atom and never compares a key, so interning for it is one
+hash lookup per atom spent on a number nothing reads; the fields are still
+written, as zero, because a structure left holding whatever Newx() found there
+is a trap for the next thing that sorts these.  The atom's name is read either
+way: it is what rmsd_wanted() selects on, and an atom that has none is left out
+under both pairings.*/
+static UV rmsd_keys(pTHX_ const structset *CSP_RESTRICT s, HV *CSP_RESTRICT tab,
+                    U32 *CSP_RESTRICT next, short int sel, bool ids,
+                    rmsd_key *CSP_RESTRICT out)
+{
+	UV n = 0, c, r, i;
+	for (c = 0; c < s->n_chain; c++) {
+		const U32 cid = ids
+		    ? rmsd_intern(aTHX_ tab, hvf_sv(aTHX_ s->chain_hv[c], "id", 2), next) : 0;
+		for (r = s->chain_first[c]; r < s->chain_last[c]; r++) {
+			const U32 rid = ids
+			    ? rmsd_intern(aTHX_ tab, hvf_sv(aTHX_ s->res_hv[r], "key", 3), next) : 0;
+			for (i = s->res_first[r]; i < s->res_last[r]; i++) {
+				SV *nm = hvf_sv(aTHX_ s->atom_hv[i], "name", 4);
+				STRLEN nlen;
+				const char *np;
+				if (!nm) continue; //an atom with no name is an atom with no identity
+				np = SvPV_const(nm, nlen);
+				if (!rmsd_wanted(aTHX_ sel, s->res_type[r], np, nlen, s->atom_hv[i]))
+					continue;
+				out[n].chain = cid;
+				out[n].res   = rid;
+				out[n].name  = ids ? rmsd_intern(aTHX_ tab, nm, next) : 0;
+				out[n].idx   = i;
+				n++;
+			}
+		}
+	}
+	return n;
+}
+
+/*rmsd_pair_by_key() -- the atoms two structures have in common, as two parallel
+lists of rows, by merging their sorted key lists.
+
+A key that appears more than once on either side names no single atom -- the
+same atom name twice in one residue, which this module's own reader cannot
+produce (alternate conformers of an atom are one entry with a list of
+conformers) but a structure assembled elsewhere can -- so the whole run is
+passed over rather than paired in whatever order it happens to be in.*/
+static UV rmsd_pair_by_key(const rmsd_key *CSP_RESTRICT a, UV na,
+                           const rmsd_key *CSP_RESTRICT b, UV nb,
+                           UV *CSP_RESTRICT ia, UV *CSP_RESTRICT ib)
+{
+	UV i = 0, j = 0, n = 0;
+	while (i < na && j < nb) {
+		const int c = rmsd_key_ord(&a[i], &b[j]);
+		if (c < 0) { i++; continue; }
+		if (c > 0) { j++; continue; }
+		{
+			UV i2 = i + 1, j2 = j + 1;
+			while (i2 < na && rmsd_key_ord(&a[i2], &a[i]) == 0) i2++;
+			while (j2 < nb && rmsd_key_ord(&b[j2], &b[j]) == 0) j2++;
+			if (i2 - i == 1 && j2 - j == 1) {
+				ia[n] = a[i].idx;
+				ib[n] = b[j].idx;
+				n++;
+			}
+			i = i2;
+			j = j2;
+		}
+	}
+	return n;
+}
+
+/*Newton-Raphson on the characteristic quartic, capped.
+
+qcprot stops at 50 iterations and at a relative change of 1e-11, and says five
+are enough on average.  1e-11 is a double's answer to "as close as it is worth
+going"; this stops at the width of an NV instead, because the whole file does,
+and because Newton doubles the number of correct figures every step -- the
+extra width costs one iteration, not a proportional number of them.  Measured
+over every pair of models of the 40 NMR entries in the first 2,000 files of
+PDBbind v2020, 5,598 superpositions: a mean of 4.98 iterations and at most 9
+on a double or long-double perl, at most 10 on a __float128 one.  The cap is
+qcprot's own and stands at five times the worst seen; reaching it would mean
+Newton had not converged, and the answer is then whatever the last iterate
+was, which is what qcprot does too.*/
+#define CSP_QCP_ITER 50
+
+/*qcp_rotation() -- the rotation that best superposes one centred point set on
+another, from the inner-product matrix of the two.
+
+s[p][q] is the sum over paired atoms of a[p] * b[q], both centred, where a is
+the set being moved and b the set it is moved onto; e0 is half the sum of the
+two sets' squared radii.  Those are the only things about the atoms this needs,
+which is what makes the method fast: everything below is a fixed amount of
+arithmetic on nine numbers, however many atoms they came from.
+
+Transcribed from Bio/PDB/qcprot.py of Biopython 1.85, which is the qcprot.c of
+Liu, Agrafiotis and Theobald (2010) with the point sets swapped so that the
+first argument is the reference; the variable names are theirs.  Two things are
+deliberately not theirs:
+
+The RMSD is not taken from the eigenvalue.  sqrt(2|E0 - L|/n) is the point of
+the method -- it never forms the rotation at all -- and it is a subtraction of
+two numbers that agree in as many figures as the two structures do: at an RMSD
+of 1e-4 A over a few thousand atoms, E0 and L agree in ten of a double's
+sixteen and the answer keeps six of them.  A caller here can ask for the
+rotation anyway, so the deviation is measured with it instead -- rotate,
+subtract, square, sum -- which is one more pass over the paired atoms, has no
+cancellation anywhere in it (every term is a square), and is the same quantity
+Biopython's SVDSuperimposer and gemmi's superpose_positions report.  So this
+function returns the rotation and rmsd_measure() below returns the number.
+
+Which row of cofactors the quaternion comes from is not theirs either.  The
+4x4 key matrix less its largest eigenvalue is singular and symmetric, so its
+adjugate is v.v' for the eigenvector v and every row of it is a multiple of v;
+qcprot tries four of them in turn and takes the first whose squared length
+clears 1e-6, which is an absolute threshold on a quantity that scales as the
+sixth power of the coordinates -- what it means for a tetrapeptide and what it
+means for a ribosome are different things.  All four are computed here and the
+longest is taken, which is the same vector whenever qcprot finds one and needs
+no threshold to choose.  Only "all four vanish" is left to decide, and that one
+is scaled: it says the key matrix is numerically zero, and there is nothing to
+rotate.
+
+Returns the rotation as rot[p][q] with b = rot . a, the column-vector
+convention -- the transpose of the one Biopython applies as coords.dot(rot).
+
+No CSP_RESTRICT and no const on the two matrices, which is the one place in
+this file a pointer parameter goes without: they are array parameters, and the
+portable spelling of the qualifier on one of those is C99's `NV s[restrict
+3][3]', which the pre-C99 fallbacks the macro exists for do not take.  They are
+two distinct locals of rmsd_measure() and nothing else can reach them.*/
+static void qcp_rotation(NV s[3][3], NV e0, NV rot[3][3])
+{
+	const NV Sxx = s[0][0], Sxy = s[0][1], Sxz = s[0][2];
+	const NV Syx = s[1][0], Syy = s[1][1], Syz = s[1][2];
+	const NV Szx = s[2][0], Szy = s[2][1], Szz = s[2][2];
+	const NV Sxx2 = Sxx * Sxx, Syy2 = Syy * Syy, Szz2 = Szz * Szz;
+	const NV Sxy2 = Sxy * Sxy, Syz2 = Syz * Syz, Sxz2 = Sxz * Sxz;
+	const NV Syx2 = Syx * Syx, Szy2 = Szy * Szy, Szx2 = Szx * Szx;
+	const NV SyzSzymSyySzz2 = 2.0 * (Syz * Szy - Syy * Szz);
+	const NV Sxx2Syy2Szz2Syz2Szy2 = Syy2 + Szz2 - Sxx2 + Syz2 + Szy2;
+	const NV c2 = -2.0 * (Sxx2 + Syy2 + Szz2 + Sxy2 + Syx2 + Sxz2 + Szx2 + Syz2 + Szy2);
+	const NV c1 = 8.0 * (Sxx * Syz * Szy + Syy * Szx * Sxz + Szz * Sxy * Syx
+	                   - Sxx * Syy * Szz - Syz * Szx * Sxy - Szy * Syx * Sxz);
+	const NV SxzpSzx = Sxz + Szx, SyzpSzy = Syz + Szy, SxypSyx = Sxy + Syx;
+	const NV SyzmSzy = Syz - Szy, SxzmSzx = Sxz - Szx, SxymSyx = Sxy - Syx;
+	const NV SxxpSyy = Sxx + Syy, SxxmSyy = Sxx - Syy;
+	const NV Sxy2Sxz2Syx2Szx2 = Sxy2 + Sxz2 - Syx2 - Szx2;
+	const NV SxxpSyy_p_Szz = SxxpSyy + Szz;
+	const NV c0 = Sxy2Sxz2Syx2Szx2 * Sxy2Sxz2Syx2Szx2
+	  + (Sxx2Syy2Szz2Syz2Szy2 + SyzSzymSyySzz2) * (Sxx2Syy2Szz2Syz2Szy2 - SyzSzymSyySzz2)
+	  + (-SxzpSzx * SyzmSzy + SxymSyx * (SxxmSyy - Szz))
+	  * (-SxzmSzx * SyzpSzy + SxymSyx * (SxxmSyy + Szz))
+	  + (-SxzpSzx * SyzpSzy - SxypSyx * (SxxpSyy - Szz))
+	  * (-SxzmSzx * SyzmSzy - SxypSyx * SxxpSyy_p_Szz)
+	  + (SxypSyx * SyzpSzy + SxzpSzx * (SxxmSyy + Szz))
+	  * (-SxymSyx * SyzmSzy + SxzpSzx * SxxpSyy_p_Szz)
+	  + (SxypSyx * SyzmSzy + SxzmSzx * (SxxmSyy - Szz))
+	  * (-SxymSyx * SyzpSzy + SxzmSzx * (SxxpSyy - Szz));
+	/*f(x) = x^4 + c2 x^2 + c1 x + c0, eq. 8 of Theobald (2005), whose largest
+	root is the maximum of the rotation's trace and lies just below E0.*/
+	NV lambda = e0;
+	NV a11, a12, a13, a14, a21, a22, a23, a24;
+	NV a31, a32, a33, a34, a41, a42, a43, a44;
+	NV a3344_4334, a3244_4234, a3243_4233, a3143_4133, a3144_4134, a3142_4132;
+	NV q[4][4], qsqr[4], best, scale, qn;
+	NV a2, x2, y2, z2, xy, az, zx, ay, yz, ax;
+	unsigned short int it, k, kbest;
+
+	for (it = 0; it < CSP_QCP_ITER; it++) {
+		const NV old = lambda;
+		const NV l2 = lambda * lambda;
+		const NV b = (l2 + c2) * lambda;
+		const NV a = b + c1;
+		const NV f = a * lambda + c0;
+		const NV fp = 2.0 * l2 * lambda + b + a;
+		NV delta;
+		if (!(nv_fabs(fp) > 0.0)) break; //a stationary point: Newton has nothing to follow
+		delta = f / fp;
+		lambda = nv_fabs(lambda - delta);
+		if (nv_fabs(lambda - old) <= 4.0 * NV_EPSILON * nv_fabs(lambda)) break;
+	}
+
+	a11 = SxxpSyy + Szz - lambda; a12 = SyzmSzy;              a13 = -SxzmSzx;             a14 = SxymSyx;
+	a21 = a12;                    a22 = SxxmSyy - Szz - lambda; a23 = SxypSyx;            a24 = SxzpSzx;
+	a31 = a13;                    a32 = a23;                  a33 = Syy - Sxx - Szz - lambda; a34 = SyzpSzy;
+	a41 = a14;                    a42 = a24;                  a43 = a34;                  a44 = Szz - SxxpSyy - lambda;
+	a3344_4334 = a33 * a44 - a43 * a34;
+	a3244_4234 = a32 * a44 - a42 * a34;
+	a3243_4233 = a32 * a43 - a42 * a33;
+	a3143_4133 = a31 * a43 - a41 * a33;
+	a3144_4134 = a31 * a44 - a41 * a34;
+	a3142_4132 = a31 * a42 - a41 * a32;
+	q[0][0] =  a22 * a3344_4334 - a23 * a3244_4234 + a24 * a3243_4233;
+	q[0][1] = -a21 * a3344_4334 + a23 * a3144_4134 - a24 * a3143_4133;
+	q[0][2] =  a21 * a3244_4234 - a22 * a3144_4134 + a24 * a3142_4132;
+	q[0][3] = -a21 * a3243_4233 + a22 * a3143_4133 - a23 * a3142_4132;
+	q[1][0] =  a12 * a3344_4334 - a13 * a3244_4234 + a14 * a3243_4233;
+	q[1][1] = -a11 * a3344_4334 + a13 * a3144_4134 - a14 * a3143_4133;
+	q[1][2] =  a11 * a3244_4234 - a12 * a3144_4134 + a14 * a3142_4132;
+	q[1][3] = -a11 * a3243_4233 + a12 * a3143_4133 - a13 * a3142_4132;
+	{
+		const NV a1324_1423 = a13 * a24 - a14 * a23;
+		const NV a1224_1422 = a12 * a24 - a14 * a22;
+		const NV a1223_1322 = a12 * a23 - a13 * a22;
+		const NV a1124_1421 = a11 * a24 - a14 * a21;
+		const NV a1123_1321 = a11 * a23 - a13 * a21;
+		const NV a1122_1221 = a11 * a22 - a12 * a21;
+		q[2][0] =  a42 * a1324_1423 - a43 * a1224_1422 + a44 * a1223_1322;
+		q[2][1] = -a41 * a1324_1423 + a43 * a1124_1421 - a44 * a1123_1321;
+		q[2][2] =  a41 * a1224_1422 - a42 * a1124_1421 + a44 * a1122_1221;
+		q[2][3] = -a41 * a1223_1322 + a42 * a1123_1321 - a43 * a1122_1221;
+		q[3][0] =  a32 * a1324_1423 - a33 * a1224_1422 + a34 * a1223_1322;
+		q[3][1] = -a31 * a1324_1423 + a33 * a1124_1421 - a34 * a1123_1321;
+		q[3][2] =  a31 * a1224_1422 - a32 * a1124_1421 + a34 * a1122_1221;
+		q[3][3] = -a31 * a1223_1322 + a32 * a1123_1321 - a33 * a1122_1221;
+	}
+	kbest = 0;
+	best = -1.0;
+	for (k = 0; k < 4; k++) {
+		qsqr[k] = q[k][0] * q[k][0] + q[k][1] * q[k][1] + q[k][2] * q[k][2] + q[k][3] * q[k][3];
+		if (qsqr[k] > best) { best = qsqr[k]; kbest = k; }
+	}
+	/*"all four rows vanish", scaled so that it means the same at every size.
+	Each cofactor is a 3x3 determinant of a[][] entries, so it scales as the
+	cube of the largest of them and its square as the sixth power; a row whose
+	squared length is below the working precision of that is a row of rounding
+	error.  Reached when the key matrix is zero, which is one paired atom, or
+	several atoms all at one point: there is no rotation to find and the
+	identity is the honest answer.*/
+	scale = nv_fabs(a11);
+	{
+		//the ten distinct entries of a symmetric 4x4
+		const NV cand[9] = { nv_fabs(a22), nv_fabs(a33), nv_fabs(a44),
+		                     nv_fabs(a12), nv_fabs(a13), nv_fabs(a14),
+		                     nv_fabs(a23), nv_fabs(a24), nv_fabs(a34) };
+		for (k = 0; k < 9; k++) if (cand[k] > scale) scale = cand[k];
+	}
+	scale = scale * scale * scale;
+	if (!(best > (16.0 * NV_EPSILON * scale) * (16.0 * NV_EPSILON * scale))) {
+		Zero(rot, 1, NV[3][3]);
+		rot[0][0] = rot[1][1] = rot[2][2] = 1.0;
+		return;
+	}
+	qn = nv_sqrt(best);
+	{
+		const NV q1 = q[kbest][0] / qn, q2 = q[kbest][1] / qn;
+		const NV q3 = q[kbest][2] / qn, q4 = q[kbest][3] / qn;
+		a2 = q1 * q1; x2 = q2 * q2; y2 = q3 * q3; z2 = q4 * q4;
+		xy = q2 * q3; az = q1 * q4; zx = q4 * q2;
+		ay = q1 * q3; yz = q3 * q4; ax = q1 * q2;
+	}
+	//transposed against Biopython's, which multiplies a row vector on the right
+	rot[0][0] = a2 + x2 - y2 - z2;
+	rot[1][0] = 2.0 * (xy + az);
+	rot[2][0] = 2.0 * (zx - ay);
+	rot[0][1] = 2.0 * (xy - az);
+	rot[1][1] = a2 - x2 + y2 - z2;
+	rot[2][1] = 2.0 * (yz + ax);
+	rot[0][2] = 2.0 * (zx + ay);
+	rot[1][2] = 2.0 * (yz - ax);
+	rot[2][2] = a2 - x2 - y2 + z2;
+}
+
+/*rmsd_measure() -- the deviation of one paired set of atoms from the other.
+
+Three passes over the pairs: the two centroids, the inner-product matrix, and
+the deviation itself.  Without a fit there is one pass and no centroid: an
+in-place RMSD is asked about two structures already in the same frame -- two
+models of an ensemble, a minimised copy against what went into the minimiser --
+and moving one of them onto the other is exactly what the question was not.
+
+The sums are ordinary running sums.  Every term of the last one is a square, so
+the relative error of the total is bounded by n * NV_EPSILON and there is no
+cancellation anywhere in it to make that worse.  At the largest structure in
+PDBbind v2020 -- 4fqr, 90,792 atoms, which is more than any pairing here will
+have -- that bound is 2e-11 on a double perl, eight figures below the 0.001 A
+a PDB coordinate is written to.
+
+rot and tran come back as b = rot . a + tran, which is the move that puts the
+first structure on the second; both are the identity when there was no fit.
+Unqualified, for the reason qcp_rotation() gives: they are array parameters and
+the qualifier has no portable spelling on one.*/
+static NV rmsd_measure(const structset *CSP_RESTRICT A, const structset *CSP_RESTRICT B,
+                       const UV *CSP_RESTRICT ia, const UV *CSP_RESTRICT ib, UV n,
+                       bool fit, NV rot[3][3], NV tran[3])
+{
+	NV acx = 0.0, acy = 0.0, acz = 0.0, bcx = 0.0, bcy = 0.0, bcz = 0.0;
+	NV sum = 0.0;
+	UV i;
+	unsigned short int p, q;
+
+	Zero(rot, 1, NV[3][3]);
+	rot[0][0] = rot[1][1] = rot[2][2] = 1.0;
+	Zero(tran, 3, NV);
+	if (n == 0) return 0.0;
+
+	if (fit) {
+		NV s[3][3], e0 = 0.0;
+		for (i = 0; i < n; i++) {
+			acx += A->x[ia[i]]; acy += A->y[ia[i]]; acz += A->z[ia[i]];
+			bcx += B->x[ib[i]]; bcy += B->y[ib[i]]; bcz += B->z[ib[i]];
+		}
+		acx /= (NV)n; acy /= (NV)n; acz /= (NV)n;
+		bcx /= (NV)n; bcy /= (NV)n; bcz /= (NV)n;
+		Zero(s, 1, NV[3][3]);
+		for (i = 0; i < n; i++) {
+			const NV ax = A->x[ia[i]] - acx, ay = A->y[ia[i]] - acy, az = A->z[ia[i]] - acz;
+			const NV bx = B->x[ib[i]] - bcx, by = B->y[ib[i]] - bcy, bz = B->z[ib[i]] - bcz;
+			s[0][0] += ax * bx; s[0][1] += ax * by; s[0][2] += ax * bz;
+			s[1][0] += ay * bx; s[1][1] += ay * by; s[1][2] += ay * bz;
+			s[2][0] += az * bx; s[2][1] += az * by; s[2][2] += az * bz;
+			e0 += ax * ax + ay * ay + az * az + bx * bx + by * by + bz * bz;
+		}
+		qcp_rotation(s, e0 * 0.5, rot);
+		//b = rot . a + tran, with the two centroids fixing tran
+		{
+			const NV ac[3] = { acx, acy, acz };
+			const NV bc[3] = { bcx, bcy, bcz };
+			for (p = 0; p < 3; p++) {
+				NV t = bc[p];
+				for (q = 0; q < 3; q++) t -= rot[p][q] * ac[q];
+				tran[p] = t;
+			}
+		}
+	}
+
+	for (i = 0; i < n; i++) {
+		const NV ax = A->x[ia[i]], ay = A->y[ia[i]], az = A->z[ia[i]];
+		const NV dx = rot[0][0] * ax + rot[0][1] * ay + rot[0][2] * az + tran[0] - B->x[ib[i]];
+		const NV dy = rot[1][0] * ax + rot[1][1] * ay + rot[1][2] * az + tran[1] - B->y[ib[i]];
+		const NV dz = rot[2][0] * ax + rot[2][1] * ay + rot[2][2] * az + tran[2] - B->z[ib[i]];
+		sum += dx * dx + dy * dy + dz * dz;
+	}
+	return nv_sqrt(sum / (NV)n);
+}
+
+/*Everything one call to structure_rmsd() allocates, so that a croak anywhere
+in the middle of it gives all of it back.  Zeroed before the destructor is
+registered, and Safefree() of a null pointer is a no-op, so a croak between any
+two of the allocations below is safe.*/
+typedef struct {
+	structset *set;
+	rmsd_key **key;
+	UV *nkey;
+	UV n_set;
+	UV *ia, *ib;
+} rmsd_work;
+
+static void rmsd_work_free(pTHX_ rmsd_work *CSP_RESTRICT w)
+{
+	UV i;
+	if (w->set) for (i = 0; i < w->n_set; i++) set_free(aTHX_ &w->set[i]);
+	if (w->key) for (i = 0; i < w->n_set; i++) Safefree(w->key[i]);
+	Safefree(w->set);
+	Safefree(w->key);
+	Safefree(w->nkey);
+	Safefree(w->ia);
+	Safefree(w->ib);
+	Zero(w, 1, rmsd_work);
+}
+
+/*No CSP_RESTRICT on the parameter: the prototype is SAVEDESTRUCTOR_X's, not
+this file's.*/
+static void rmsd_work_free_cb(pTHX_ void *p)
+{
+	rmsd_work_free(aTHX_ (rmsd_work *)p);
+}
+
+/*An option that is one of a few words, as the index of the word: the tables
+below are in the order of the RS_* and RM_* values, which is what makes the
+index the value.
+
+Perl has already checked these -- this is the backstop for a caller who reaches
+_rmsd() directly -- so the message only has to be true, not helpful.*/
+static short int rmsd_word(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k,
+                           const char *const *CSP_RESTRICT words,
+                           const char *CSP_RESTRICT list, short int dflt,
+                           const char *CSP_RESTRICT who)
+{
+	SV *v = opt_get(aTHX_ o, k);
+	short int i;
+	if (!v) return dflt;
+	for (i = 0; words[i]; i++) if (strEQ(SvPV_nolen(v), words[i])) return i;
+	croak("%s: %s must be %s, not '%s'", who, k, list, SvPV_nolen(v));
+}
+
+/*rmsd_do() -- the RMSD of every pair of a list of structures.
+
+Each element of sets is a hash with chains and chain_order in it, which is an
+$info, or one model of an $info read with model => 'all': the same shape, which
+is why an ensemble costs nothing extra here.  Perl has already made the list
+and knows what to call each of them; this returns the numbers.
+
+One set_build() per structure and not one per pair: the walk is the expensive
+part -- it is the thing notes.txt says not to do twice -- and twenty models
+make a hundred and ninety pairs out of twenty walks.  Same for the key lists,
+which are built and sorted once each and merged pairwise.*/
+static HV *rmsd_do(pTHX_ AV *CSP_RESTRICT sets, HV *CSP_RESTRICT o,
+                   const char *CSP_RESTRICT who)
+{
+	//in RS_* order and in RM_* order: rmsd_word() returns the index
+	static const char *const sel_words[] = { "all", "heavy", "backbone", "ca", NULL };
+	static const char *const match_words[] = { "key", "order", NULL };
+	const short int sel = rmsd_word(aTHX_ o, "select", sel_words,
+	                                "'all', 'heavy', 'backbone' or 'ca'", RS_ALL, who);
+	const short int match = rmsd_word(aTHX_ o, "match", match_words,
+	                                  "'key' or 'order'", RM_KEY, who);
+	const bool fit = opt_bool(aTHX_ o, "fit", TRUE);
+	const bool want_transform = opt_bool(aTHX_ o, "transform", FALSE);
+	const IV min_atoms = opt_iv(aTHX_ o, "min_atoms", 3);
+	const SSize_t nsv = av_len(sets) + 1;
+	HV *tab;
+	U32 next = 0;
+	UV nmax = 0;
+	rmsd_work w;
+	HV *out;
+	AV *mat, *cnt, *sizes;
+	//the move that puts the first structure on the second, when it was asked
+	//for; there is only one pair to ask it of, and Perl only asks then
+	AV *rotation = NULL, *translation = NULL;
+	SSize_t si, sj;
+	UV i;
+
+	if (min_atoms < 1) croak("%s: min_atoms must be at least 1", who);
+	if (nsv < 2) croak("%s: nothing to compare", who);
+
+	ENTER;
+	Zero(&w, 1, rmsd_work);
+	SAVEDESTRUCTOR_X(rmsd_work_free_cb, &w);
+	Newxz(w.set, (UV)nsv, structset);
+	Newxz(w.key, (UV)nsv, rmsd_key *);
+	Newxz(w.nkey, (UV)nsv, UV);
+	w.n_set = (UV)nsv;
+
+	//the intern table, mortal so that a croak below does not keep it
+	tab = newHV();
+	sv_2mortal((SV *)tab);
+
+	for (si = 0; si < nsv; si++) {
+		SV **e = av_fetch(sets, si, 0);
+		if (!e || !*e || !SvROK(*e) || SvTYPE(SvRV(*e)) != SVt_PVHV)
+			croak("%s: structure %" IVdf " is not a hash reference", who, (IV)(si + 1));
+		//positions only: the pairing reads names out of the atom hashes and
+		//the measurement reads x, y and z, and nothing here asks what an atom
+		//weighs or how big it is
+		set_build(aTHX_ (HV *)SvRV(*e), &w.set[si], 0.0, TRUE, who);
+		Newx(w.key[si], w.set[si].n_atom ? w.set[si].n_atom : 1, rmsd_key);
+		w.nkey[si] = rmsd_keys(aTHX_ &w.set[si], tab, &next, sel,
+		                       match == RM_KEY, w.key[si]);
+		/*sized from the atom count because the selection is not known until
+		the walk has been made; given back before the next structure's is taken,
+		since select => 'ca' keeps one atom in eight and the lists of every
+		structure in the call are alive at once*/
+		if (w.nkey[si] > 0 && w.nkey[si] < w.set[si].n_atom)
+			Renew(w.key[si], w.nkey[si], rmsd_key);
+		if (match == RM_KEY && w.nkey[si] > 1)
+			qsort(w.key[si], (size_t)w.nkey[si], sizeof(rmsd_key), rmsd_key_cmp);
+		if (w.nkey[si] > nmax) nmax = w.nkey[si];
+	}
+	Newx(w.ia, nmax ? nmax : 1, UV);
+	Newx(w.ib, nmax ? nmax : 1, UV);
+
+	mat = newAV();
+	cnt = newAV();
+	sizes = newAV();
+	sv_2mortal((SV *)mat);
+	sv_2mortal((SV *)cnt);
+	sv_2mortal((SV *)sizes);
+	for (si = 0; si < nsv; si++) {
+		av_push(sizes, newSVuv(w.nkey[si]));
+		av_push(mat, newRV_noinc((SV *)newAV()));
+		av_push(cnt, newRV_noinc((SV *)newAV()));
+	}
+	/*Both matrices are given their full length up front and filled in below.
+	A cell of the count matrix is always written; a cell of the RMSD matrix is
+	written only where there was an RMSD to write, and the ones that are not
+	are the pairs with too few atoms in common -- which is undef, which is what
+	a slot nobody stored into reads back as.*/
+	for (si = 0; si < nsv; si++) {
+		av_fill((AV *)SvRV(*av_fetch(mat, si, 0)), nsv - 1);
+		av_fill((AV *)SvRV(*av_fetch(cnt, si, 0)), nsv - 1);
+	}
+
+	for (si = 0; si < nsv; si++) {
+		AV *mrow = (AV *)SvRV(*av_fetch(mat, si, 0));
+		AV *crow = (AV *)SvRV(*av_fetch(cnt, si, 0));
+		/*a structure against itself is zero by construction and needs neither
+		the pairing nor the fit; what it pairs with is everything it has*/
+		(void)av_store(mrow, si, newSVnv(0.0));
+		(void)av_store(crow, si, newSVuv(w.nkey[si]));
+		for (sj = si + 1; sj < nsv; sj++) {
+			AV *mrow2 = (AV *)SvRV(*av_fetch(mat, sj, 0));
+			AV *crow2 = (AV *)SvRV(*av_fetch(cnt, sj, 0));
+			NV rot[3][3], tran[3], r;
+			UV n;
+			if (match == RM_ORDER) {
+				/*pairing by position is the nth atom against the nth atom, and
+				two lists of different lengths are not a correspondence at all:
+				there is no nth atom to pair with past the end of the shorter*/
+				n = (w.nkey[si] == w.nkey[sj]) ? w.nkey[si] : 0;
+				for (i = 0; i < n; i++) {
+					w.ia[i] = w.key[si][i].idx;
+					w.ib[i] = w.key[sj][i].idx;
+				}
+			} else {
+				n = rmsd_pair_by_key(w.key[si], w.nkey[si], w.key[sj], w.nkey[sj],
+				                     w.ia, w.ib);
+			}
+			(void)av_store(crow, sj, newSVuv(n));
+			(void)av_store(crow2, si, newSVuv(n));
+			if (n < (UV)min_atoms) continue;
+			r = rmsd_measure(&w.set[si], &w.set[sj], w.ia, w.ib, n, fit, rot, tran);
+			(void)av_store(mrow, sj, newSVnv(r));
+			(void)av_store(mrow2, si, newSVnv(r));
+			if (want_transform && !rotation) {
+				unsigned short int p, q;
+				rotation = newAV();
+				translation = newAV();
+				sv_2mortal((SV *)rotation);
+				sv_2mortal((SV *)translation);
+				for (p = 0; p < 3; p++) {
+					AV *row = newAV();
+					for (q = 0; q < 3; q++) av_push(row, newSVnv(rot[p][q]));
+					av_push(rotation, newRV_noinc((SV *)row));
+					av_push(translation, newSVnv(tran[p]));
+				}
+			}
+		}
+	}
+
+	//the result hash is built last, so that nothing between here and the
+	//return can croak with it half-filled and unreferenced
+	out = newHV();
+	(void)hv_stores(out, "rmsd", newRV_inc((SV *)mat));
+	(void)hv_stores(out, "n", newRV_inc((SV *)cnt));
+	(void)hv_stores(out, "n_atoms", newRV_inc((SV *)sizes));
+	if (rotation) {
+		(void)hv_stores(out, "rotation", newRV_inc((SV *)rotation));
+		(void)hv_stores(out, "translation", newRV_inc((SV *)translation));
+	}
 	LEAVE;
 	return out;
 }
@@ -6458,5 +7185,22 @@ SV * _features(info, opts, who)
 		}
 		RETVAL = newRV_noinc((SV *)features_do(aTHX_ (HV *)SvRV(info), o,
 		                                       SvOK(who) ? SvPV_nolen(who) : "structure_features"));
+	OUTPUT:
+		RETVAL
+
+SV * _rmsd(sets, opts)
+	SV *sets
+	SV *opts
+	PREINIT:
+		HV *o = NULL;
+	CODE:
+		if (!SvROK(sets) || SvTYPE(SvRV(sets)) != SVt_PVAV)
+			croak("structure_rmsd: the structures must be an array reference");
+		if (SvOK(opts)) {
+			if (!SvROK(opts) || SvTYPE(SvRV(opts)) != SVt_PVHV)
+				croak("structure_rmsd: options must be a hash reference");
+			o = (HV *)SvRV(opts);
+		}
+		RETVAL = newRV_noinc((SV *)rmsd_do(aTHX_ (AV *)SvRV(sets), o, "structure_rmsd"));
 	OUTPUT:
 		RETVAL

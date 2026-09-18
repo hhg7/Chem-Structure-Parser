@@ -19,7 +19,7 @@ our @EXPORT_OK = qw(
 	chain_sequence structure_summary is_single_ion
 	structure_features structure_sasa structure_pi_stacking structure_disulfides
 	structure_base_pairs structure_base_stacks structure_contacts structure_hbonds
-	structure_dssp
+	structure_dssp structure_rmsd
 	aa3to1 aa1to3 res1 res_type formats h
 );
 our @EXPORT = @EXPORT_OK;
@@ -699,6 +699,186 @@ sub structure_base_stacks {
 	$o->{hbonds}      = 0;
 	$o->{secondary}   = 0;
 	return _features($info, $o, 'structure_base_stacks')->{base_stacks};
+}
+
+#
+# Comparing structures
+#
+# Everything above answers a question about one structure.  structure_rmsd()
+# is the one that takes two, or twenty: how far apart are these copies of the
+# same molecule?  The work is in the XS -- pairing the atoms, the superposition
+# and the deviation all touch every atom, and an NMR ensemble asks for them
+# once per pair of models -- and what is here is deciding what is being
+# compared with what.
+#
+# An argument is a file name or a structure already read, in any mix, and a
+# structure read with model => 'all' counts as one per model: that is what
+# makes the ensemble case a single call.  Two things to compare give the
+# number; more than two give the matrix, because with three structures there
+# is no one RMSD to hand back.
+#
+my %RMSD_DEFAULT = (
+	fit       => 1,      # superpose first; 0 measures the two where they lie
+	select    => 'all',  # 'all', 'heavy', 'backbone' or 'ca'
+	match     => 'key',  # 'key' = chain, residue and atom name; 'order' = the nth of each
+	min_atoms => 3,      # fewer atoms in common than this and there is no answer
+	detail    => 0,      # the whole hash rather than the one number
+	chain_map => undef,  # hashref: what a chain of the second and later structures
+	                     # is called in the first
+);
+
+# The options that are about reading a file rather than about the comparison.
+# They are structure_info()'s own and mean the same thing here; an argument
+# that is already a structure was read without them, so chains is applied to it
+# as a filter instead and the rest cannot be.
+my @RMSD_READ = qw(model altloc hydrogens waters hetatm chains format);
+
+# structure_rmsd($a, $b, %opt) -- the RMSD of two structures.
+# structure_rmsd($a, $b, $c, ..., %opt) -- the matrix of every pair.
+# structure_rmsd($ensemble, %opt) -- the matrix over one file's models.
+sub structure_rmsd {
+	my @in;
+	# The structures come first and the options after them, and what separates
+	# the two is that a structure is a reference or the name of a file that
+	# exists.  A name that does not exist is the mistake it looks like and is
+	# said to be one below, rather than being read as the first half of an
+	# option pair and reported as an unknown option.
+	while (@_) {
+		last unless defined $_[0];
+		if (ref $_[0]) { push @in, shift; next }
+		last unless -e $_[0];
+		push @in, shift;
+	}
+	die 'structure_rmsd: nothing to compare; give two structures, two file '
+	  . 'names, or one file read with model => \'all\'' unless @in;
+	die "structure_rmsd: '$_[0]' is not a file that exists, and the options "
+	  . 'after the structures come in name => value pairs' if @_ % 2;
+	my %opt = @_;
+	for my $k (sort keys %opt) {
+		die "structure_rmsd: unknown option '$k'; known options are: "
+		    . join(', ', sort (keys %RMSD_DEFAULT, @RMSD_READ))
+			unless exists $RMSD_DEFAULT{$k} || grep { $_ eq $k } @RMSD_READ;
+	}
+	my %o = (%RMSD_DEFAULT, map { $_ => $opt{$_} }
+	                        grep { exists $RMSD_DEFAULT{$_} } keys %opt);
+	my %read = map { $_ => $opt{$_} } grep { exists $opt{$_} } @RMSD_READ;
+
+	die "structure_rmsd: select must be 'all', 'heavy', 'backbone' or 'ca', not '$o{select}'"
+		unless grep { $_ eq $o{select} } qw(all heavy backbone ca);
+	die "structure_rmsd: match must be 'key' or 'order', not '$o{match}'"
+		unless $o{match} eq 'key' || $o{match} eq 'order';
+	die "structure_rmsd: min_atoms must be a whole number of at least 1, not '$o{min_atoms}'"
+		unless $o{min_atoms} =~ /\A[0-9]+\z/ && $o{min_atoms} >= 1;
+	if (defined $o{chain_map}) {
+		die 'structure_rmsd: chain_map must be a hash reference'
+			unless (reftype($o{chain_map}) || '') eq 'HASH';
+	}
+	my $keep;
+	if (defined $read{chains}) {
+		die 'structure_rmsd: chains must be an array reference'
+			unless (reftype($read{chains}) || '') eq 'ARRAY';
+		die 'structure_rmsd: chains is empty' unless @{ $read{chains} };
+		$keep = { map { $_ => 1 } @{ $read{chains} } };
+	}
+
+	my (@sets, @labels);
+	my $nth = 0;
+	my $most_models = 0;   # for the message when there turns out to be nothing to compare
+	for my $thing (@in) {
+		my ($info, $name);
+		$nth++;
+		if (ref $thing) {
+			_check_info($thing, 'structure_rmsd');
+			$info = $thing;
+			$name = defined $info->{file}                  ? $info->{file}
+			      : defined $info->{id} && length $info->{id} ? $info->{id}
+			      :                                          "structure $nth";
+		}
+		else {
+			# meta => 0 and features => 0: the header records and the physical
+			# properties are the expensive half of a read and none of this
+			# looks at either.  atoms => 1 is the default and is said out loud
+			# because without the atom hashes there is nothing to measure.
+			$info = structure_info($thing, %read,
+			                       atoms => 1, features => 0, meta => 0);
+			$name = $thing;
+		}
+		$most_models = $info->{n_models}
+			if ($info->{n_models} || 0) > $most_models;
+		# read with model => 'all', an ensemble is one structure per model, and
+		# that is the whole of what makes structure_rmsd($nmr, model => 'all')
+		# the pairwise matrix over the models
+		my @models = $info->{models}
+		           ? map { [ $_, $info->{models}{$_} ] }
+		             sort { $a <=> $b } keys %{ $info->{models} }
+		           : ([ undef, { chains      => $info->{chains},
+		                         chain_order => $info->{chain_order} } ]);
+		for my $m (@models) {
+			my ($num, $set) = @$m;
+			push @labels, defined $num ? "$name model $num" : $name;
+			push @sets, _rmsd_set($set, $keep,
+			                      ($nth > 1 ? $o{chain_map} : undef));
+		}
+	}
+	# One structure is not a comparison.  When it is an ensemble read at one
+	# model, though, the caller almost certainly meant the other thing, and
+	# saying so is more use than saying it wanted two.
+	if (@sets < 2) {
+		die 'structure_rmsd: only one structure to compare'
+		  . ($most_models > 1
+		     ? "; it has $most_models models, and reading it with "
+		     . "model => 'all' is what makes them a set to compare"
+		     : '');
+	}
+
+	my $r = _rmsd(\@sets, { %o, transform => (@sets == 2 && $o{detail}) ? 1 : 0 });
+	return $r->{rmsd}[0][1] if @sets == 2 && !$o{detail};
+	my %out = (
+		labels  => \@labels,
+		n_atoms => $r->{n_atoms},
+		fit     => $o{fit} ? 1 : 0,
+		select  => $o{select},
+		match   => $o{match},
+	);
+	if (@sets == 2) {
+		# two structures have one RMSD and one count, and handing back a 2x2
+		# matrix of which three cells are known in advance would be a puzzle
+		$out{rmsd} = $r->{rmsd}[0][1];
+		$out{n}    = $r->{n}[0][1];
+		$out{rotation}    = $r->{rotation}    if $r->{rotation};
+		$out{translation} = $r->{translation} if $r->{translation};
+	}
+	else {
+		$out{rmsd} = $r->{rmsd};
+		$out{n}    = $r->{n};
+	}
+	return \%out;
+}
+
+# One structure, or one model of one, as the XS wants it: a hash with chains
+# and chain_order.  chains => filters it, chain_map => renames it.
+#
+# Both are done by building a new chain_order and, for the rename, a shallow
+# copy of each chain hash under its new name.  Nothing below this writes to a
+# chain and the residues are shared, so the copy is a few dozen scalars per
+# chain and no coordinates at all.
+sub _rmsd_set {
+	my ($set, $keep, $map) = @_;
+	my @order = @{ $set->{chain_order} };
+	@order = grep { $keep->{$_} } @order if $keep;
+	return { chains => $set->{chains}, chain_order => \@order }
+		unless $map && %$map;
+	my (%chains, %from, @renamed);
+	for my $cid (@order) {
+		my $to = exists $map->{$cid} ? $map->{$cid} : $cid;
+		die "structure_rmsd: chain_map puts both '$from{$to}' and '$cid' "
+		  . "under '$to'; two chains cannot become one chain"
+			if exists $chains{$to};
+		$chains{$to} = { %{ $set->{chains}{$cid} }, id => $to };
+		$from{$to}   = $cid;
+		push @renamed, $to;
+	}
+	return { chains => \%chains, chain_order => \@renamed };
 }
 
 # The two sequence-level numbers, per protein chain and over the structure.
@@ -2408,6 +2588,20 @@ shape to take a whole fold in at once:
 
 Chain, then DSSP letter, then where in that chain those residues are. It is
 mdtraj's C<compute_dssp()> letter for letter — see C<structure_dssp>.
+
+Two copies of a molecule are compared in one call, and an NMR ensemble is
+compared against itself in the same one:
+
+ my $d = structure_rmsd('before.pdb', 'after.cif');   # 1.83   angstrom
+
+ my $r = structure_rmsd('2ll7.ent.pdb', model => 'all');
+ print scalar @{ $r->{labels} };      # 20   models, compared with each other
+ printf '%.2f', $r->{rmsd}[0][1];     # 3.61 A between models 1 and 2
+
+Atoms are paired on the identity the file gives them and the superposition is
+Theobald's quaternion characteristic polynomial, which agrees with gemmi's
+C<superpose_positions> to 5.65e-12 over 5,598 real superpositions — see
+C<structure_rmsd>.
 
 The coordinate section is parsed in C, because across a directory of
 structures it is millions of lines: the largest entry in PDBbind v2020 is
@@ -4499,6 +4693,188 @@ C<structure_pi_stacking()> is the other question about the same atoms: mdtraj's
 face-to-face and edge-to-face geometry over aromatic rings, ring by ring rather
 than base by base, and over the aromatic amino acids as well. It answers whether
 two rings are stacked; this answers how much.
+
+=head2 structure_rmsd
+
+ my $d = structure_rmsd('before.pdb', 'after.cif');   # one number, in angstrom
+ my $d = structure_rmsd($info1, $info2);              # or two structures already read
+
+ # an NMR ensemble against itself: every model against every other model
+ my $r = structure_rmsd('2ll7.pdb', model => 'all');
+ printf "models 1 and 7 are %.2f A apart\n", $r->{rmsd}[0][6];
+
+How far apart two copies of the same molecule are: the root mean square
+deviation over the atoms they have in common, after the rigid-body move that
+makes it as small as it can be.
+
+Each argument is a file name or the hash reference C<structure_info()> returned,
+in any mix, and the options come after them. A structure read with
+C<< model =E<gt> 'all' >> counts as one structure per model, which is what makes the
+ensemble case a single call. B<Every structure is compared with every other
+one>: two of them give the number, more than two give the matrix.
+
+An argument that is a file name is read for you, with C<< meta =E<gt> 0 >> and
+C<< features =E<gt> 0 >> — the header records and the physical properties are most of
+what a read costs and none of this looks at either.
+
+=head3 Which atom is which
+
+Atoms are paired on the identity the file gives them: the chain, the residue as
+this module keys it (its number and insertion code), and the atom name. Nothing
+is aligned and nothing is guessed. An atom that is not in both structures under
+the same name is not in the answer, and C<< $r-E<gt>{n} >> says how many were.
+
+That is exactly right for two models of one ensemble, for a structure before
+and after a minimisation, and for the same entry read as PDB and as mmCIF. It
+is not right for two structures that number their residues differently or call
+their chains by different letters, and there are three ways round that:
+C<chains> reads only some of them, C<chain_map> says what a chain of the later
+structures is called in the first, and C<< match =E<gt> 'order' >> pairs the I<n>th atom
+of each and ignores the names altogether.
+
+ # the same domain, chain A in one file and chain H in the other
+ structure_rmsd($apo, $holo, chain_map => { H => 'A' });
+
+=head3 What comes back
+
+With two structures it is the RMSD in angstrom, or C<undef> when there is no
+answer to give — fewer than C<min_atoms> atoms in common. With more than two it
+is a hash reference:
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>key</th>
+  <th>what it holds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>rmsd</code></td>
+  <td>the matrix, <code>$r-&gt;{rmsd}[$i][$j]</code>: symmetric, 0 down the diagonal, <code>undef</code> for a pair with too few atoms in common</td>
+</tr>
+<tr>
+  <td><code>n</code></td>
+  <td>the same shape: how many atoms that pair had in common</td>
+</tr>
+<tr>
+  <td><code>n_atoms</code></td>
+  <td>one count per structure: how many atoms the selection left it with</td>
+</tr>
+<tr>
+  <td><code>labels</code></td>
+  <td>one name per structure, in the same order — the file name, and <code>... model N</code> for a model of an ensemble</td>
+</tr>
+<tr>
+  <td><code>fit</code>, <code>select</code>, <code>match</code></td>
+  <td>the options the answer was computed under</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+C<< detail =E<gt> 1 >> gives the same hash for two structures, with C<rmsd> and C<n> as
+plain numbers rather than matrices, and adds the move itself: C<rotation>, a
+3x3 array of arrays, and C<translation>, a vector, such that
+C<$b = rotation . $a + translation> takes the first structure onto the second.
+
+=head3 Options
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>option</th>
+  <th>default</th>
+  <th>what it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>fit</code></td>
+  <td>1</td>
+  <td>superpose before measuring; 0 measures the two where they lie, which is the question for two structures already in one frame</td>
+</tr>
+<tr>
+  <td><code>select</code></td>
+  <td><code>'all'</code></td>
+  <td>which atoms take part: <code>'all'</code>, <code>'heavy'</code> (everything but hydrogen and deuterium), <code>'backbone'</code> (N, CA, C, O of an amino acid; P, O5', C5', C4', C3', O3' of a nucleotide), or <code>'ca'</code> (CA of an amino acid, P of a nucleotide)</td>
+</tr>
+<tr>
+  <td><code>match</code></td>
+  <td><code>'key'</code></td>
+  <td>how atoms are paired: <code>'key'</code> by chain, residue and atom name, or <code>'order'</code> by position in the file</td>
+</tr>
+<tr>
+  <td><code>min_atoms</code></td>
+  <td>3</td>
+  <td>fewer atoms in common than this and the answer is <code>undef</code>. Three is where a rotation is determined; a pair below it has an arithmetic answer and not a meaningful one</td>
+</tr>
+<tr>
+  <td><code>chain_map</code></td>
+  <td>—</td>
+  <td>hash reference: what a chain of the second and later structures is called in the first</td>
+</tr>
+<tr>
+  <td><code>detail</code></td>
+  <td>0</td>
+  <td>return the hash rather than the one number</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+C<model>, C<altloc>, C<hydrogens>, C<waters>, C<hetatm>, C<chains> and C<format> are
+C<structure_info()>'s own and mean the same thing here; they apply to the
+arguments that are file names. C<chains> also applies to a structure already
+read, as a filter over the chains it has.
+
+Reading a file without its hydrogens and selecting the heavy atoms of one that
+has them are the same answer over the same atoms — C<t/rmsd.t> asserts it — so
+either will do.
+
+=head3 Against gemmi and Biopython
+
+The superposition is Theobald's quaternion characteristic polynomial (Theobald,
+D L (2005) I<Acta Cryst> A61:478), as its reference implementation C<qcprot.c>
+writes it (Liu, Agrafiotis and Theobald (2010) I<J Comput Chem> 31:1561) and as
+Biopython 1.85 ships it in C<Bio/PDB/qcprot.py>.
+
+The deviation itself is not read off the eigenvalue, which is what makes QCP
+fast, and that is deliberate. C<sqrt(2|E0 - L|/n)> subtracts two numbers that
+agree in as many figures as the two structures do, and two structures being
+nearly the same is the ordinary case: models 24 and 25 of 1JM4 have identical
+coordinates, and gemmi 0.7.5 — which takes that route — answers 8.6e-07 A for
+them where this answers 0. Here the rotation is formed and the deviation
+measured with it, which costs one more pass over the paired atoms and has no
+cancellation in it anywhere.
+
+Against gemmi's C<superpose_positions> over every pair of models of the 40 NMR
+entries in the first two thousand files of PDBbind v2020 — 5,598 superpositions
+— the largest relative difference is 5.65e-12 and the median 1.43e-14. Against
+Biopython's C<SVDSuperimposer> the two agree to every figure either prints.
+
+Biopython's C<QCPSuperimposer> is the exception and does not agree with any of
+the three: over the 20 models of 2LL7 it reports 3.5022 A where gemmi,
+C<SVDSuperimposer> and this module all report 3.6090 A. Its Newton-Raphson
+convergence test lost the absolute value C<qcprot.c> has around it, so it stops
+on the first iteration and reads the RMSD off a barely-improved starting guess.
+Measuring with the rotation it returns itself gives 3.60899. C<t/rmsd.t> says so
+in its header, so that the next person to compare against it knows what they
+are looking at.
 
 =head2 aa3to1
 

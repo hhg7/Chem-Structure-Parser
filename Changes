@@ -1,7 +1,60 @@
 Revision history for Chem-Structure-Parser
 
 
-0.03 2026-09-14 CDT
+0.03 2026-09-18 CDT
+
+ - new: structure_rmsd(), how far apart two copies of a molecule are.  Takes
+   file names, structures structure_info() already returned, or any mix of the
+   two, and compares every one of them with every other: two give the RMSD in
+   angstrom, more than two give the matrix.  A file read with model => 'all'
+   counts as one structure per model, so an NMR ensemble is compared against
+   itself in one call --
+
+       my $r = structure_rmsd('2ll7.ent.pdb', model => 'all');
+       printf '%.2f', $r->{rmsd}[0][1];        # 3.61 A, models 1 and 2
+
+   Atoms are paired on the identity the file gives them -- chain, residue,
+   atom name -- so two models of an ensemble pair exactly and two files of the
+   same protein pair over whatever they share; nothing is aligned and nothing
+   is guessed.  chains reads only some of them, chain_map says what a chain of
+   the later structures is called in the first, and match => 'order' pairs the
+   nth atom of each instead.  select => 'heavy', 'backbone' or 'ca' narrows
+   what takes part, fit => 0 measures the two where they lie rather than
+   superposing them first, min_atoms is where "too few to mean anything" is
+   drawn, and detail => 1 returns the rotation and translation as well as the
+   number.
+
+   The superposition is Theobald's quaternion characteristic polynomial, after
+   qcprot.c and Biopython's Bio/PDB/qcprot.py.  The deviation is not read off
+   the eigenvalue the way QCP's whole point is that it can be: that subtracts
+   two numbers which agree in as many figures as the two structures do, and two
+   structures being nearly the same is the ordinary case -- models 24 and 25 of
+   1JM4 have identical coordinates and gemmi 0.7.5, which takes that route,
+   answers 8.6e-07 A for them where this answers 0.  Forming the rotation and
+   measuring with it costs one pass more over the paired atoms and has no
+   cancellation in it.  Against gemmi's superpose_positions over 5,598
+   superpositions -- every pair of models of the 40 NMR entries in the first
+   two thousand files of PDBbind v2020 -- the largest relative difference is
+   5.65e-12, and against Biopython's SVDSuperimposer the two agree to every
+   figure either prints.
+
+   All of it is in C, for the reason the rest of the per-atom work is: over
+   2L6J, 20 models of 1,841 atoms and 190 pairs, 0.05 s against 1.19 s for the
+   same matrix written in Perl with the same arithmetic, and half the working
+   memory.  benchmark.pl measures it and notes.txt records it.
+
+ - structure.info.pl gains --rmsd, the matrix of every structure named on the
+   command line against every other, and --select to say which atoms take
+   part.  One NMR entry on its own compares its own models, because a file
+   with more than one counts as one structure per model.
+
+ - t/data gains ensemble.pdb and ensemble.cif, four models of chain B of 1K9R
+   as deposited: an ensemble whose models really differ, which nmr.pdb's three
+   do not -- they are one tripeptide moved a whole angstrom along x, and a
+   rigid move superposes onto itself exactly and says nothing about the fit.
+   t/rmsd.t is the new test file and carries gemmi's answer for every pair of
+   them, under each of the four selections, so that the comparison runs on a
+   machine with no Python on it.
 
  - new: the rest of the physical properties, all computed by structure_info()
    on the way past and reachable through $info->{features} or the functions

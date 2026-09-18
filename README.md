@@ -64,6 +64,20 @@ shape to take a whole fold in at once:
 Chain, then DSSP letter, then where in that chain those residues are. It is
 mdtraj's `compute_dssp()` letter for letter — see `structure_dssp`.
 
+Two copies of a molecule are compared in one call, and an NMR ensemble is
+compared against itself in the same one:
+
+    my $d = structure_rmsd('before.pdb', 'after.cif');   # 1.83   angstrom
+
+    my $r = structure_rmsd('2ll7.ent.pdb', model => 'all');
+    print scalar @{ $r->{labels} };      # 20   models, compared with each other
+    printf '%.2f', $r->{rmsd}[0][1];     # 3.61 A between models 1 and 2
+
+Atoms are paired on the identity the file gives them and the superposition is
+Theobald's quaternion characteristic polynomial, which agrees with gemmi's
+`superpose_positions` to 5.65e-12 over 5,598 real superpositions — see
+`structure_rmsd`.
+
 The coordinate section is parsed in C, because across a directory of
 structures it is millions of lines: the largest entry in PDBbind v2020 is
 33 MB and 411,648 atom records, and it reads in about a second. The header
@@ -1547,6 +1561,116 @@ wrong.
 face-to-face and edge-to-face geometry over aromatic rings, ring by ring rather
 than base by base, and over the aromatic amino acids as well. It answers whether
 two rings are stacked; this answers how much.
+
+## structure_rmsd
+
+    my $d = structure_rmsd('before.pdb', 'after.cif');   # one number, in angstrom
+    my $d = structure_rmsd($info1, $info2);              # or two structures already read
+
+    # an NMR ensemble against itself: every model against every other model
+    my $r = structure_rmsd('2ll7.pdb', model => 'all');
+    printf "models 1 and 7 are %.2f A apart\n", $r->{rmsd}[0][6];
+
+How far apart two copies of the same molecule are: the root mean square
+deviation over the atoms they have in common, after the rigid-body move that
+makes it as small as it can be.
+
+Each argument is a file name or the hash reference `structure_info()` returned,
+in any mix, and the options come after them. A structure read with
+`model => 'all'` counts as one structure per model, which is what makes the
+ensemble case a single call. **Every structure is compared with every other
+one**: two of them give the number, more than two give the matrix.
+
+An argument that is a file name is read for you, with `meta => 0` and
+`features => 0` — the header records and the physical properties are most of
+what a read costs and none of this looks at either.
+
+### Which atom is which
+
+Atoms are paired on the identity the file gives them: the chain, the residue as
+this module keys it (its number and insertion code), and the atom name. Nothing
+is aligned and nothing is guessed. An atom that is not in both structures under
+the same name is not in the answer, and `$r->{n}` says how many were.
+
+That is exactly right for two models of one ensemble, for a structure before
+and after a minimisation, and for the same entry read as PDB and as mmCIF. It
+is not right for two structures that number their residues differently or call
+their chains by different letters, and there are three ways round that:
+`chains` reads only some of them, `chain_map` says what a chain of the later
+structures is called in the first, and `match => 'order'` pairs the *n*th atom
+of each and ignores the names altogether.
+
+    # the same domain, chain A in one file and chain H in the other
+    structure_rmsd($apo, $holo, chain_map => { H => 'A' });
+
+### What comes back
+
+With two structures it is the RMSD in angstrom, or `undef` when there is no
+answer to give — fewer than `min_atoms` atoms in common. With more than two it
+is a hash reference:
+
+| key | what it holds |
+| --- | --- |
+| `rmsd` | the matrix, `$r->{rmsd}[$i][$j]`: symmetric, 0 down the diagonal, `undef` for a pair with too few atoms in common |
+| `n` | the same shape: how many atoms that pair had in common |
+| `n_atoms` | one count per structure: how many atoms the selection left it with |
+| `labels` | one name per structure, in the same order — the file name, and `... model N` for a model of an ensemble |
+| `fit`, `select`, `match` | the options the answer was computed under |
+
+`detail => 1` gives the same hash for two structures, with `rmsd` and `n` as
+plain numbers rather than matrices, and adds the move itself: `rotation`, a
+3x3 array of arrays, and `translation`, a vector, such that
+`$b = rotation . $a + translation` takes the first structure onto the second.
+
+### Options
+
+| option | default | what it does |
+| --- | --- | --- |
+| `fit` | 1 | superpose before measuring; 0 measures the two where they lie, which is the question for two structures already in one frame |
+| `select` | `'all'` | which atoms take part: `'all'`, `'heavy'` (everything but hydrogen and deuterium), `'backbone'` (N, CA, C, O of an amino acid; P, O5', C5', C4', C3', O3' of a nucleotide), or `'ca'` (CA of an amino acid, P of a nucleotide) |
+| `match` | `'key'` | how atoms are paired: `'key'` by chain, residue and atom name, or `'order'` by position in the file |
+| `min_atoms` | 3 | fewer atoms in common than this and the answer is `undef`. Three is where a rotation is determined; a pair below it has an arithmetic answer and not a meaningful one |
+| `chain_map` | — | hash reference: what a chain of the second and later structures is called in the first |
+| `detail` | 0 | return the hash rather than the one number |
+
+`model`, `altloc`, `hydrogens`, `waters`, `hetatm`, `chains` and `format` are
+`structure_info()`'s own and mean the same thing here; they apply to the
+arguments that are file names. `chains` also applies to a structure already
+read, as a filter over the chains it has.
+
+Reading a file without its hydrogens and selecting the heavy atoms of one that
+has them are the same answer over the same atoms — `t/rmsd.t` asserts it — so
+either will do.
+
+### Against gemmi and Biopython
+
+The superposition is Theobald's quaternion characteristic polynomial (Theobald,
+D L (2005) *Acta Cryst* A61:478), as its reference implementation `qcprot.c`
+writes it (Liu, Agrafiotis and Theobald (2010) *J Comput Chem* 31:1561) and as
+Biopython 1.85 ships it in `Bio/PDB/qcprot.py`.
+
+The deviation itself is not read off the eigenvalue, which is what makes QCP
+fast, and that is deliberate. `sqrt(2|E0 - L|/n)` subtracts two numbers that
+agree in as many figures as the two structures do, and two structures being
+nearly the same is the ordinary case: models 24 and 25 of 1JM4 have identical
+coordinates, and gemmi 0.7.5 — which takes that route — answers 8.6e-07 A for
+them where this answers 0. Here the rotation is formed and the deviation
+measured with it, which costs one more pass over the paired atoms and has no
+cancellation in it anywhere.
+
+Against gemmi's `superpose_positions` over every pair of models of the 40 NMR
+entries in the first two thousand files of PDBbind v2020 — 5,598 superpositions
+— the largest relative difference is 5.65e-12 and the median 1.43e-14. Against
+Biopython's `SVDSuperimposer` the two agree to every figure either prints.
+
+Biopython's `QCPSuperimposer` is the exception and does not agree with any of
+the three: over the 20 models of 2LL7 it reports 3.5022 A where gemmi,
+`SVDSuperimposer` and this module all report 3.6090 A. Its Newton-Raphson
+convergence test lost the absolute value `qcprot.c` has around it, so it stops
+on the first iteration and reads the RMSD off a barely-improved starting guess.
+Measuring with the rotation it returns itself gives 3.60899. `t/rmsd.t` says so
+in its header, so that the next person to compare against it knows what they
+are looking at.
 
 ## aa3to1
 

@@ -179,3 +179,47 @@ within 5 A -- is 0.046 s, measured over three runs on a warm cache with
 `store => 0`.  PDB_stacker, which is the Perl this is a translation of, is the
 other end of that trade: it reads one tetramer per file and compares its four
 bases pairwise, where a scan is the right answer and a grid would be overhead.
+
+# What the RMSD costs, and why it is in C
+
+`structure_rmsd()` is the one thing in the module that reads two structures at
+once, and everything it does is per atom: pair them by chain, residue and atom
+name; take the two centroids; take the inner-product matrix; and measure the
+deviation with the rotation that came out of it.  Four passes over the paired
+atoms, once per pair of structures -- and an NMR ensemble is not one pair but
+190, because twenty models compared against each other is what an ensemble is
+compared for.
+
+`benchmark.pl` writes the same thing out in Perl, with the same quaternion
+arithmetic, so that what is being measured is the language and not the method.
+2L6J, 20 models of 1,841 atoms, 190 pairs:
+
+    structure_rmsd                     0.05 s
+    the same matrix, in pure Perl      1.19 s
+
+**23x**, and the two answers differ by 1.95e-14 A at the worst pair.  Memory
+goes the same way: over 2LL7, 20 models of 2,539 atoms, the comparison costs
+3.4 MB above the structure in C and 6.5 MB in Perl (VmHWM, twice each).  Three
+NV arrays and a 24-byte key per atom against four SVs per atom is the whole of
+that difference.
+
+Two decisions inside it are worth writing down.
+
+**One walk per structure, not one per pair.** `set_build()` flattens each
+structure into coordinate arrays once and the pairing keys are built and sorted
+once; the 190 pairs are then 190 merges of two sorted lists.  Doing either per
+pair would be twenty walks' worth of work done a hundred and ninety times, which
+is the same mistake the parse benchmark found in a different place.
+
+**The deviation is measured, not read off the eigenvalue.** This is the one
+place where the module deliberately does *more* arithmetic than the reference
+implementations do.  QCP's whole point is that it never forms the rotation:
+`sqrt(2|E0 - L|/n)` falls out of the eigenvalue.  But E0 and L agree in as many
+figures as the two structures do, so the subtraction throws those figures away
+-- and two structures being nearly the same is the ordinary case, not the
+pathological one.  Models 24 and 25 of 1JM4 in PDBbind v2020 have byte-identical
+coordinates: gemmi 0.7.5, which takes the eigenvalue route, answers 8.6e-07 A
+for them.  Measuring with the rotation costs one more pass over the paired atoms
+-- included in the 0.05 s above -- has no cancellation in it at all, and answers
+0.  Over 5,598 real superpositions the two routes agree to 5.65e-12 relative,
+which is what `t/rmsd.t` holds them to.

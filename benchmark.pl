@@ -268,6 +268,182 @@ sub perl_sasa {
 		$p_time / ($c_time || 1e-9), abs($c_area - $p_area);
 }
 
+# --- the RMSD, and the same RMSD in pure Perl -----------------------------
+#
+# The job structure_rmsd() does per pair of structures is: walk both into flat
+# coordinate arrays, pair the atoms by chain, residue and atom name, and then
+# three passes over the pairs for the centroids, the inner-product matrix and
+# the deviation.  An NMR ensemble asks for it once per pair of models, which is
+# 190 times for the twenty models the archive usually deposits, so this is the
+# per-atom work the module's own rule says belongs in C.  perl_rmsd() below
+# does the same thing the obvious way, with the same quaternion arithmetic, so
+# that the difference is the language and not the method.
+sub perl_pairs {
+	my ($info) = @_;
+	my (@x, @y, @z, @k);
+	for my $cid (@{ $info->{chain_order} }) {
+		my $c = $info->{chains}{$cid};
+		for my $rk (@{ $c->{residue_order} }) {
+			my $res = $c->{residues}{$rk};
+			for my $an (@{ $res->{atom_order} }) {
+				my $a = $res->{atoms}{$an};
+				next unless defined $a->{x};
+				push @x, $a->{x}; push @y, $a->{y}; push @z, $a->{z};
+				push @k, "$cid|$rk|$an";
+			}
+		}
+	}
+	return (\@x, \@y, \@z, \@k);
+}
+
+sub perl_rmsd {
+	my ($a, $b) = @_;
+	my ($ax, $ay, $az, $ak) = @$a;
+	my ($bx, $by, $bz, $bk) = @$b;
+	my %where;
+	$where{ $bk->[$_] } = $_ for 0 .. $#$bk;
+	my (@i, @j);
+	for my $n (0 .. $#$ak) {
+		next unless exists $where{ $ak->[$n] };
+		push @i, $n;
+		push @j, $where{ $ak->[$n] };
+	}
+	return undef unless @i >= 3;
+	my $n = scalar @i;
+	my (@ac, @bc) = ((0, 0, 0), (0, 0, 0));
+	@ac = (0, 0, 0); @bc = (0, 0, 0);
+	for my $p (0 .. $n - 1) {
+		$ac[0] += $ax->[$i[$p]]; $ac[1] += $ay->[$i[$p]]; $ac[2] += $az->[$i[$p]];
+		$bc[0] += $bx->[$j[$p]]; $bc[1] += $by->[$j[$p]]; $bc[2] += $bz->[$j[$p]];
+	}
+	$_ /= $n for @ac, @bc;
+	my @s = (0) x 9;
+	my $e0 = 0;
+	for my $p (0 .. $n - 1) {
+		my @u = ($ax->[$i[$p]] - $ac[0], $ay->[$i[$p]] - $ac[1], $az->[$i[$p]] - $ac[2]);
+		my @v = ($bx->[$j[$p]] - $bc[0], $by->[$j[$p]] - $bc[1], $bz->[$j[$p]] - $bc[2]);
+		for my $r (0 .. 2) { $s[3 * $r + $_] += $u[$r] * $v[$_] for 0 .. 2 }
+		$e0 += $u[0] ** 2 + $u[1] ** 2 + $u[2] ** 2 + $v[0] ** 2 + $v[1] ** 2 + $v[2] ** 2;
+	}
+	my @rot = perl_qcp(\@s, $e0 / 2);
+	my @t;
+	for my $r (0 .. 2) {
+		my $v = $bc[$r];
+		$v -= $rot[3 * $r + $_] * $ac[$_] for 0 .. 2;
+		push @t, $v;
+	}
+	my $sum = 0;
+	for my $p (0 .. $n - 1) {
+		my @u = ($ax->[$i[$p]], $ay->[$i[$p]], $az->[$i[$p]]);
+		my @w = ($bx->[$j[$p]], $by->[$j[$p]], $bz->[$j[$p]]);
+		for my $r (0 .. 2) {
+			my $d = $t[$r] - $w[$r];
+			$d += $rot[3 * $r + $_] * $u[$_] for 0 .. 2;
+			$sum += $d * $d;
+		}
+	}
+	return sqrt($sum / $n);
+}
+
+# the quaternion characteristic polynomial, spelled the same way the XS spells
+# it, so that the two are the same arithmetic in two languages
+sub perl_qcp {
+	my ($s, $e0) = @_;
+	my ($xx, $xy, $xz, $yx, $yy, $yz, $zx, $zy, $zz) = @$s;
+	my $c2 = -2 * ($xx**2 + $yy**2 + $zz**2 + $xy**2 + $yx**2 + $xz**2 + $zx**2 + $yz**2 + $zy**2);
+	my $c1 = 8 * ($xx * $yz * $zy + $yy * $zx * $xz + $zz * $xy * $yx
+	            - $xx * $yy * $zz - $yz * $zx * $xy - $zy * $yx * $xz);
+	my $d1 = $xy**2 + $xz**2 - $yx**2 - $zx**2;
+	my $d2 = $yy**2 + $zz**2 - $xx**2 + $yz**2 + $zy**2;
+	my $d3 = 2 * ($yz * $zy - $yy * $zz);
+	my $c0 = $d1**2 + ($d2 + $d3) * ($d2 - $d3)
+	  + (-($xz + $zx) * ($yz - $zy) + ($xy - $yx) * ($xx - $yy - $zz))
+	  * (-($xz - $zx) * ($yz + $zy) + ($xy - $yx) * ($xx - $yy + $zz))
+	  + (-($xz + $zx) * ($yz + $zy) - ($xy + $yx) * ($xx + $yy - $zz))
+	  * (-($xz - $zx) * ($yz - $zy) - ($xy + $yx) * ($xx + $yy + $zz))
+	  + (($xy + $yx) * ($yz + $zy) + ($xz + $zx) * ($xx - $yy + $zz))
+	  * (-($xy - $yx) * ($yz - $zy) + ($xz + $zx) * ($xx + $yy + $zz))
+	  + (($xy + $yx) * ($yz - $zy) + ($xz - $zx) * ($xx - $yy - $zz))
+	  * (-($xy - $yx) * ($yz + $zy) + ($xz - $zx) * ($xx + $yy - $zz));
+	my $l = $e0;
+	for (1 .. 50) {
+		my $old = $l;
+		my $l2 = $l * $l;
+		my $b = ($l2 + $c2) * $l;
+		my $a = $b + $c1;
+		my $fp = 2 * $l2 * $l + $b + $a;
+		last unless abs($fp) > 0;
+		$l = abs($l - ($a * $l + $c0) / $fp);
+		last if abs($l - $old) <= 4e-16 * abs($l);
+	}
+	my @a = (
+		$xx + $yy + $zz - $l, $yz - $zy,            -($xz - $zx),          $xy - $yx,
+		$yz - $zy,            $xx - $yy - $zz - $l, $xy + $yx,             $xz + $zx,
+		-($xz - $zx),         $xy + $yx,            $yy - $xx - $zz - $l,  $yz + $zy,
+		$xy - $yx,            $xz + $zx,            $yz + $zy,             $zz - $xx - $yy - $l,
+	);
+	my $m3344 = $a[10] * $a[15] - $a[14] * $a[11];
+	my $m3244 = $a[9]  * $a[15] - $a[13] * $a[11];
+	my $m3243 = $a[9]  * $a[14] - $a[13] * $a[10];
+	my $m3143 = $a[8]  * $a[14] - $a[12] * $a[10];
+	my $m3144 = $a[8]  * $a[15] - $a[12] * $a[11];
+	my $m3142 = $a[8]  * $a[13] - $a[12] * $a[9];
+	my @q = ( $a[5] * $m3344 - $a[6] * $m3244 + $a[7] * $m3243,
+	         -$a[4] * $m3344 + $a[6] * $m3144 - $a[7] * $m3143,
+	          $a[4] * $m3244 - $a[5] * $m3144 + $a[7] * $m3142,
+	         -$a[4] * $m3243 + $a[5] * $m3143 - $a[6] * $m3142 );
+	my $qs = $q[0]**2 + $q[1]**2 + $q[2]**2 + $q[3]**2;
+	return (1, 0, 0, 0, 1, 0, 0, 0, 1) unless $qs > 0;
+	$_ /= sqrt $qs for @q;
+	my ($w, $x, $y, $z) = @q;
+	return ($w*$w + $x*$x - $y*$y - $z*$z, 2*($x*$y - $w*$z),            2*($z*$x + $w*$y),
+	        2*($x*$y + $w*$z),             $w*$w - $x*$x + $y*$y - $z*$z, 2*($y*$z - $w*$x),
+	        2*($z*$x - $w*$y),             2*($y*$z + $w*$x),             $w*$w - $x*$x - $y*$y + $z*$z);
+}
+
+{
+	# the first ensemble of the set, or nothing to say if it holds none
+	my ($ens, $nm);
+	for my $f (@files) {
+		my $i = structure_info($f, meta => 0, features => 0, atoms => 0);
+		next unless ($i->{n_models} || 1) > 1;
+		$ens = $f;
+		$nm = $i->{n_models};
+		last;
+	}
+	if (!defined $ens) {
+		print "\n  no NMR ensemble in this set, so no RMSD comparison\n";
+	}
+	else {
+		my $info = structure_info($ens, meta => 0, features => 0, model => 'all');
+		my @m = map { $info->{models}{$_} } sort { $a <=> $b } keys %{ $info->{models} };
+		my $t0 = time;
+		my $c = Chem::Structure::Parser::_rmsd(\@m, {});
+		my $c_time = time - $t0;
+		$t0 = time;
+		my @pre = map { [ perl_pairs($_) ] } @m;
+		my @p;
+		for my $i (0 .. $#pre) {
+			for my $j ($i + 1 .. $#pre) { push @p, perl_rmsd($pre[$i], $pre[$j]) }
+		}
+		my $p_time = time - $t0;
+		my $worst = 0;
+		my $k = 0;
+		for my $i (0 .. $#pre) {
+			for my $j ($i + 1 .. $#pre) {
+				my $d = abs($p[$k++] - $c->{rmsd}[$i][$j]);
+				$worst = $d if $d > $worst;
+			}
+		}
+		printf "\n  %s, %d models of %d atoms, %d pairs:\n",
+			$ens, $nm, $c->{n_atoms}[0], $nm * ($nm - 1) / 2;
+		printf "  %-38s %6.2f s\n", 'structure_rmsd', $c_time;
+		printf "  %-38s %6.2f s\n", 'the same matrix, in pure Perl', $p_time;
+		printf "  the C is %.0fx the Perl, and the worst pair differs by %.3g A\n",
+			$p_time / ($c_time || 1e-9), $worst;
+	}
+}
+
 print <<"SUMMARY";
 
 The parse alone is @{[ sprintf '%.1f', $pp / $raw ]}x the same parse written in Perl.

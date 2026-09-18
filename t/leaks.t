@@ -262,6 +262,32 @@ no_leaks_ok { structure_info("$data/fold.cif") }
 }
 
 #--------
+# structure_rmsd(), which builds a matrix of new SVs and holds several
+# structsets open at once
+#--------
+{
+	my $ens = structure_info("$data/ensemble.pdb", model => 'all', features => 0);
+	my @m = map { $ens->{models}{$_} } sort { $a <=> $b } keys %{ $ens->{models} };
+	no_leaks_ok { Chem::Structure::Parser::_rmsd(\@m, {}) }
+		'the XS behind structure_rmsd does not leak';
+	no_leaks_ok { Chem::Structure::Parser::_rmsd([ @m[0, 1] ], { transform => 1 }) }
+		'nor does the rotation and translation it hands back on request';
+	no_leaks_ok { Chem::Structure::Parser::_rmsd([ @m[0, 1] ], { fit => 0 }) }
+		'nor the answer without a fit';
+	no_leaks_ok { Chem::Structure::Parser::_rmsd(\@m, { select => 'ca', min_atoms => 6 }) }
+		'nor a matrix whose cells are all undef for want of atoms';
+	no_leaks_ok { eval { Chem::Structure::Parser::_rmsd(\@m, { select => 'no such' }) } }
+		'and a rejected option gives back everything it had allocated';
+	no_leaks_ok { structure_rmsd($ens) } 'structure_rmsd over an ensemble does not leak';
+	no_leaks_ok { structure_rmsd($ens, chain_map => { B => 'B' }, select => 'heavy') }
+		'nor the copies a chain_map makes';
+	no_leaks_ok { structure_rmsd("$data/nmr.pdb", "$data/nmr.cif") }
+		'nor reading the two files it is given';
+	no_leaks_ok { eval { structure_rmsd($ens, fitt => 1) } }
+		'nor a call that dies in the argument check';
+}
+
+#--------
 # no cycles: the whole structure must go away when the caller drops it
 #--------
 for my $stem (qw(mini.pdb mini.cif)) {

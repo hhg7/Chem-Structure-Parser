@@ -9,6 +9,8 @@
 #     structure.info.pl --features *.pdb              # surface, size, composition
 #     structure.info.pl --stacks 1a22.ent.pdb         # stacked aromatic rings
 #     structure.info.pl --pairs 1bna.pdb              # Watson-Crick base pairs
+#     structure.info.pl --rmsd 2ll7.ent.pdb           # every model against every other
+#     structure.info.pl --rmsd a.pdb b.cif c.pdb      # and every file against every other
 #
 # PDB and mmCIF are read the same way and print the same thing, so a mixed
 # directory needs no sorting out first.
@@ -19,9 +21,10 @@ use Getopt::Long;
 use Chem::Structure::Parser;
 
 my %opt = (fasta => 0, tsv => 0, ligands => 0, dump => 0, seqres => 0,
-           features => 0, stacks => 0, ss => 0, pairs => 0, chain => undef);
+           features => 0, stacks => 0, ss => 0, pairs => 0, rmsd => 0,
+           chain => undef, select => 'all');
 GetOptions(\%opt, 'fasta', 'tsv', 'ligands', 'dump', 'seqres', 'features', 'stacks',
-           'ss', 'pairs', 'chain=s', 'help')
+           'ss', 'pairs', 'rmsd', 'chain=s', 'select=s', 'help')
 	or die "see --help\n";
 
 if ($opt{help} || !@ARGV) {
@@ -38,11 +41,35 @@ usage: structure.info.pl [options] file.pdb|file.cif ...
     --stacks     one row per stacked pair of aromatic rings
     --ss         one row per disulfide, with what the file declares beside it
     --pairs      one row per Watson-Crick or wobble base pair
+    --rmsd       the RMSD of every structure against every other, as a matrix.
+                 A file with more than one model counts as one structure per
+                 model, so one NMR entry on its own compares its models
+    --select W   with --rmsd, which atoms take part: all, heavy, backbone or ca
     --chain ID   only this chain
 
 With no option, prints a readable summary of each file.
 USAGE
 	exit(!@ARGV);
+}
+
+# --rmsd is the one question that is about the files together rather than about
+# each of them in turn, so it is answered here and not in the loop below.
+if ($opt{rmsd}) {
+	my $r = structure_rmsd(@ARGV, model => 'all', select => $opt{select},
+		(defined $opt{chain} ? (chains => [ $opt{chain} ]) : ()));
+	# two structures give the number on its own; anything more gives the matrix
+	$r = { labels => [ @ARGV[0, 1] ], rmsd => [ [ 0, $r ], [ $r, 0 ] ] }
+		unless ref $r;
+	my @lab = map { my $l = $_; $l =~ s{.*/}{}; $l } @{ $r->{labels} };
+	my $w = 0;
+	for my $l (@lab) { $w = length $l if length $l > $w }
+	printf "%-*s %s\n", $w, '', join ' ', map { sprintf '%7d', $_ + 1 } 0 .. $#lab;
+	for my $i (0 .. $#lab) {
+		printf "%-*s %s\n", $w, $lab[$i], join ' ',
+			map { defined $_ ? sprintf '%7.3f', $_ : sprintf '%7s', '-' }
+			@{ $r->{rmsd}[$i] };
+	}
+	exit 0;
 }
 
 my $header_printed = 0;
