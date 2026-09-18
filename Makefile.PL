@@ -75,9 +75,10 @@ WriteMakefile(
 	},
 	# "autodie" is deliberately absent: the module checks the calls the pragma
 	# would have checked, in its own words, rather than asking every installer
-	# for it.  Kept in step with the [Prereqs] block in dist.ini.
+	# for it.  So is "Carp", which was listed here and loaded nowhere: the Perl
+	# half dies rather than croaks.  Kept in step with the [Prereqs] and
+	# [Prereqs / TestRequires] blocks in dist.ini.
 	PREREQ_PM => {
-		'Carp'         => 0,
 		'Exporter'     => 0,
 		'Scalar::Util' => 0,
 		'XSLoader'     => 0,

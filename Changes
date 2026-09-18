@@ -436,6 +436,20 @@ Revision history for Chem-Structure-Parser
    running each block anyway so that a coverage run still covers it, and the
    reference-cycle checks at the foot of it still run for real.
 
+ - fixed: installing the module no longer installs Test::More and Test::Exception
+   with it.  dist.ini listed both in a [Prereqs] block with no phase, which is
+   the runtime phase, so the released META.json asked every installer for the
+   two modules only t/*.t loads -- both releases so far, and not the checked-in
+   Makefile.PL, which has had them in TEST_REQUIRES all along.
+   They are in [Prereqs / TestRequires] now.  Carp is gone from Makefile.PL's
+   PREREQ_PM for the same reason in reverse: it was listed and loaded nowhere.
+
+ - SECURITY.md says where to take a report that goes unanswered -- the CPAN
+   Security Group, <cpan-security@security.metacpan.org>, who can triage it and
+   who are the better first stop for anybody who would rather not write to an
+   individual maintainer -- and which perls the support statement covers, which
+   is every perl the module installs on and not merely the newest.
+
 0.02 2026-08-22 CDT
 
  - Fix for Windows: https://www.cpantesters.org/cpan/report/960c8de0-8001-1014-8897-e6a949c55ebf

@@ -18,10 +18,27 @@ guaranteed response time and no bounty. Reports are nevertheless taken
 seriously, and you will be credited in `Changes` for anything that leads to a
 fix unless you would rather not be.
 
+If a report goes unanswered for a week, or if the issue is being exploited and
+cannot wait that long, copy it to the CPAN Security Group at
+<cpan-security@security.metacpan.org>, who can triage it and reach me by other
+means. They are also the right people to write to first if you would rather not
+deal with an individual maintainer, or if you want help deciding whether what
+you have found is a vulnerability at all. Please do not disclose it publicly —
+here, on the GitHub tracker, or anywhere else — before a fix is released or
+CPANSec says otherwise.
+
 ## Which versions are supported
 
 Only the most recent release on CPAN. Fixes are shipped as a new release
 rather than as a patch to an older one.
+
+Every perl the module installs on is supported: it declares 5.10 as its
+minimum and is built and tested on 5.10.1, 5.12.5, 5.42.3 and 5.44.0, on the
+`double`, `long double` and `__float128` NV widths and threaded as well as
+unthreaded. A report that needs a perl older than 5.10 is a report about a
+configuration the distribution declines to install on; a report that needs one
+of the above is in scope, and saying which one it is saves most of the work of
+reproducing it.
 
 ## Scope
 

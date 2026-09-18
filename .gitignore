@@ -28,3 +28,11 @@ read.me.pod
 .build/
 Chem-Structure-Parser-*/
 Chem-Structure-Parser-*.tar.gz
+
+# Coverage.  `cover -t' leaves cover_db/ behind, and a build with
+# -fprofile-arcs -ftest-coverage leaves a .gcno beside every object, a .gcda
+# beside every run and a .gcov for every header gcov walked into.
+cover_db/
+*.gcov
+*.gcda
+*.gcno
