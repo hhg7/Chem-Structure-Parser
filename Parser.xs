@@ -2476,11 +2476,12 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 				if (!xs || !ys || !zs) continue;
 				es = coords_only ? NULL : hvf_sv(aTHX_ a, "element", 7);
 				apolar = 0;
-				ep.vdw = CSP_VDW_DEFAULT;
-				ep.mass = 0.0;
 				if (coords_only) {
-					//nothing derived from the element is wanted, and the
-					//tally of atoms that spell none is one of those things
+					//the element decides rad, mass and apolar and none of the
+					//three is wanted: not fetched, not looked up, not stored,
+					//and no tally kept of the atoms that spell none
+					ep.vdw = CSP_VDW_DEFAULT;
+					ep.mass = 0.0;
 				} else if (es) {
 					STRLEN el;
 					const char *ep_s = SvPV_const(es, el);

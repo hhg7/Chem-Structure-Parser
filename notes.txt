@@ -223,3 +223,45 @@ for them.  Measuring with the rotation costs one more pass over the paired atoms
 -- included in the 0.05 s above -- has no cancellation in it at all, and answers
 0.  Over 5,598 real superpositions the two routes agree to 5.65e-12 relative,
 which is what `t/rmsd.t` holds them to.
+
+**What is left is the walk, not the arithmetic.** Measured on this machine, gcc
+`-O2 -Wall -Wextra`, perl 5.44.0 (`double`), lower quartile of 25 runs: one
+pair of 4fqr (PDBbind v2020, 90,792 atoms each, the largest entry there) costs
+0.065 s with `select => 'all'` and 0.052 s with `select => 'ca'` -- a selection
+that keeps one atom in eight, for a fifth off the time, because both walk the
+same atoms.  `fit => 0`, which drops two of the four passes, costs 0.059 s
+against 0.065 s.  So the superposition is not where the time is: it is the
+per-atom trip through the perl hashes, six or seven lookups an atom between
+`set_build()` and `rmsd_keys()`, and the only speed-ups that show up in a
+measurement are the ones that remove a lookup.  Three did, on the same
+benchmark (`ens40` is the 40 models of 1H0T, 780 pairs; `4fqr` one pair of
+90,792 atoms; seconds, before -> after):
+
+    select    match   ens40              4fqr
+    all       key     0.0324 -> 0.0311   0.0749 -> 0.0651
+    all       order   0.0274 -> 0.0235   0.0704 -> 0.0417
+    heavy     key     0.0233 -> 0.0224   0.0722 -> 0.0659
+    heavy     order   0.0209 -> 0.0183   0.0646 -> 0.0473
+    backbone  key     0.0180 -> 0.0171   0.0684 -> 0.0566
+    backbone  order   0.0176 -> 0.0149   0.0651 -> 0.0430
+    ca        key     0.0145 -> 0.0127   0.0622 -> 0.0515
+    ca        order   0.0148 -> 0.0125   0.0611 -> 0.0419
+
+They are: `set_build()` given a `coords_only` flag, which drops the element
+fetch and the element-table search per atom along with the `rad`, `mass` and
+`apolar` arrays nothing here reads; `rmsd_wanted()` taking the atom hash rather
+than its element, so that the three selections which never look at an element
+stop paying for the fetch; and `rmsd_keys()` told not to intern when the
+pairing is `match => 'order'`, which compares no key at all.  Memory goes with
+them: 17 bytes an atom for the three dropped arrays, in every structure of the
+call at once, and the key list is given back down to the selection's size
+rather than the atom count -- 24 bytes for every atom `select => 'ca'` left out.
+
+**Two that did not show up, and are not there.** Packing an atom name into the
+key's U32 instead of interning it through a hash -- four 7-bit characters and a
+length fit in 30 bits -- measured 4% on `select => 'all', match => 'key'` and
+under the run-to-run spread of the benchmark, for a bespoke encoding and a
+different summation order in the answer.  A second copy of the deviation loop
+with the identity rotation left out, for `fit => 0`, measured nothing at all:
+the loop is bound by gathering `x[ia[i]]` out of three arrays, not by the nine
+multiplies.  Both were written, measured and taken out again.
