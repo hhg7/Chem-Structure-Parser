@@ -456,6 +456,21 @@ applied while writing, not something a run here will catch.
 - No glibc-only or BSD-only libc: no `qsort_r`, `memmem`, `strchrnul`,
   `strndup`, `asprintf`, `getline`, `fmemopen`, `reallocarray`, `arc4random`.
   `memchr` and `memcmp` are C89 and are what the line and keyword scans use.
+- **`windows.h` owns a pile of ordinary English words**, and perl.h includes it
+  on Win32, so an identifier that collides with one is deleted or rewritten by
+  the preprocessor before the compiler ever sees it. `near` and `far` are empty
+  object-like macros left over from 16-bit segment addressing; `IN`, `OUT`,
+  `OPTIONAL` and `PASCAL` are empty too, `CONST` is `const`, `min` and `max` are
+  function-like, and `ERROR`, `DELETE`, `interface`, `small` and `hyper` are all
+  taken. A collision is not a warning — 0.03 shipped a local called `near` and a
+  Strawberry 5.42.2 smoker rejected `contacts_find()` with eleven syntax errors
+  starting at its declaration. Name around them, and check a new function by
+  handing the macros to the compiler here:
+
+      gcc -fsyntax-only -std=c99 -I. -I"$CORE" -Dnear= -Dfar= -DIN= -DOUT= \
+          -DOPTIONAL= -DPASCAL= -DCONST=const -DERROR=0 -Dinterface=struct \
+          -Dsmall=char '-Dhyper=long long' Parser.c
+
 - Printf lengths must be perl's: `%" UVuf "`, `%" IVdf "`, `%" NVgf "`.
 - Assume nothing about `char`'s signedness, struct field order, or alignment.
   SPARC and some ARM/BSD combinations fault on unaligned access, so never cast
