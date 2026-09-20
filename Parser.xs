@@ -5386,7 +5386,6 @@ static void dssp_read(pTHX_ structset *CSP_RESTRICT s, dssp_res *CSP_RESTRICT bb
                       const UV *CSP_RESTRICT seg)
 {
 	UV r;
-	unsigned short int k;
 	for (r = 0; r < s->n_res; r++) {
 		HV *at = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
 		dssp_res *b = &bb[r];
@@ -5421,9 +5420,9 @@ static void dssp_read(pTHX_ structset *CSP_RESTRICT s, dssp_res *CSP_RESTRICT bb
 		dssp_sub3(p->c, p->o, co);
 		len = (float)sqrt((double)dssp_dot3(co, co));
 		if (!(len > 0.0f)) continue;
-		for (k = 0; k < 3; k++) {
-			//one step per named float, so that each is rounded to float where
-			//it is in mdtraj, rather than a wider product reaching the sum
+		for (unsigned short int k = 0; k < 3; k++) {
+	//one step per named float, so that each is rounded to float where
+	//it is in mdtraj, rather than a wider product reaching the sum
 			float u = co[k] / len;
 			float step = u * DSSP_H;
 			b->h[k] = b->n[k] + step;
