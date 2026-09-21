@@ -164,8 +164,9 @@ the value can actually be, not the type that happens to be convenient. Plain
 - **A loop counter bounded by a small literal** → `unsigned short int`, as in
   `for (unsigned short int i = 0; i < NCOL; i++)`. A counter bounded by a
   runtime count is `size_t` instead.
-- **A byte** → `unsigned char` (`res_info.type`, and every `ctype.h` argument:
-  `isdigit((unsigned char)s[i])`, never a bare `char`).
+- **A byte** → `unsigned char` (`res_info.type`, and every character
+  classification's argument: `isDIGIT((unsigned char)s[i])`, never a bare
+  `char`).
 - **Floating point** → `NV` throughout, never bare `double`, so the module
   keeps working on long-double and quadmath perls.
 
@@ -272,10 +273,16 @@ changing anything it touches.
   chain would never be freed and no single-file test would notice.
 - Reach for the perl API before libc whenever perl has an equivalent
   (`my_snprintf`, `strEQ`/`foldEQ`, `Zero`, `PerlIO`, `PerlProc_*`): it is the
-  layer already ported to every target below. `slurp()` is the one place that
-  is not honoured — it reads with `fopen`/`fread`/`ferror` — so if you touch
-  that function, move it to `PerlIO_open`/`PerlIO_read`/`PerlIO_error` rather
-  than adding more stdio around it.
+  layer already ported to every target below. `slurp()` reads through
+  `PerlIO_open`/`PerlIO_read`/`PerlIO_error`; there is no `<stdio.h>` in the
+  file and no reason to put one back.
+- **No `<ctype.h>`.** perl calls `setlocale(LC_ALL, "")` at startup, so
+  `isalpha()`, `toupper()` and their kin answer for the caller's locale, and
+  everything this file classifies — an element symbol, a residue name, a CIF
+  keyword — is ASCII by definition. Use perl's `isALPHA`, `isDIGIT`, `isSPACE`,
+  `toUPPER`, `toLOWER` (handy.h, ASCII-only on every non-EBCDIC build). The
+  reason is written at the head of `Parser.xs`, and `t/parse.t` reads a
+  structure again under every locale the machine has.
 
 ## The Perl half behaves as though `autodie` were loaded, and it is not
 
