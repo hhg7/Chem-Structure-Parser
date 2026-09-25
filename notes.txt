@@ -41,6 +41,21 @@ still gets one entry per atom, because there the columns are the answer;
 `t/parse.t` reads four fixtures in both shapes and asserts they say the same
 thing.
 
+The fourth was a profile rather than a count. Under callgrind the largest
+thing in a parse of 4fqr was `malloc` and `free`, ahead of the number
+conversion and the parse loop itself, and what they were allocating was the
+buffers of the short strings every atom carries seven of: its name, altloc,
+residue name, chain, insertion code, element and charge. A file has a few
+hundred distinct values among all of them. Built as shared hash key SVs
+(`newSVpvn_share`) they point at perl's one copy of the string and own no
+buffer. Best of ten on 4fqr, gcc `-O2`, perl 5.44.0: the columnar parse went
+from 0.109 s to 0.068 s and its peak from 113 MB to 92 MB, and the atom-hash
+parse from 0.087 s to 0.070 s and 130 MB to 105 MB. `structure_info()` with
+`features => 0` over 200 files of the set went from 5.18 s to 4.38 s, best of
+three, and the peak of the whole default read of 4fqr from 234 MB to 217 MB.
+Nothing a caller sees changes: the strings are writable, and perl copies one
+out of the shared table the first time anything modifies it.
+
 # What is written in C, and what is not
 
 The C side makes one pass over the bytes and does three things: it splits
