@@ -3,7 +3,7 @@
 require 5.010;
 use strict;
 package Chem::Structure::Parser;
-our $VERSION = 0.033;
+our $VERSION = 0.034;
 require XSLoader;
 use warnings FATAL => 'all';
 # No `use autodie': it would ask every installer for a prerequisite in order to
@@ -126,9 +126,13 @@ my $NUM = qr/[0-9]*\.?[0-9]+/;
 # and the two forms cannot be confused: a file and an even number of arguments
 # after it is always an odd-sized option list, which is an error.
 my %VIEW = (
-	dssp     => sub { $_[0]{features}{dssp} },
+	dssp     => sub { $_[0]{dssp} },
 	torsions => \&_torsion_view,
 );
+# the options a view turns on for itself.  The dssp view is dssp => 1, which
+# computes the secondary structure on its own when the rest of the features are
+# off; the torsions have no such option, and need the features.
+my %VIEW_OPT = (dssp => { dssp => 1 });
 # other spellings of a view, which the error message does not list
 my %VIEW_ALIAS = (torsion => 'torsions');
 
@@ -145,10 +149,17 @@ sub structure_info {
 		    . "Those are named pairs: structure_info(\$file, $view => 1)"
 			unless exists $VIEW{$view};
 	}
-	my %opt = @_;
+	my %opt = (@_, (defined $view && $VIEW_OPT{$view} ? %{ $VIEW_OPT{$view} } : ()));
 	die 'structure_info: no file name given' unless defined $file && length $file;
 	die "structure_info: '$file' does not exist"  unless -e $file;
 	die "structure_info: '$file' is a directory"  if -d $file;
+	# The format is worked out from the name with a .bz2 or .Z taken off, but
+	# only gzip is ever unpacked, so either of those was read as the raw bytes
+	# of a compressed file and came back as a structure with no atoms in it.
+	die "structure_info: '$file' is compressed with "
+	    . ($file =~ /\.bz2\z/i ? 'bzip2' : 'compress')
+	    . ', which this module does not unpack; gzip it, or unpack it first'
+		if $file =~ /\.(?:bz2|z)\z/i;
 	my $o   = _options(\%opt, 'structure_info');
 	my $fmt = defined $o->{format} ? _alias($o->{format}) : _detect_format($file);
 	my $reader = $READER{$fmt}
@@ -163,7 +174,7 @@ sub structure_info {
 	# loud rather than an empty hash that reads as a structure with none
 	die "structure_info: '$view' needs the features, and this file was read with "
 	  . (!$o->{atoms} ? 'atoms => 0' : 'features => 0')
-		unless $info->{features};
+		unless $info->{features} || $VIEW_OPT{$view};
 	return $VIEW{$view}->($info);
 }
 
@@ -290,7 +301,11 @@ sub structure_sequences {
 	else {
 		die 'structure_sequences: expected a file name or the hash reference from structure_info()'
 			unless defined $info && length $info;
-		$info = structure_info($info, %opt);
+		# the sequence is read off the residues, so neither the atom hashes nor
+		# the features they feed are wanted: over 30 entries of PDBbind v2020
+		# this is 0.42 s to the default read's 4.49 s, with the same answer.
+		# A caller's own atoms or features still wins, coming after.
+		$info = structure_info($info, atoms => 0, features => 0, %opt);
 	}
 	_check_info($info, 'structure_sequences');
 	return { map { $_ => $info->{chains}{$_}{sequence} }
@@ -496,6 +511,30 @@ my @TORS_OPT = qw(store peptide_bond phosphodiester_bond);
 my @CONT_OPT = qw(store contact_distance);
 my @HB_OPT   = qw(peptide_bond);
 
+# The options that are a switch, in either table.  undef is a false value and
+# means off, which is what the caller who wrote hydrogens => $keep with $keep
+# unset will have meant; every other option takes a value, and undef is not one.
+my %SWITCH = map { $_ => 1 } qw(
+	hydrogens waters hetatm atoms features meta anisou dssp
+	sasa pi_stacking disulfides base_pairs base_stacks interface shape
+	dihedrals contacts exposure hbonds secondary store
+);
+
+# _no_undef(\%opt, $who, \%default) -- die at an option given as undef that
+# needs a value.  Without this, model => undef or probe => undef reached a
+# comparison and died of 'Use of uninitialized value' in this file, which says
+# neither which function was called nor which option was wrong.  An option
+# whose default is undef -- chains, format -- is not given a value by undef
+# either, and is left as not given, which is what undef means there.
+sub _no_undef {
+	my ($opt, $who, $default) = @_;
+	for my $k (sort keys %$opt) {
+		next if defined $opt->{$k} || $SWITCH{$k} || !defined $default->{$k};
+		die "$who: $k is undef; leave it out for the default, '$default->{$k}'";
+	}
+	return;
+}
+
 sub _feature_options {
 	my ($opt, $who, $allowed) = @_;
 	my %ok = map { $_ => 1 } @$allowed;
@@ -503,6 +542,7 @@ sub _feature_options {
 		die "$who: unknown option '$k'; known options are: " . join(', ', sort @$allowed)
 			unless $ok{$k};
 	}
+	_no_undef($opt, $who, \%FEATURE_DEFAULT);
 	my %o = (%FEATURE_DEFAULT, %$opt);
 	die "$who: probe must be a number and must not be negative, not '$o{probe}'"
 		unless $o{probe} =~ /\A[0-9]*\.?[0-9]+\z/;
@@ -985,6 +1025,7 @@ sub _options {
 		die "$who: unknown option '$k'; known options are: " . join(', ', sort keys %DEFAULT)
 			unless exists $DEFAULT{$k};
 	}
+	_no_undef($opt, $who, \%DEFAULT);
 	my %o = (%DEFAULT, %$opt);
 	die "$who: altloc must be 'first' or 'highest', not '$o{altloc}'"
 		unless $o{altloc} eq 'first' || $o{altloc} eq 'highest';
@@ -994,6 +1035,12 @@ sub _options {
 	# the ignored option the check above exists for, spelled with a real name.
 	die "$who: features is 1 or 0 here; the per-feature options are "
 	  . "structure_features(\$info, ...)'s" if ref $o{features};
+	# features => 1 with atoms => 0 computes nothing and says nothing, because
+	# features is on by default and a caller reading for residues should not
+	# have to turn it off too.  dssp is off by default, so asking for it with
+	# nothing to compute it from is a request that cannot be met.
+	die "$who: dssp needs the atoms, and this read has atoms => 0"
+		if $o{dssp} && !$o{atoms};
 	if (defined $o{chains}) {
 		die "$who: chains must be an array reference"
 			unless (reftype($o{chains}) || '') eq 'ARRAY';
@@ -1017,8 +1064,13 @@ sub _xs_options {
 	return {
 		model     => ($o->{model} eq 'all' ? -1 : $o->{model}),
 		# when atoms are wanted, the parse builds the atom hashes itself; see
-		# the note in the XS about not building every atom twice
+		# the note in the XS about not building every atom twice.  When they
+		# are not, it builds the four columns _assemble still reads and none of
+		# the others.
 		atom_hashes => $o->{atoms} ? 1 : 0,
+		slim        => $o->{atoms} ? 0 : 1,
+		# and files them into their residues, which is where altloc is decided
+		altloc_highest => $o->{altloc} eq 'highest' ? 1 : 0,
 		hydrogens => $o->{hydrogens},
 		waters    => $o->{waters},
 		hetatm    => $o->{hetatm},
@@ -1070,7 +1122,11 @@ sub _slurp_maybe_gzipped {
 	if ($file =~ /\.gz\z/i) {
 		eval { require IO::Uncompress::Gunzip; 1 }
 			or die "Chem::Structure::Parser: '$file' is gzipped but IO::Uncompress::Gunzip is not installed: $@";
-		my $z = IO::Uncompress::Gunzip->new($file)
+		# MultiStream, because bgzip and `cat a.gz b.gz' both write a file of
+		# several gzip members, and without it the reader stops at the end of the
+		# first: mini.pdb split in two came back as 38 lines and no atoms, where
+		# zcat gives the whole file
+		my $z = IO::Uncompress::Gunzip->new($file, MultiStream => 1)
 			or die "Chem::Structure::Parser: cannot gunzip '$file': "
 			       . do { no warnings 'once'; $IO::Uncompress::Gunzip::GunzipError };
 		my ($text, $buf) = ('', '');
@@ -1087,7 +1143,8 @@ sub _slurp_maybe_gzipped {
 			$text .= $buf;
 			last if defined $limit && length($text) >= $limit;
 		}
-		$z->close;
+		$z->close
+			or die "Can't close '$file': '" . $z->error . "'";
 		return $text;
 	}
 	open my $fh, '<:raw', $file
@@ -1237,13 +1294,12 @@ sub _build_structure {
 	# They are on by default because a structure's surface, size and contacts
 	# are as much a part of what it *is* as its sequence, and a caller who has
 	# to know to ask for them mostly does not.  What that costs is real and is
-	# measured in notes.txt: reading a structure goes from about 214,000 atoms a
-	# second to about 19,500, which is eleven times the cost.  Nearly all of it
-	# is the solvent-accessible surface, at 960 sphere points per atom -- with
-	# sasa => 0 the rest together come to 2.7x the read, and interface => 0
-	# alone takes the whole thing from 10.9x to 7.1x.  features => 0 is the way
-	# back to the old speed, and is what to reach for when reading a directory
-	# for its headers or its sequences.
+	# measured in notes.txt: reading a structure goes from about 246,000 atoms a
+	# second to about 52,700, which is 4.7 times the cost.  The largest part is
+	# the solvent-accessible surface, at 960 sphere points per atom -- with
+	# sasa => 0 the rest together come to 3.0x the read.  features => 0 is the
+	# way back to the old speed, and is what to reach for when reading a
+	# directory for its headers or its sequences.
 	#
 	# atoms => 0 turns them off on its own rather than dying: it is the
 	# documented way to read a file for its residues without its coordinates,
@@ -1255,8 +1311,12 @@ sub _build_structure {
 	# dssp => 1 lifts the secondary structure roll-up out of the features and
 	# puts it where a caller who wants that and not the rest will look for it.
 	# It is the same hash, not a copy: structure_dssp() hands back the same one.
-	$info->{dssp} = $info->{features}{dssp}
-		if $o->{dssp} && $info->{features};
+	# With features => 0 it is computed on its own, which is the cheap way to
+	# the secondary structure: it used to leave nothing at {dssp} and say
+	# nothing, which read as a structure with no secondary structure in it.
+	if ($o->{dssp}) {
+		$info->{dssp} = $info->{features} ? $info->{features}{dssp} : structure_dssp($info);
+	}
 
 	return $info;
 }
@@ -1277,19 +1337,31 @@ sub _assemble {
 	# the parse tallied the elements of every chain of every model as it read
 	# them, keyed model then chain, which is the pair that names a chain here
 	my $chain_elem = $p->{chain_elements} || {};
-	# the atom hashes, built by the parse when the caller wanted atoms at all
+	# the atom hashes, built by the parse when the caller wanted atoms at all,
+	# and filed by it into one atoms hash and atom_order per residue: see
+	# filer_atom() in the XS for the rules, which are the ones this loop
+	# used to apply an atom at a time
 	my $atom_of = ($o->{atoms} && @{ $p->{atoms} || [] }) ? $p->{atoms} : undef;
+	my ($res_atoms, $res_order) = @{$p}{qw(res_atoms res_order)};
+	# the residue's identity and first element are one entry per residue in
+	# both of the shapes structure_info() asks for -- the atom hashes, and the
+	# slim columns of atoms => 0 -- and per atom only in the full columns
+	my $per_res = $atom_of || !$o->{atoms};
 	my $st = $info->{stats};
 	my %by_model;
+	# the first and last atom of each residue's first run of records, keyed by
+	# the residue hash, for _demote_free_residues to find a bonding atom in
+	my %span;
 
 	for my $r (0 .. $#$rf) {
 		my ($i0, $i1) = ($rf->[$r], $rl->[$r]);
 		# Where the residue's identity is.  The parse emits it once per residue
-		# when it is building the atom hashes and once per atom when it is
-		# building columns, because that is the shape each caller is asking for
-		# -- and either way it is read here, at the residue.  The six fields
-		# were a third of everything the parse built; see the note in the XS.
-		my $ri  = $atom_of ? $r : $i0;
+		# when it is building the atom hashes or the slim columns, and once per
+		# atom when it is building full columns, because that is the shape each
+		# caller is asking for -- and either way it is read here, at the
+		# residue.  The six fields were a third of everything the parse built;
+		# see the note in the XS.
+		my $ri  = $per_res ? $r : $i0;
 		my $m   = $model->[$ri];
 		my $cid = $chain->[$ri];
 		my $rn  = $resname->[$ri];
@@ -1332,10 +1404,11 @@ sub _assemble {
 				standard   => ($STANDARD{$rn} ? 1 : 0),
 				modified   => (($type eq 'amino_acid' || $type eq 'nucleotide') && !$STANDARD{$rn}) ? 1 : 0,
 				n_atoms    => 0,
-				atoms      => {},
-				atom_order => [],
+				atoms      => ($atom_of ? $res_atoms->[$r] : {}),
+				atom_order => ($atom_of ? $res_order->[$r] : []),
 			};
 			push @{ $c->{residue_order} }, $key;
+			$span{$res} = [ $i0, $i1 ];
 		}
 
 		# Counts and sums come out of the parse, which had to read every
@@ -1360,8 +1433,6 @@ sub _assemble {
 		# free base in another need their atoms looked through; walking every
 		# residue's atoms to ask a question about five of them would undo the
 		# point of having the parse mark the residues in the first place.
-		# Only the handful of names that mean a nucleotide in one file and a
-		# free base in another need their atoms looked through.
 		my $backbone = 0;
 		if ($FREE_BASE{$rn}) {
 			for my $i ($i0 .. $i1) {
@@ -1372,43 +1443,9 @@ sub _assemble {
 			}
 		}
 
-		if ($atom_of) {
-			my $ra = $res->{atoms};
-			my $ro = $res->{atom_order};
-			for my $i ($i0 .. $i1) {
-				my $atom = $atom_of->[$i];
-				my $an   = $atom->{name};
-				my $have = $ra->{$an};
-				unless ($have) {
-					$ra->{$an} = $atom;
-					push @$ro, $an;
-					# an atom with an altloc keeps the list even when it is the
-					# only conformer, so that "was this modelled twice?" is one
-					# question rather than two
-					$atom->{altlocs} = [ _conformer($atom) ] if length $atom->{altloc};
-					next;
-				}
-				# an alternate conformer: every one is kept on the atom, and
-				# the altloc option decides which supplies the coordinates.
-				# The one already there is put on the list first if it is not
-				# on it yet, which is the case where the first record of the
-				# pair had no altloc letter at all -- disordered.pdb writes
-				# ARG 27's CZ once with a blank altloc and once as B, and a
-				# list holding only the B is a list that has lost a conformer.
-				$have->{altlocs} ||= [ _conformer($have) ];
-				push @{ $have->{altlocs} }, _conformer($atom);
-				if ($o->{altloc} eq 'highest'
-				    && defined $atom->{occupancy} && defined $have->{occupancy}
-				    && $atom->{occupancy} > $have->{occupancy}) {
-					@{$have}{qw(altloc serial x y z occupancy bfactor)}
-						= @{$atom}{qw(altloc serial x y z occupancy bfactor)};
-				}
-			}
-		}
-
 		# the type an unknown residue really is, now that its atoms are counted
 		if ($res->{type} eq 'other') {
-			my $el = $atom_of ? $atom_of->[$i0]{element} : $elem->[$i0];
+			my $el = $atom_of ? $atom_of->[$i0]{element} : $elem->[$ri];
 			$res->{type} = ($ION{$rn} || ($res->{n_atoms} == 1 && uc($el || '') eq uc $rn))
 			             ? 'ion' : 'ligand';
 		}
@@ -1426,6 +1463,25 @@ sub _assemble {
 		}
 	}
 
+	# where a named atom of a residue is, from whichever of the atom hashes or
+	# the columns this parse built
+	my $xyz = sub {
+		my ($res, $want) = @_;
+		my $sp = $span{$res} or return;
+		for my $i ($sp->[0] .. $sp->[1]) {
+			if ($atom_of) {
+				my $a = $atom_of->[$i];
+				return [ @{$a}{qw(x y z)} ] if $a->{name} eq $want;
+			} elsif ($name->[$i] eq $want) {
+				return [ $x->[$i], $y->[$i], $z->[$i] ];
+			}
+		}
+		return;
+	};
+	for my $mm (values %by_model) {
+		_demote_free_residues($mm->{chains}{$_}, $xyz) for @{ $mm->{chain_order} };
+	}
+
 	return \%by_model;
 }
 
@@ -1440,7 +1496,6 @@ sub _finish_chains {
 	for my $set (@all) {
 		for my $cid (@{ $set->{chain_order} }) {
 			my $c = $set->{chains}{$cid};
-			_demote_free_residues($c);
 			my (@seq, @poly, %count);
 			for my $rk (@{ $c->{residue_order} }) {
 				my $r = $c->{residues}{$rk};
@@ -1519,51 +1574,71 @@ sub _finish_chains {
 	return $info;
 }
 
-# one conformer's worth of an atom, for the altlocs list
-sub _conformer {
-	my ($a) = @_;
-	return { map { $_ => $a->{$_} } qw(altloc serial x y z occupancy bfactor) };
-}
-
 # A HETATM residue with an amino acid's name is one of two very different
-# things.  Numbered among the polymer it is a modified residue -- the MSE that
-# replaced a methionine -- and it belongs in the sequence.  Numbered out with
-# the ligands it is a free amino acid sitting in a binding site, and it does
-# not: 3lms has a glycine at A501, two hundred residues past the end of a
-# chain whose SEQRES is 309 long, and counting it makes a 310-residue protein
-# out of a 309-residue one.
+# things.  Inside the polymer it is a modified residue -- the MSE that replaced
+# a methionine -- and it belongs in the sequence.  After the polymer it is a
+# free amino acid sitting in a binding site, and it does not: 1hsl has a
+# histidine bound after each of its 238-residue chains, and counting it made a
+# 239-residue protein with an n_missing of -1.
 #
-# The numbering is what separates them.  Heterogens are numbered in their own
-# range, after the polymer, by long convention; a modified residue takes the
-# number of the residue it replaced.  A chain written entirely as HETATM -- a
-# synthetic peptide ligand, say -- has no polymer range to compare against, so
-# nothing is demoted and the whole thing reads as the peptide it is.
+# Where the polymer ends is the last residue written as an ATOM record with an
+# amino acid's or a nucleotide's name.  A HETATM residue after that is still
+# part of the chain if it is bonded to the residue before it -- a modified
+# residue capping the terminus -- and the first one that is not ends the chain:
+# everything with a polymer's name after it is free.  The bond is gemmi's
+# have_peptide_bond() and have_nucleotide_bond(), C to N within 1.341 * 1.5 A
+# or O3' to P within 1.6 * 1.5 A (gemmi 0.7.0, polyheur.hpp).
+#
+# The residue numbers cannot draw this line, which is what was tried first.
+# Heterogens are numbered after the polymer by convention and no more than
+# that: 3lms chain A runs 4, 567, 1501, 1889 and so on, so its free GLY 501
+# falls inside the polymer's numbering, and 1hsl's HIS 239 is numbered one past
+# the chain's last residue as though it continued it.  Where a residue sits in
+# the file and what it is bonded to are the same in both formats, so the PDB
+# file and the mmCIF one say the same thing, and neither needs a TER record.
+#
+# A chain written entirely as HETATM -- a synthetic peptide ligand, say -- has
+# no ATOM polymer to end, so nothing is demoted and the whole thing reads as
+# the peptide it is.
 sub _demote_free_residues {
-	my ($c) = @_;
-	my ($lo, $hi);
-	for my $rk (@{ $c->{residue_order} }) {
-		my $r = $c->{residues}{$rk};
-		next if $r->{hetero};
-		next unless $r->{type} eq 'amino_acid' || $r->{type} eq 'nucleotide';
-		next unless defined $r->{number};
-		$lo = $r->{number} if !defined $lo || $r->{number} < $lo;
-		$hi = $r->{number} if !defined $hi || $r->{number} > $hi;
+	my ($c, $xyz) = @_;
+	my @res = map { $c->{residues}{$_} } @{ $c->{residue_order} };
+	my $end;
+	for my $k (0 .. $#res) {
+		my $r = $res[$k];
+		$end = $k if !$r->{hetero}
+		          && ($r->{type} eq 'amino_acid' || $r->{type} eq 'nucleotide');
 	}
-	return $c unless defined $lo;
-	for my $rk (@{ $c->{residue_order} }) {
-		my $r = $c->{residues}{$rk};
-		next unless $r->{hetero};
+	return $c unless defined $end;
+	$end++ while $end < $#res && _bonded($res[$end], $res[$end + 1], $xyz);
+	for my $r (@res[ $end + 1 .. $#res ]) {
 		next unless $r->{type} eq 'amino_acid' || $r->{type} eq 'nucleotide';
-		next unless defined $r->{number};
-		# one either side, so that a modified residue capping a terminus is
-		# still part of the chain
-		next if $r->{number} >= $lo - 1 && $r->{number} <= $hi + 1;
 		$r->{type}     = 'ligand';
 		$r->{one}      = '';
 		$r->{modified} = 0;
 		$r->{free}     = 1;    # a free amino acid, not part of the polymer
 	}
 	return $c;
+}
+
+# gemmi's bond lengths, from polyheur.hpp; see _demote_free_residues
+my %LINK = (
+	amino_acid => [ 'C',   'N', 1.341 * 1.5 ],
+	nucleotide => [ "O3'", 'P', 1.6 * 1.5 ],
+);
+
+# whether $b continues the polymer $a is the end of: both of one kind, and the
+# one's carboxyl carbon or O3' bonded to the other's nitrogen or phosphorus
+sub _bonded {
+	my ($a, $b, $xyz) = @_;
+	return 0 unless $a->{type} eq $b->{type};
+	my $l = $LINK{ $b->{type} } or return 0;
+	my $p = $xyz->($a, $l->[0]) or return 0;
+	my $q = $xyz->($b, $l->[1]) or return 0;
+	return 0 if grep { !defined } @$p, @$q;
+	my $d2 = 0;
+	$d2 += ($p->[$_] - $q->[$_]) ** 2 for 0 .. 2;
+	return $d2 < $l->[2] ** 2 ? 1 : 0;
 }
 
 sub _chain_type {
@@ -1681,7 +1756,18 @@ sub _parse_meta {
 	$info->{source}   = _mol_records($meta->{SOURCE}, 10, 'organism_scientific', $eid);
 	_entities($info);
 
+	# A revision that touched more records than one line has room for goes on
+	# to a second line, which carries the revision number again, a continuation
+	# number in columns 11-12, and nothing but the record names: no date, no id
+	# and no type.  It is the same revision, not another one with no date, and
+	# the names it lists belong to it.  1a37's revision 5 is written that way;
+	# 1,789 PDBbind entries have at least one.
 	for my $l (@{ $meta->{REVDAT} || [] }) {
+		my $prev = $info->{revdat}[-1];
+		if (length _c($l, 10, 2) && $prev && $prev->{num} eq _c($l, 7, 3)) {
+			$prev->{what} = _rejoin($prev->{what}, _c($l, 39));
+			next;
+		}
 		push @{ $info->{revdat} }, {
 			num  => _c($l, 7, 3),
 			date => _c($l, 13, 9),
@@ -1737,6 +1823,20 @@ sub _parse_meta {
 		$info->{r_free} = $1 + 0 if !defined $info->{r_free}
 			&& $l =~ /\AFREE R VALUE\s*:\s*($NUM)/;
 	}
+	# A structure refined with SHELXL writes its R values twice, once for all
+	# the data and once for F > 4 sigma(F), and neither line is spelled like the
+	# two above: 'R VALUE (WORKING SET, NO CUTOFF)' and 'FREE R VALUE (NO
+	# CUTOFF)'.  The no-cutoff pair is the one the archive files as the R-work
+	# and R-free: the mmCIF of 1c5c has 0.2529 as _refine.ls_R_factor_R_free and
+	# 0.1934 as _pdbx_refine.R_factor_obs_no_cutoff, where its PDB file has 0.253
+	# and 0.193 on those lines and 0.243 and 0.186 on the F > 4 sigma(F) ones.
+	# 81 PDBbind entries had neither number without this.
+	for my $l (@{ $info->{remarks}{3} || [] }) {
+		$info->{r_work} = $1 + 0 if !defined $info->{r_work}
+			&& $l =~ /\AR VALUE\s+\(WORKING SET,\s*NO CUTOFF\)\s*:\s*($NUM)/;
+		$info->{r_free} = $1 + 0 if !defined $info->{r_free}
+			&& $l =~ /\AFREE R VALUE\s+\(NO CUTOFF\)\s*:\s*($NUM)/;
+	}
 	for my $l (@{ $info->{remarks}{200} || [] }) {
 		$info->{temperature} = $1 + 0 if $l =~ /TEMPERATURE\s+\(KELVIN\)\s*:\s*($NUM)/;
 		$info->{ph}          = $1 + 0 if $l =~ /\bPH\s*:\s*($NUM)/;
@@ -1774,6 +1874,32 @@ sub _parse_meta {
 			db_id      => _c($l, 42, 12),
 			db_begin   => _c($l, 55, 5),
 			db_end     => _c($l, 62, 5),
+		};
+	}
+	# An accession or database id too long for DBREF's columns -- a UniProt
+	# accession of ten characters, an id like A0A2B6C295_BACAN -- is written as
+	# a DBREF1 and DBREF2 pair instead: the first line the chain's range and the
+	# database, the second the accession and the database's range.  They are
+	# always written one after the other, so the n-th of each are a pair.
+	# Columns from the wwPDB format v3.3 and Bio.SeqIO.PdbIO of Biopython 1.87,
+	# which reads them the same way.  232 PDBbind entries have them and no
+	# DBREF at all, so without this they had no cross-references.
+	my @dbref2 = @{ $meta->{DBREF2} || [] };
+	for my $l (@{ $meta->{DBREF1} || [] }) {
+		my $cid = _c($l, 12, 1);
+		my $m   = shift @dbref2;
+		# a DBREF2 for another chain is not this one's second half, and
+		# pairing it anyway would file one chain's accession under another
+		undef $m if defined $m && _c($m, 12, 1) ne $cid;
+		push @{ $info->{dbref}{$cid} }, {
+			chain      => $cid,
+			seq_begin  => _c($l, 14, 4),
+			seq_end    => _c($l, 20, 4),
+			database   => _c($l, 26, 6),
+			accession  => _c($m, 18, 22),
+			db_id      => _c($l, 47, 20),
+			db_begin   => _c($m, 45, 10),
+			db_end     => _c($m, 57, 10),
 		};
 	}
 	for my $l (@{ $meta->{SEQADV} || [] }) {
@@ -2028,7 +2154,11 @@ sub _parse_cif_meta {
 		$info->{resolution} = $v;
 		last;
 	}
+	# a SHELXL refinement leaves ls_R_factor_R_work as '?' and files the
+	# working-set R as the no-cutoff one in _pdbx_refine; see _parse_meta
 	$info->{r_work}      = _cifn($p, '_refine', 'ls_r_factor_r_work');
+	$info->{r_work}      = _cifn($p, '_pdbx_refine', 'r_factor_obs_no_cutoff')
+		unless defined $info->{r_work};
 	$info->{r_free}      = _cifn($p, '_refine', 'ls_r_factor_r_free');
 	$info->{temperature} = _cifn($p, '_diffrn', 'ambient_temp');
 	$info->{ph}          = _cifn($p, '_exptl_crystal_grow', 'ph');
@@ -2117,7 +2247,9 @@ sub _cif_entities {
 			chain    => $chains_of{$e} || [],
 			type     => $r->{type},
 		};
-		$compound{$e}{ec} = $r->{pdbx_ec} if defined $r->{pdbx_ec};
+		$compound{$e}{ec}       = $r->{pdbx_ec}       if defined $r->{pdbx_ec};
+		# COMPND's FRAGMENT, which _entities() hands on to the chain
+		$compound{$e}{fragment} = $r->{pdbx_fragment} if defined $r->{pdbx_fragment};
 	}
 	# an entity that only shows up in _entity_poly still has to have a record,
 	# or its chains lose their molecule name
@@ -2125,24 +2257,39 @@ sub _cif_entities {
 		$compound{$e} ||= { mol_id => $e, chain => $chains_of{$e} };
 	}
 
-	for my $r (@{ _cif_rows($p, '_entity_src_gen') }) {
-		my $e = $r->{entity_id};
-		next unless defined $e;
-		$source{$e} = {
-			mol_id              => $e,
-			organism_scientific => $r->{pdbx_gene_src_scientific_name},
-			organism_taxid      => $r->{pdbx_gene_src_ncbi_taxonomy_id},
-			expression_system   => $r->{pdbx_host_org_scientific_name},
-		};
-	}
-	for my $r (@{ _cif_rows($p, '_entity_src_nat') }) {
-		my $e = $r->{entity_id};
-		next unless defined $e;
-		$source{$e} ||= {
-			mol_id              => $e,
-			organism_scientific => $r->{pdbx_organism_scientific},
-			organism_taxid      => $r->{pdbx_ncbi_taxonomy_id},
-		};
+	# One row per source, and an entity can have more than one: 1shz's chimera
+	# is seven segments, rat and mouse by turns, seven rows of _entity_src_gen
+	# that its PDB file writes as 'ORGANISM_SCIENTIFIC: RATTUS NORVEGICUS, MUS
+	# MUSCULUS'.  So the distinct values are joined the way SOURCE joins them,
+	# in the order they first turn up.  Each category is only read for an entity the one before it had
+	# nothing for: an engineered entity's natural source is not its source.
+	#
+	# A chemically synthesised entity -- SOURCE's 'SYNTHETIC: YES' -- still
+	# names the organism its sequence came from, on the same ORGANISM_SCIENTIFIC
+	# line a natural one uses: 1avp's adenovirus peptide cofactor.
+	my @from = (
+		[ '_entity_src_gen', pdbx_gene_src_scientific_name => 'pdbx_gene_src_ncbi_taxonomy_id',
+		  pdbx_host_org_scientific_name => undef ],
+		[ '_entity_src_nat', pdbx_organism_scientific => 'pdbx_ncbi_taxonomy_id' ],
+		[ '_pdbx_entity_src_syn', organism_scientific => 'ncbi_taxonomy_id', undef, 'YES' ],
+	);
+	for my $f (@from) {
+		my ($cat, $org, $tax, $host, $syn) = @$f;
+		my (%mine, %seen);
+		for my $r (@{ _cif_rows($p, $cat) }) {
+			my $e = $r->{entity_id};
+			next unless defined $e;
+			next if $source{$e} && !$mine{$e};
+			my $s = $source{$e} ||= { mol_id => $e };
+			$mine{$e} = 1;
+			$s->{synthetic} = $syn if defined $syn;
+			my %add = (organism_scientific => $r->{$org}, organism_taxid => $r->{$tax});
+			$add{expression_system} = $r->{$host} if defined $host;
+			for my $k (keys %add) {
+				next unless defined $add{$k} && !$seen{$e}{$k}{ $add{$k} }++;
+				$s->{$k} = defined $s->{$k} ? "$s->{$k}, $add{$k}" : $add{$k};
+			}
+		}
 	}
 
 	$info->{compound} = \%compound;
@@ -2159,9 +2306,15 @@ sub _cif_entities {
 # the same one -- which is what a PDB file writes out twice.
 sub _cif_seqres {
 	my ($info, $p) = @_;
-	my %res_of;
+	my (%res_of, %seen);
 	for my $r (@{ _cif_rows($p, '_entity_poly_seq') }) {
 		next unless defined $r->{entity_id} && defined $r->{mon_id};
+		# A position modelled as two residues at once -- microheterogeneity,
+		# _entity_poly_seq.hetero 'y' -- has a row for each, under one num.
+		# SEQRES names the first of them and nothing else, and so does this:
+		# 1ejg's crambin, PRO/SER at 22 and LEU/ILE at 25, is 46 residues long
+		# from either file rather than 48 from this one.
+		next if defined $r->{num} && $seen{ $r->{entity_id} }{ $r->{num} }++;
 		push @{ $res_of{ $r->{entity_id} } }, $r->{mon_id};
 	}
 	for my $r (@{ _cif_rows($p, '_entity_poly') }) {
@@ -2240,7 +2393,9 @@ sub _cif_annotations {
 	for my $r (@{ _cif_rows($p, '_struct_conf') }) {
 		next unless ($r->{conf_type_id} || '') =~ /\AHELX/i;
 		push @{ $info->{helix} }, {
-			id           => $r->{id},
+			# the id the HELIX record carried, AA or 1; $r->{id} is
+			# HELX_P1, a name the mmCIF file made up for the row
+			id           => (defined $r->{pdbx_pdb_helix_id} ? $r->{pdbx_pdb_helix_id} : $r->{id}),
 			init_resname => _cif_auth($r, 'beg', 'comp_id'),
 			init_chain   => _cif_auth($r, 'beg', 'asym_id'),
 			init_resseq  => _cif_auth($r, 'beg', 'seq_id'),
@@ -2251,10 +2406,32 @@ sub _cif_annotations {
 			length       => $r->{pdbx_pdb_helix_length},
 		};
 	}
+	# SHEET carries each sheet's strand count on every strand, and each
+	# strand's sense relative to the strand before it: 0 for the first, 1
+	# parallel, -1 antiparallel.  mmCIF keeps the count in _struct_sheet and
+	# the sense in _struct_sheet_order, as a pair of range ids and a word.
+	my (%n_strands, %sense);
+	for my $r (@{ _cif_rows($p, '_struct_sheet') }) {
+		$n_strands{ $r->{id} } = $r->{number_strands} if defined $r->{id};
+	}
+	my %SENSE = ('parallel' => '1', 'anti-parallel' => '-1');
+	for my $r (@{ _cif_rows($p, '_struct_sheet_order') }) {
+		next unless defined $r->{sheet_id} && defined $r->{range_id_2};
+		# undef where the file does not say, which is still not a first strand
+		$sense{ $r->{sheet_id} }{ $r->{range_id_2} } = $SENSE{ lc($r->{sense} || '') };
+	}
 	for my $r (@{ _cif_rows($p, '_struct_sheet_range') }) {
+		my ($sh, $st) = @{$r}{qw(sheet_id id)};
+		my $sense;
+		if (defined $sh && defined $st) {
+			# the first strand of a sheet is the one nothing is ordered after
+			$sense = exists $sense{$sh}{$st} ? $sense{$sh}{$st} : '0';
+		}
 		push @{ $info->{sheet} }, {
-			strand       => $r->{id},
-			id           => $r->{sheet_id},
+			strand       => $st,
+			id           => $sh,
+			n_strands    => (defined $sh ? $n_strands{$sh} : undef),
+			sense        => $sense,
 			init_resname => _cif_auth($r, 'beg', 'comp_id'),
 			init_chain   => _cif_auth($r, 'beg', 'asym_id'),
 			init_resseq  => _cif_auth($r, 'beg', 'seq_id'),
@@ -2740,8 +2917,8 @@ key:
 </tr>
 <tr>
   <td><code>r_work</code>, <code>r_free</code></td>
-  <td><code>REMARK 3</code></td>
-  <td><code>_refine.ls_R_factor_R_*</code></td>
+  <td><code>REMARK 3</code>, including SHELXL's no-cutoff pair</td>
+  <td><code>_refine.ls_R_factor_R_*</code>, then <code>_pdbx_refine.R_factor_obs_no_cutoff</code></td>
 </tr>
 <tr>
   <td><code>keywords</code></td>
@@ -2761,7 +2938,7 @@ key:
 <tr>
   <td><code>compound</code>, <code>source</code></td>
   <td><code>COMPND</code>, <code>SOURCE</code></td>
-  <td><code>_entity</code>, <code>_entity_src_*</code></td>
+  <td><code>_entity</code>, <code>_entity_src_gen</code>, <code>_entity_src_nat</code>, <code>_pdbx_entity_src_syn</code></td>
 </tr>
 <tr>
   <td><code>seqres</code></td>
@@ -2776,12 +2953,12 @@ key:
 <tr>
   <td><code>helix</code></td>
   <td><code>HELIX</code></td>
-  <td><code>_struct_conf</code></td>
+  <td><code>_struct_conf</code>, with <code>pdbx_PDB_helix_id</code> as the id</td>
 </tr>
 <tr>
   <td><code>sheet</code></td>
   <td><code>SHEET</code></td>
-  <td><code>_struct_sheet_range</code></td>
+  <td><code>_struct_sheet_range</code>, <code>_struct_sheet</code>, <code>_struct_sheet_order</code></td>
 </tr>
 <tr>
   <td><code>ssbond</code>, <code>link</code></td>
@@ -2800,7 +2977,7 @@ key:
 </tr>
 <tr>
   <td><code>dbref</code></td>
-  <td><code>DBREF</code></td>
+  <td><code>DBREF</code>, <code>DBREF1</code>/<code>DBREF2</code></td>
   <td><code>_struct_ref</code>, <code>_struct_ref_seq</code></td>
 </tr>
 <tr>
@@ -2871,13 +3048,18 @@ C<res_type()> before C<h> is ever reached. Use one of the three forms above.
 Reads C<$file> and returns a hash reference. The format is worked out from the
 file name — C<.pdb>, C<.ent>, C<.cif>, C<.mmcif>, C<.pdbx> — and from the first
 records in the file when the name gives nothing away. C<.gz> files are read as
-they are, without unpacking to a temporary file.
+they are, without unpacking to a temporary file — a file of several gzip members,
+as C<bgzip> writes, included. A C<.bz2> or C<.Z> file dies saying so: only gzip is
+unpacked, and read as it stands one would be a structure with no atoms in it.
 
 A plain string in second place names a I<view>, and asks for that and nothing
 else: the file is read, the view is taken out of it, and the rest is thrown
 away. There are two views today: C<dssp> — see C<structure_dssp> below — and
 C<torsions> (or C<torsion>), described under "The same angles, by chain". The
 options that follow are the reader's, the same ones the first form takes. The
+C<dssp> view is C<< dssp =E<gt> 1 >>, so with C<< features =E<gt> 0 >> it computes the secondary
+structure alone, which is the cheap way to it; the C<torsions> view needs the
+features and dies without them. The
 two forms cannot be confused with one another: a file name followed by an even
 number of arguments is an option list with an odd number of elements, which was
 never anything but a mistake.
@@ -2963,6 +3145,8 @@ file, real values, the long lists cut short:
  ├── biological_assembly  [ 32 lines of REMARK 350, verbatim ]
  ├── revdat          [ { num '3', date '18-APR-18', id '1A22',
  │                       type '1', what 'REMARK' }, ... ]
+ │                                           one per revision; a continuation
+ │                                           line adds to the one before it
  ├── remarks                                 every REMARK, by number
  │   ├── 2           [ '', 'RESOLUTION.    2.60 ANGSTROMS.' ]
  │   ├── 350         [ ... ]                                     32 lines
@@ -3194,7 +3378,9 @@ that goes unnoticed until the ten-thousandth file.
  format    => 'pdb'      skip the format detection: 'pdb' or 'mmcif'
                          ('cif', 'pdbx' and 'ent' name the same two)
  dssp      => 0          also leave the secondary structure roll-up at
-                         {dssp}, where structure_dssp() would find it
+                         {dssp}, where structure_dssp() would find it;
+                         with features => 0 it is computed on its own,
+                         and with atoms => 0 it dies
 
 Every option is checked. A misspelled one is fatal, because an ignored typo is
 a wrong answer that arrives without a word: C<< hydrogen =E<gt> 0 >> that is quietly
@@ -3204,9 +3390,9 @@ For a very large structure the options are the difference between a hash of
 hashes that fits in memory and one that does not. The largest entry in PDBbind
 v2020 is 2wy2: 33 MB, 64 models, 411,648 atom records.
 
- structure_info($f)                # model 1 only    47 MB    0.20 s
- structure_info($f, model => 'all')                 514 MB    1.06 s
- structure_info($f, model => 'all', atoms => 0)     408 MB    0.74 s
+ structure_info($f)                # model 1 only    48 MB    0.09 s
+ structure_info($f, model => 'all')                 513 MB    0.76 s
+ structure_info($f, model => 'all', atoms => 0)     140 MB    0.30 s
 
 The chains are built from one model whichever of those is asked for — C<models>
 is the rest of them — so the physical properties in the first two rows cost the
@@ -3218,13 +3404,13 @@ a caller who has to know to ask mostly does not. What it costs is measured, over
 60 structures of PDBbind:
 
  structure_info($f, features => 0)         1.30 s   246,000 atoms/s
- structure_info($f)                       10.77 s    29,700 atoms/s    8.3x
- ... with interface => 0                  10.02 s    32,000 atoms/s    7.7x
- ... with sasa => 0                        3.80 s    84,000 atoms/s    2.9x
+ structure_info($f)                        6.07 s    52,700 atoms/s    4.7x
+ ... with interface => 0                   5.88 s    54,400 atoms/s    4.5x
+ ... with sasa => 0                        3.96 s    80,800 atoms/s    3.0x
 
-Nearly all of it is the solvent-accessible surface, at 960 sphere points per
-atom; everything else together is 2.9 times the read. C<< interface =E<gt> 0 >> drops the
-per-chain surfaces, which is a fourteenth of the whole: an atom with no
+The largest single part is the solvent-accessible surface, at 960 sphere points
+per atom; everything else together is 3.0 times the read. C<< interface =E<gt> 0 >> drops
+the per-chain surfaces, which is a thirtieth of the whole: an atom with no
 neighbour outside its own chain has the same surface alone as it has in the
 structure, and only the ones that do have such a neighbour are computed twice.
 
@@ -3949,7 +4135,21 @@ agree exactly.
 Only the twenty standard amino acids, because Biopython's is built on
 C<CaPPBuilder> with C<aa_only>, so a selenomethionine is invisible to it — it
 neither gets a figure nor counts towards anybody else's. Glycine gets the
-virtual CB Biopython builds for it.
+virtual CB Biopython builds for it, and nothing else does: a side chain deposited
+without its CB has no direction to split its neighbours by, and gets no figure,
+though its CA still counts towards theirs.
+
+And only a residue in one of C<CaPPBuilder>'s polypeptides, which is a run of two
+or more of those, each next to the one before it in its chain with a CA within
+4.3 Å of that one's. A standard residue on its own is in none: 1a08's bound
+peptide is ACE-FTY-GLU-DIP, and its GLU, between two residues that are not
+standard, gets no figure and adds nothing to the counts of the domain around it.
+
+Biopython takes the alternate conformer with the highest occupancy, so it is
+with C<< altloc =E<gt> 'highest' >> that the two agree residue for residue. Over a hundred
+entries of PDBbind v2020 read that way, both give a figure to the same 56,227
+residues, and the figures differ at one of them: a neighbour 0.00005° from the
+dividing plane, which Biopython's float32 coordinates put on the other side.
 
 =head2 structure_sasa
 
@@ -4060,6 +4260,14 @@ ring pointing its edge at the other's face.
 
 It writes nothing into C<$info>, and takes the eleven geometry options in the
 table above and none of the others.
+
+Which of the two rings is first makes no difference to the answer. mdtraj
+measures C<intersect_distance> from its first group's centroid projected onto the
+line, so the one pair can be a stack when handed one way round and not the
+other: 1b6c's TRP A59 and PHE A99 are an edge stack with the phenylalanine first
+and nothing with the tryptophan first, the phenylalanine's centroid being 0.66 Å
+from the line and the tryptophan's 5.06 Å. This takes the nearer centroid, which
+is what mdtraj finds asked both ways round.
 
 =head3 Which rings
 
@@ -4230,7 +4438,8 @@ no backbone gets neither, because it is not coil, it is not protein.
 There is nothing to tune, so C<structure_dssp()> takes no options: DSSP is the
 hydrogen bonds and the two constants Kabsch and Sander chose for them.
 C<< structure_info($file, dssp =E<gt> 1) >> leaves the same hash at C<< $info-E<gt>{dssp} >> for a
-caller who wants the structure as well.
+caller who wants the structure as well, and C<< dssp =E<gt> 1, features =E<gt> 0 >> computes
+it without the rest of the features — the surface is nearly all of their cost.
 
 =head3 Against mdtraj
 
@@ -4252,7 +4461,11 @@ array without checking that that residue has a carbonyl; where it has none,
 C<ks_assign_hydrogens()> indexes the coordinate array with -1 and reads whatever
 lies in front of it. What it finds is not a structure, and the hydrogen it
 places from it bonds to nothing — which is what this code does on purpose. If it
-ever found something, the two would part company there.
+ever found something, the two would part company there, and once it has: 5x0w's
+GLY G563 was deposited without its O, and mdtraj bonds the ASN G564 after it to
+ARG G561 at -1.56 kcal/mol through a hydrogen placed from a carbonyl that is not
+in the file. Nothing is reported here. The secondary structure of 5x0w is the
+same letter for letter either way.
 
 Two things follow from matching it that are worth knowing about.
 
@@ -5026,12 +5239,18 @@ to 1czc reads as a nucleotide and turns up as a C<G> on the end of a
 396-residue protein sequence.
 
 B<A free amino acid is not part of the chain.> A HETATM residue with an amino
-acid's name is a modified residue when it is numbered among the polymer — the
-MSE that replaced a methionine belongs in the sequence — and a free amino acid
-bound in a site when it is numbered out with the ligands, in which case it
-does not. 3lms has a glycine at A501, two hundred residues past the end of a
-chain whose SEQRES is 309 long. Those are flagged C<< free =E<gt> 1 >> and typed as
-ligands.
+acid's or a nucleotide's name is a modified residue when it is part of the
+polymer — the MSE that replaced a methionine belongs in the sequence — and a
+free residue bound in a site when it comes after the polymer, in which case it
+does not. The polymer ends at the last residue written as ATOM, and carries on
+past it through any HETATM residue bonded to the one before it (C to N within
+1.341 × 1.5 Å, or O3′ to P within 1.6 × 1.5 Å, which is gemmi's test), so a
+modified residue capping the terminus stays in the chain. The residue number
+cannot draw the line: 1hsl numbers its free histidine 239, one past the end of
+a 238-residue chain, and 3lms's chain A runs 4, 567, 1501, … so its free
+glycine at A501 falls inside the numbering. Both formats say the same thing,
+and no TER record is needed. Those residues are flagged C<< free =E<gt> 1 >> and typed
+as ligands.
 
 Neither is a rule the format states; both are what the format means.
 

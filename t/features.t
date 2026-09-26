@@ -115,9 +115,9 @@ sub pair_key {
 #
 # Two tolerances, and they are different in kind.
 #
-# Against the float64 column -- mdtraj's own loop with the dtype changed -- the
-# answers are the same calculation and agree to the last digit the generator
-# prints.  The observed largest disagreement over every atom and residue of
+# Against the float64 column -- mdtraj's own loop in float64, coordinates and
+# all -- the answers are the same calculation and agree to the last digit the
+# generator prints.  The observed largest disagreement over every atom and residue of
 # every structure in t/data is 4e-9 A^2 absolute, which is the 1e-9 the
 # generator rounds to; 1e-7 leaves two orders of magnitude of headroom on that
 # and would still catch a single sphere point, the smallest real difference

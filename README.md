@@ -147,19 +147,19 @@ key:
 | `id` | `HEADER` | `_entry.id` |
 | `experiment` | `EXPDTA` | `_exptl.method` |
 | `resolution` | `REMARK 2`, then `REMARK 3` | `_refine.ls_d_res_high` |
-| `r_work`, `r_free` | `REMARK 3` | `_refine.ls_R_factor_R_*` |
+| `r_work`, `r_free` | `REMARK 3`, including SHELXL's no-cutoff pair | `_refine.ls_R_factor_R_*`, then `_pdbx_refine.R_factor_obs_no_cutoff` |
 | `keywords` | `KEYWDS` | `_struct_keywords.text` |
 | `authors` | `AUTHOR` | `_audit_author` |
 | `journal` | `JRNL` | `_citation`, `_citation_author` |
-| `compound`, `source` | `COMPND`, `SOURCE` | `_entity`, `_entity_src_*` |
+| `compound`, `source` | `COMPND`, `SOURCE` | `_entity`, `_entity_src_gen`, `_entity_src_nat`, `_pdbx_entity_src_syn` |
 | `seqres` | `SEQRES` | `_entity_poly`, `_entity_poly_seq` |
 | `het` | `HET`, `HETNAM`, `FORMUL` | `_chem_comp`, `_pdbx_nonpoly_scheme` |
-| `helix` | `HELIX` | `_struct_conf` |
-| `sheet` | `SHEET` | `_struct_sheet_range` |
+| `helix` | `HELIX` | `_struct_conf`, with `pdbx_PDB_helix_id` as the id |
+| `sheet` | `SHEET` | `_struct_sheet_range`, `_struct_sheet`, `_struct_sheet_order` |
 | `ssbond`, `link` | `SSBOND`, `LINK` | `_struct_conn` |
 | `cispep` | `CISPEP` | `_struct_mon_prot_cis` |
 | `modres` | `MODRES` | `_pdbx_struct_mod_residue` |
-| `dbref` | `DBREF` | `_struct_ref`, `_struct_ref_seq` |
+| `dbref` | `DBREF`, `DBREF1`/`DBREF2` | `_struct_ref`, `_struct_ref_seq` |
 | `cryst1` | `CRYST1` | `_cell`, `_symmetry` |
 | `n_models` | `MODEL` | `_atom_site.pdbx_PDB_model_num` |
 
@@ -214,13 +214,18 @@ every function here is exported, so Perl parses the bareword as a call to
 Reads `$file` and returns a hash reference. The format is worked out from the
 file name — `.pdb`, `.ent`, `.cif`, `.mmcif`, `.pdbx` — and from the first
 records in the file when the name gives nothing away. `.gz` files are read as
-they are, without unpacking to a temporary file.
+they are, without unpacking to a temporary file — a file of several gzip members,
+as `bgzip` writes, included. A `.bz2` or `.Z` file dies saying so: only gzip is
+unpacked, and read as it stands one would be a structure with no atoms in it.
 
 A plain string in second place names a *view*, and asks for that and nothing
 else: the file is read, the view is taken out of it, and the rest is thrown
 away. There are two views today: `dssp` — see `structure_dssp` below — and
 `torsions` (or `torsion`), described under "The same angles, by chain". The
 options that follow are the reader's, the same ones the first form takes. The
+`dssp` view is `dssp => 1`, so with `features => 0` it computes the secondary
+structure alone, which is the cheap way to it; the `torsions` view needs the
+features and dies without them. The
 two forms cannot be confused with one another: a file name followed by an even
 number of arguments is an option list with an odd number of elements, which was
 never anything but a mistake.
@@ -306,6 +311,8 @@ file, real values, the long lists cut short:
     ├── biological_assembly  [ 32 lines of REMARK 350, verbatim ]
     ├── revdat          [ { num '3', date '18-APR-18', id '1A22',
     │                       type '1', what 'REMARK' }, ... ]
+    │                                           one per revision; a continuation
+    │                                           line adds to the one before it
     ├── remarks                                 every REMARK, by number
     │   ├── 2           [ '', 'RESOLUTION.    2.60 ANGSTROMS.' ]
     │   ├── 350         [ ... ]                                     32 lines
@@ -537,7 +544,9 @@ that goes unnoticed until the ten-thousandth file.
     format    => 'pdb'      skip the format detection: 'pdb' or 'mmcif'
                             ('cif', 'pdbx' and 'ent' name the same two)
     dssp      => 0          also leave the secondary structure roll-up at
-                            {dssp}, where structure_dssp() would find it
+                            {dssp}, where structure_dssp() would find it;
+                            with features => 0 it is computed on its own,
+                            and with atoms => 0 it dies
 
 Every option is checked. A misspelled one is fatal, because an ignored typo is
 a wrong answer that arrives without a word: `hydrogen => 0` that is quietly
@@ -547,9 +556,9 @@ For a very large structure the options are the difference between a hash of
 hashes that fits in memory and one that does not. The largest entry in PDBbind
 v2020 is 2wy2: 33 MB, 64 models, 411,648 atom records.
 
-    structure_info($f)                # model 1 only    47 MB    0.20 s
-    structure_info($f, model => 'all')                 514 MB    1.06 s
-    structure_info($f, model => 'all', atoms => 0)     408 MB    0.74 s
+    structure_info($f)                # model 1 only    48 MB    0.09 s
+    structure_info($f, model => 'all')                 513 MB    0.76 s
+    structure_info($f, model => 'all', atoms => 0)     140 MB    0.30 s
 
 The chains are built from one model whichever of those is asked for — `models`
 is the rest of them — so the physical properties in the first two rows cost the
@@ -561,13 +570,13 @@ a caller who has to know to ask mostly does not. What it costs is measured, over
 60 structures of PDBbind:
 
     structure_info($f, features => 0)         1.30 s   246,000 atoms/s
-    structure_info($f)                       10.77 s    29,700 atoms/s    8.3x
-    ... with interface => 0                  10.02 s    32,000 atoms/s    7.7x
-    ... with sasa => 0                        3.80 s    84,000 atoms/s    2.9x
+    structure_info($f)                        6.07 s    52,700 atoms/s    4.7x
+    ... with interface => 0                   5.88 s    54,400 atoms/s    4.5x
+    ... with sasa => 0                        3.96 s    80,800 atoms/s    3.0x
 
-Nearly all of it is the solvent-accessible surface, at 960 sphere points per
-atom; everything else together is 2.9 times the read. `interface => 0` drops the
-per-chain surfaces, which is a fourteenth of the whole: an atom with no
+The largest single part is the solvent-accessible surface, at 960 sphere points
+per atom; everything else together is 3.0 times the read. `interface => 0` drops
+the per-chain surfaces, which is a thirtieth of the whole: an atom with no
 neighbour outside its own chain has the same surface alone as it has in the
 structure, and only the ones that do have such a neighbour are computed twice.
 
@@ -1018,7 +1027,21 @@ agree exactly.
 Only the twenty standard amino acids, because Biopython's is built on
 `CaPPBuilder` with `aa_only`, so a selenomethionine is invisible to it — it
 neither gets a figure nor counts towards anybody else's. Glycine gets the
-virtual CB Biopython builds for it.
+virtual CB Biopython builds for it, and nothing else does: a side chain deposited
+without its CB has no direction to split its neighbours by, and gets no figure,
+though its CA still counts towards theirs.
+
+And only a residue in one of `CaPPBuilder`'s polypeptides, which is a run of two
+or more of those, each next to the one before it in its chain with a CA within
+4.3 Å of that one's. A standard residue on its own is in none: 1a08's bound
+peptide is ACE-FTY-GLU-DIP, and its GLU, between two residues that are not
+standard, gets no figure and adds nothing to the counts of the domain around it.
+
+Biopython takes the alternate conformer with the highest occupancy, so it is
+with `altloc => 'highest'` that the two agree residue for residue. Over a hundred
+entries of PDBbind v2020 read that way, both give a figure to the same 56,227
+residues, and the figures differ at one of them: a neighbour 0.00005° from the
+dividing plane, which Biopython's float32 coordinates put on the other side.
 
 ## structure_sasa
 
@@ -1092,6 +1115,14 @@ ring pointing its edge at the other's face.
 
 It writes nothing into `$info`, and takes the eleven geometry options in the
 table above and none of the others.
+
+Which of the two rings is first makes no difference to the answer. mdtraj
+measures `intersect_distance` from its first group's centroid projected onto the
+line, so the one pair can be a stack when handed one way round and not the
+other: 1b6c's TRP A59 and PHE A99 are an edge stack with the phenylalanine first
+and nothing with the tryptophan first, the phenylalanine's centroid being 0.66 Å
+from the line and the tryptophan's 5.06 Å. This takes the nearer centroid, which
+is what mdtraj finds asked both ways round.
 
 ### Which rings
 
@@ -1222,7 +1253,8 @@ no backbone gets neither, because it is not coil, it is not protein.
 There is nothing to tune, so `structure_dssp()` takes no options: DSSP is the
 hydrogen bonds and the two constants Kabsch and Sander chose for them.
 `structure_info($file, dssp => 1)` leaves the same hash at `$info->{dssp}` for a
-caller who wants the structure as well.
+caller who wants the structure as well, and `dssp => 1, features => 0` computes
+it without the rest of the features — the surface is nearly all of their cost.
 
 ### Against mdtraj
 
@@ -1244,7 +1276,11 @@ array without checking that that residue has a carbonyl; where it has none,
 `ks_assign_hydrogens()` indexes the coordinate array with -1 and reads whatever
 lies in front of it. What it finds is not a structure, and the hydrogen it
 places from it bonds to nothing — which is what this code does on purpose. If it
-ever found something, the two would part company there.
+ever found something, the two would part company there, and once it has: 5x0w's
+GLY G563 was deposited without its O, and mdtraj bonds the ASN G564 after it to
+ARG G561 at -1.56 kcal/mol through a hydrogen placed from a carbonyl that is not
+in the file. Nothing is reported here. The secondary structure of 5x0w is the
+same letter for letter either way.
 
 Two things follow from matching it that are worth knowing about.
 
@@ -1783,12 +1819,18 @@ to 1czc reads as a nucleotide and turns up as a `G` on the end of a
 396-residue protein sequence.
 
 **A free amino acid is not part of the chain.** A HETATM residue with an amino
-acid's name is a modified residue when it is numbered among the polymer — the
-MSE that replaced a methionine belongs in the sequence — and a free amino acid
-bound in a site when it is numbered out with the ligands, in which case it
-does not. 3lms has a glycine at A501, two hundred residues past the end of a
-chain whose SEQRES is 309 long. Those are flagged `free => 1` and typed as
-ligands.
+acid's or a nucleotide's name is a modified residue when it is part of the
+polymer — the MSE that replaced a methionine belongs in the sequence — and a
+free residue bound in a site when it comes after the polymer, in which case it
+does not. The polymer ends at the last residue written as ATOM, and carries on
+past it through any HETATM residue bonded to the one before it (C to N within
+1.341 × 1.5 Å, or O3′ to P within 1.6 × 1.5 Å, which is gemmi's test), so a
+modified residue capping the terminus stays in the chain. The residue number
+cannot draw the line: 1hsl numbers its free histidine 239, one past the end of
+a 238-residue chain, and 3lms's chain A runs 4, 567, 1501, … so its free
+glycine at A501 falls inside the numbering. Both formats say the same thing,
+and no TER record is needed. Those residues are flagged `free => 1` and typed
+as ligands.
 
 Neither is a rule the format states; both are what the format means.
 

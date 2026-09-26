@@ -108,18 +108,20 @@ left as the file wrote it rather than dressed up as one.
 everything the module computes by default:
 
     structure_info, features => 0     1.30 s    246,000 atoms/s
-    structure_info, the default      10.77 s     29,700 atoms/s    8.3x
-      ... with interface => 0        10.02 s     32,000 atoms/s    7.7x
-      ... with sasa => 0              3.80 s     84,000 atoms/s    2.9x
+    structure_info, the default       6.07 s     52,700 atoms/s    4.7x
+      ... with interface => 0         5.88 s     54,400 atoms/s    4.5x
+      ... with sasa => 0              3.96 s     80,800 atoms/s    3.0x
 
-So the properties cost eight times the read, and **nearly all of that is the
-surface**: everything else together -- the shape, the torsion angles, the
-contacts, the exposure, the hydrogen bonds, the secondary structure, the
-disulfides and the ring geometry -- comes to 2.9x the read between them.
+So the properties cost between four and five times the read, and the surface
+is the largest part of that: everything else together -- the shape, the
+torsion angles, the contacts, the exposure, the hydrogen bonds, the secondary
+structure, the disulfides and the ring geometry -- comes to 3.0x the read
+between them.  It was 10.77 s and 8.3x before the sphere points were binned by
+direction (see below), when the surface was nearly all of it.
 
 The per-chain runs that give the buried area used to be a third of what the
-properties cost and are now a fourteenth -- 0.75 s of the 10.77 above, where
-they were 5.7 s of 16.38.  An atom's surface is decided by the atoms whose spheres reach it, so
+properties cost and are now a thirtieth -- 0.19 s of the 6.07 above; they were
+0.75 s of 10.77 before the bins, and 5.7 s of 16.38 before that.  An atom's surface is decided by the atoms whose spheres reach it, so
 an atom with no neighbour outside its own chain has the same surface with the
 other chains there and taken away; the whole-structure run marks the ones that
 do have such a neighbour, and only those are computed again.  `interface` stays
@@ -161,6 +163,26 @@ residues times atoms and was 2.25 s of 4fqr's 11,406 residues and 88,416 heavy
 atoms.  The atoms of a residue are one contiguous run of that array -- the walk
 that built it went residue by residue -- so walking the run instead is 0.15 s
 for the same pairs.
+
+**The sphere points are binned by direction.** Most of a structure's sphere
+points are covered -- 95% of 4fqr's -- and the kernel found each covered point
+by trying neighbours against it, 1.2 of them a point on average once it tried
+the one that covered the point before first.  So the cost was the points, not
+the tests, and the only way to make it smaller was to try fewer points.  The
+points are put in 48 bins by the direction they face, and a neighbour covers
+a point when the point is inside a cap of the sphere round the neighbour's
+direction; a bin inside one neighbour's cap whole has every point covered, and
+none of them is tried.  Which points are covered does not change, so neither
+does the area: over 56 structures of PDBbind (every 250th, 4fqr, and the PDB
+files in t/data) every atom, chain and total surface compares byte for byte as
+%.17g before and after, at 960 points, at 200, and at 50 with a 1.2 A probe,
+and on the quadmath and long-double perls as well as this one.  The surfaces of
+the 56 went from 5.89 s to 2.08 s, best of three; 4fqr's default read from
+2.47 s to 1.18 s.  Lists of the neighbours that could reach each bin, to cut
+down the exposed points' tests as well, were written and measured and were no
+faster: an exposed point is one in twenty, and building the lists cost what
+they saved.  The margin, the bin count and the rest are argued at the head of
+sasa_bins_build() in Parser.xs.
 
 **The secondary structure counts the hydrogen bonds twice, on purpose.**
 `structure_hbonds()` reports the bonds this module believes in -- a donor has to

@@ -126,6 +126,37 @@ for my $case (
 		"$fn: and leaves nothing behind";
 }
 
+# A chains hash that can die.  Both readers ask it about every atom, in the
+# middle of the parse, so a tied one whose EXISTS died took the parse down with
+# everything it had built still allocated: 448 SVs from _parse_string on
+# mini.pdb, 1,365 from _parse_cif_string on mini.cif.  The Perl half only ever
+# passes a plain hash, and a magical one is now refused before anything exists.
+{
+	package DyingChains;
+	sub TIEHASH { return bless {}, shift }
+	sub EXISTS  { die "no such chain\n" }
+	sub FETCH   { return }
+}
+{
+	tie my %chains, 'DyingChains';
+	for my $case ([ '_parse_string', 'mini.pdb' ], [ '_parse_cif_string', 'mini.cif' ]) {
+		my ($fn, $file) = @$case;
+		my $sub  = \&{"Chem::Structure::Parser::$fn"};
+		my $text = do {
+			open my $fh, '<', "$data/$file" or die "Can't open '$data/$file' with mode '<': '$!'";
+			local $/;
+			my $t = <$fh>;
+			close $fh or die "Can't close '$data/$file': '$!'";
+			$t;
+		};
+		eval { $sub->($text, { chains => \%chains }) };
+		like($@, qr/chains must be a plain hash reference, not a tied one/,
+			"$fn: a tied chains hash is refused");
+		no_leaks_ok { eval { $sub->($text, { chains => \%chains }) } }
+			"$fn: and refusing it leaves nothing behind";
+	}
+}
+
 no_leaks_ok { aa3to1('ALA'); aa3to1('NAG'); res1('DA'); res_type('HOH');
               aa1to3('A'); aa1to3('*') }
 	'the residue name lookups do not leak';
@@ -204,6 +235,8 @@ no_leaks_ok { structure_info("$data/empty.cif") } 'nor does an empty one';
 		"structure_info(\$file, 'dssp') does not leak";
 	no_leaks_ok { structure_info("$data/fold.pdb", dssp => 1) }
 		'nor does dssp => 1';
+	no_leaks_ok { structure_info("$data/fold.pdb", dssp => 1, features => 0) }
+		'nor dssp => 1 computed on its own';
 	no_leaks_ok { structure_info("$data/duplex.pdb", 'torsions') }
 		"nor does structure_info(\$file, 'torsions')";
 	no_leaks_ok { eval { structure_info("$data/fold.pdb", 'nosuch') } }

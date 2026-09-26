@@ -26,6 +26,23 @@ throws_ok { structure_info('') } qr/no file name/, 'an empty file name dies';
 throws_ok { structure_info("$data/no.such.file.pdb") } qr/does not exist/,
 	'a file that is not there dies, and says which one';
 throws_ok { structure_info($data) } qr/is a directory/, 'a directory dies';
+{
+	# only gzip is unpacked; the other two suffixes the name rule strips used
+	# to be read as the compressed bytes and come back with no atoms at all
+	my $dir = tempdir(CLEANUP => 1);
+	for my $f ('mini.pdb.bz2', 'mini.pdb.Z', 'mini.cif.BZ2') {
+		open my $fh, '>:raw', "$dir/$f" or die $!;
+		print {$fh} "BZh91AY&SY";
+		close $fh or die $!;
+	}
+	throws_ok { structure_info("$dir/mini.pdb.bz2") }
+		qr/^structure_info: '[^']*mini\.pdb\.bz2' is compressed with bzip2, which this module does not unpack/,
+		'a .bz2 dies rather than coming back empty';
+	throws_ok { structure_info("$dir/mini.pdb.Z") } qr/is compressed with compress/,
+		'and so does a .Z';
+	throws_ok { structure_info("$dir/mini.cif.BZ2") } qr/is compressed with bzip2/,
+		'whatever case the suffix is in';
+}
 
 #--------
 # formats
