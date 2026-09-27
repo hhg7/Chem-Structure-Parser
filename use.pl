@@ -5,12 +5,14 @@ no source::encoding;
 use warnings FATAL => 'all';
 use autodie ':default';
 use Chem::Structure::Parser;
-use Matplotlib::Simple;
-use
+#use Matplotlib::Simple;
 use Util;
 
-my $r = structure_rmsd("$ENV{HOME}/ui/pepPriML/PPB/PDB/PDBbind.v2020/2ll7.ent.pdb", model => 'all');
+my $r = structure_info('2ll7.ent.pdb.bz2');
 p $r;
+#"$ENV{HOME}/ui/pepPriML/PPB/PDB/PDBbind.v2020/2ll7.ent.pdb", model => 'all');
+
+=p $r;
 mkdir 'svg' unless -d 'svg';
 imshow(
 	data => $r->{rmsd},

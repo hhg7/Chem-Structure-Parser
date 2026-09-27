@@ -1190,10 +1190,11 @@ sub _sequence_features {
 #
 # A chain named as a partner is its amino acids and nucleotides, modified ones
 # included, and nothing else in it: a ligand, an ion or a water that happens to
-# carry the chain's letter is not part of the polymer, and a cap or cofactor
-# that should be is named by its key alongside the chain.  PRODIGY takes the
-# chain without its HETATM residues at all, which is the same thing for the
-# twenty standard residues it accepts.
+# carry the chain's letter is not part of the polymer.  A cap peptide-bonded
+# to the chain is part of it already; a cofactor that should be is named by its
+# key alongside the chain, and a residue named twice, in either way, is on its
+# side once.  PRODIGY takes the chain without its HETATM residues at all, which
+# is the same thing for the twenty standard residues it accepts.
 #
 # Returns { partners => [ [names], [names] ], residues => [ [hashes], [hashes] ] }.
 sub _partners {
@@ -1251,6 +1252,10 @@ sub _partners {
 				}
 				push @{ $names[$i] }, $w;
 			}
+			my %once;
+			$res[$i] = [ grep { !$once{"$_"}++ } @{ $res[$i] } ];
+			my %said;
+			$names[$i] = [ grep { !$said{$_}++ } @{ $names[$i] } ];
 		}
 		my %seen = map { ($_ => 1) } map { "$_" } @{ $res[0] };
 		for (@{ $res[1] }) {

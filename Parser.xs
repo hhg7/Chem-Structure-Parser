@@ -736,10 +736,17 @@ static IV opt_iv(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, IV dflt)
 	return v ? SvIV(v) : dflt;
 }
 
+/*A switch given as undef is off, as it is in the Perl half (%SWITCH in
+Parser.pm): hydrogens => $keep with $keep unset means the caller did not ask
+for them.  opt_get() treats undef as not given, which for a switch whose
+default is on would turn it on, so a key that is present is read here.*/
 static bool opt_bool(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, bool dflt)
 {
-	SV *v = opt_get(aTHX_ o, k);
-	return v ? (SvTRUE(v) ? TRUE : FALSE) : dflt;
+	SV **p;
+	if (!o) return dflt;
+	p = hv_fetch(o, k, (I32)strlen(k), 0);
+	if (!p || !*p) return dflt;
+	return SvTRUE(*p) ? TRUE : FALSE;
 }
 
 //the parse
@@ -826,7 +833,9 @@ static void filer_run(pTHX_ atom_filer *CSP_RESTRICT f, IV model, const char *CS
 {
 	/*model, a NUL, the chain, a NUL, the number and insertion code as Perl
 	stringifies them.  The NULs cannot be in a chain id read off a record
-	line, which is what makes the three fields one unambiguous key.*/
+	line, which is what makes the three fields one unambiguous key.
+
+	An IV prints in at most 21 characters, so 64 holds either number.*/
 	char head[64];
 	SV *key = sv_2mortal(newSVpvs(""));
 	SV **slot;
@@ -1503,11 +1512,10 @@ static void cif_next(cif_lex *CSP_RESTRICT lx, cif_tok *CSP_RESTRICT t){
 	in step.*/
 		char qc = *p;
 		const char *CSP_RESTRICT s = p + 1, *q = s;
-		bool closed = TRUE; //FALSE = the line ended first: not a quote after all
+		bool closed = TRUE; //FALSE = the line or file ended first: not a quote after all
 		for (;;) {
 			while (q < end && *q != qc && *q != '\n') q++;
-			if (q >= end) break;
-			if (*q == '\n') { closed = FALSE; break; }
+			if (q >= end || *q == '\n') { closed = FALSE; break; }
 			if (q + 1 >= end || cif_space(q[1])) break;
 			q++;
 		}
@@ -1573,6 +1581,22 @@ static short int cif_atom_field(const char *CSP_RESTRICT item, STRLEN n)
 		if (kn == n && cif_iskw(item, n, cif_atom_item[i], kn)) return i;
 	}
 	return -1;
+}
+
+/*A number in mmCIF, which may carry its standard uncertainty in parentheses
+after it: 1.000(2) is 1.000, as CIF 1.1's numeric syntax has it and as gemmi's
+cif::as_number() reads it.  str2nv() takes the whole field or nothing -- the
+rule that keeps a PDB coordinate which overflowed into the next field from
+reading as its prefix -- so the uncertainty is taken off here, on the mmCIF
+side only, and a PDB field is held to the stricter rule.*/
+static bool cif_nv(const char *CSP_RESTRICT s, STRLEN n, NV *CSP_RESTRICT out)
+{
+	if (n >= 3 && s[n - 1] == ')') {
+		STRLEN open_at = n - 2;
+		while (open_at > 0 && isDIGIT((unsigned char)s[open_at])) open_at--;
+		if (s[open_at] == '(' && open_at < n - 2) n = open_at;
+	}
+	return str2nv(s, n, out);
 }
 
 /*mmCIF writes a formal charge as a signed integer and PDB as a magnitude
@@ -1793,11 +1817,11 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st,
 	}
 
 	have_xyz = v[A_X] && v[A_Y] && v[A_Z]
-	         && str2nv(v[A_X], vn[A_X], &xv)
-	         && str2nv(v[A_Y], vn[A_Y], &yv)
-	         && str2nv(v[A_Z], vn[A_Z], &zv);
-	have_occ    = v[A_OCC] && str2nv(v[A_OCC], vn[A_OCC], &ov);
-	have_b      = v[A_B]   && str2nv(v[A_B],   vn[A_B],   &bv);
+	         && cif_nv(v[A_X], vn[A_X], &xv)
+	         && cif_nv(v[A_Y], vn[A_Y], &yv)
+	         && cif_nv(v[A_Z], vn[A_Z], &zv);
+	have_occ    = v[A_OCC] && cif_nv(v[A_OCC], vn[A_OCC], &ov);
+	have_b      = v[A_B]   && cif_nv(v[A_B],   vn[A_B],   &bv);
 	have_serial = v[A_ID]  && str2iv(v[A_ID],  vn[A_ID],  &serial);
 	chg_n = v[A_CHARGE] ? cif_charge(v[A_CHARGE], vn[A_CHARGE], chgbuf) : 0;
 
@@ -2687,10 +2711,9 @@ static void set_free(pTHX_ structset *CSP_RESTRICT s)
 /*set_add_residue() -- one residue of an $info into the arrays above, with
 every atom of it that has a position.
 
-The body of set_build(), and of set_from_sides() below it, which walk
-different lists of residues into the same arrays.  The caller has checked that
-there is room for the residue; the atom arrays grow here if the residue holds
-more atoms than *cap_atom left room for.
+Taken out of set_build(), its one caller.  The caller has checked that there is
+room for the residue; the atom arrays grow here if the residue holds more atoms
+than *cap_atom left room for.
 
 No CSP_RESTRICT on r: it is a hash perl built, and the perl API may reach it by
 another route inside the calls below.*/
@@ -2717,8 +2740,6 @@ static void set_add_residue(pTHX_ structset *CSP_RESTRICT s, HV *r, NV probe,
 	rn = hvf_sv(aTHX_ r, "resname", 7);
 	if (rn) {
 		STRLEN rl;
-		//not `ri', which is set_build()'s residue counter, nor `info',
-		//which is the structure that walk was handed
 		res_info named;
 		const char *rp = SvPV_const(rn, rl);
 		s->res_key[s->n_res] = res_key(rp, rl);
@@ -3245,7 +3266,7 @@ static UV sasa_open(const NV *CSP_RESTRICT pts, UV first, UV last,
 		const NV px = xi + ri * pts[3 * j];
 		const NV py = yi + ri * pts[3 * j + 1];
 		const NV pz = zi + ri * pts[3 * j + 2];
-		bool open = 1;
+		bool open = TRUE;
 		for (UV k = 0; k < n_nbr; k++) {
 			UV kp = kc + k;
 			NV dx, dy, dz;
@@ -3253,7 +3274,7 @@ static UV sasa_open(const NV *CSP_RESTRICT pts, UV first, UV last,
 			dx = px - nx[kp]; dy = py - ny[kp]; dz = pz - nz[kp];
 			if (dx * dx + dy * dy + dz * dz < nr2[kp]) {
 				kc = kp;
-				open = 0;
+				open = FALSE;
 				break;
 			}
 		}
@@ -3424,7 +3445,7 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 				const NV bx = bins->centre[3 * b], by = bins->centre[3 * b + 1],
 				         bz = bins->centre[3 * b + 2];
 				const NV cr = bins->cos_r[b], sr = bins->sin_r[b];
-				bool whole = 0;
+				bool whole = FALSE;
 				for (UV q = 0; q <= kmax && !whole; q++) {
 					NV dot;
 					k = q ? q - 1 : k_cov;
@@ -3433,7 +3454,7 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 					if (!(ncos[k] < cr)) continue;
 					dot = bx * (nx[k] - xi) + by * (ny[k] - yi) + bz * (nz[k] - zi);
 					//within theta - rho: cos(theta - rho), scaled by d
-					if (dot > ndist[k] * (ncos[k] * cr + nsin[k] * sr)) { whole = 1; k_cov = k; }
+					if (dot > ndist[k] * (ncos[k] * cr + nsin[k] * sr)) { whole = TRUE; k_cov = k; }
 				}
 				if (!whole)
 					acc += sasa_open(pts, bins->first[b], bins->first[b + 1], xi, yi, zi, ri,

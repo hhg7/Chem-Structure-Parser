@@ -187,6 +187,13 @@ throws_ok { structure_info_string("END\n", altloc => undef) }
 	'and so does altloc => undef';
 lives_ok { structure_info($file, hydrogens => undef, chains => undef, format => undef) }
 	'undef is still off for a switch, and not given for an option whose default is undef';
+# and off means off whichever half reads the switch: hydrogens and sasa are read
+# by the XS, which took an undef for not given and so for its default, on
+is(structure_info($file, features => 0, hydrogens => undef)->{stats}{n_atoms},
+	structure_info($file, features => 0, hydrogens => 0)->{stats}{n_atoms},
+	'hydrogens => undef leaves the hydrogens out');
+ok(!exists structure_features(structure_info($file, features => 0),
+	sasa => undef, interface => 0)->{sasa}, 'sasa => undef computes no surface');
 # structure_features() takes sasa => 0 and the rest of them; structure_info()
 # takes features => 0 and no more than that.  A hash of the first spelled into
 # the second is a true value, so it would compute every feature, the surface

@@ -627,6 +627,63 @@ CIF
 	is($i->{chains}{A}{residues}{2}{atoms}{N}{x}, 5, 'and the rows after it keep their columns');
 }
 {
+	# The same quote on the last line of a file with no newline after it: the
+	# file ending is the line ending, and the word is still read as written.
+	# The scan used to stop at the end of the buffer thinking the value closed,
+	# and read the rest of the row as the atom's name.
+	my $i = structure_info_string(<<'CIF' . "ATOM 2 C 'CA ALA A 1 2.0 2.0 3.0", format => 'mmcif', features => 0);
+data_X
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.auth_atom_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 N N ALA A 1 1.0 2.0 3.0
+CIF
+	is_deeply($i->{chains}{A}{residues}{1}{atom_order}, [ 'N', "'CA" ],
+		'a quote the end of the file leaves open is read as written');
+	is($i->{chains}{A}{residues}{1}{atoms}{"'CA"}{x}, 2, 'and its row keeps its columns');
+}
+{
+	# A number with its standard uncertainty after it in parentheses, which is
+	# CIF 1.1's numeric syntax.  gemmi 0.7.5's cif::as_number() reads '1.000(2)',
+	# '-2.5(13)', '0.50(5)' and '10.0(1)' as 1, -2.5, 0.5 and 10 (checked with
+	# gemmi.cif.as_number from its python module).  0.034 required the number to
+	# be the whole field -- the PDB rule for a coordinate that overflowed its
+	# columns -- and read all four as undef.
+	my $i = structure_info_string(<<'CIF', format => 'mmcif', features => 0);
+data_X
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.auth_atom_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+ATOM 1 N N ALA A 1 1.000(2) -2.5(13) 3.0 0.50(5) 10.0(1)
+ATOM 2 C CA ALA A 1 2.0 2.0 3.0 1.0 12.5(
+ATOM 3 C C ALA A 1 3.0 2.0 3.0 1.0 12.5()
+CIF
+	my $n = $i->{chains}{A}{residues}{1}{atoms}{N};
+	is_deeply([ @{$n}{qw(x y z occupancy bfactor)} ], [ 1, -2.5, 3, 0.5, 10 ],
+		'a standard uncertainty after a number is not part of it');
+	is($i->{chains}{A}{residues}{1}{atoms}{CA}{bfactor}, undef,
+		'a parenthesis with no uncertainty in it is not one');
+	is($i->{chains}{A}{residues}{1}{atoms}{C}{bfactor}, undef, 'nor is an empty pair');
+}
+{
 	# the annotation categories, and the identifiers they are read under.  Only
 	# label_* here: auth_* is preferred where a row has both, and a row with
 	# neither is a row nothing can be filed under.

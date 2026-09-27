@@ -194,6 +194,11 @@ ok(!(grep { $_->{distance} >= 3.5 } @{ $x->{polar_contacts} }), 'every polar pai
 	is_deeply($alone->{sasa}, $x->{sasa}, 'and the same totals');
 	is_deeply($alone->{buried}, $x->{buried}, 'and buries the same area');
 	ok(!exists $alone->{pi_stacking}, 'computed alone it has no ring pairs to filter');
+	# a chain named twice is on its side once: it used to be counted twice, and
+	# 1cka came back with 114 residues on side A, a NIS of its own and a dg of
+	# -4.655 where it is -4.281
+	is_deeply(structure_interface($info{pdb}, partners => [ ['A', 'A'], ['B'] ]), $alone,
+		'naming a chain twice is naming it once');
 }
 {
 	my $b = $x->{buried};
@@ -285,8 +290,11 @@ for my $b (@BJELLQVIST) {
 	my ($file, $cid, $seq, $q, $pi) = @$b;
 	my $c = structure_info("$data/$file")->{chains}{$cid};
 	is($c->{sequence}, $seq, "$file $cid: the sequence Biopython was given");
-	# the same NV on a double perl; a wider NV evaluates the powers of ten in
-	# more bits, which moves the charge by rounding and the bisection not at all
+	# The same NV on a double perl.  A wider NV evaluates the powers of ten in
+	# more bits, and both answers move: on 5.44.0-quadmath and 5.12.5's long
+	# double the largest difference over these eight chains was 2.73 double
+	# epsilons in the charge (fold A) and 1.05 in the isoelectric point (iface
+	# B), measured 2026-09-27.  64 leaves some twenty-fold headroom over that.
 	my $tol = 64 * 2.220446049250313e-16;
 	cmp_ok(abs($c->{charge} - $q), '<=', $tol * (1 + abs $q), "$file $cid: charge at pH 7");
 	cmp_ok(abs($c->{isoelectric_point} - $pi), '<=', $tol * $pi, "$file $cid: isoelectric point");

@@ -105,7 +105,7 @@ is($gz->{title}, $plain->{title}, 'including the title');
 {
 	open my $in, '<:raw', "$data/mini.pdb" or die $!;
 	my $text = do { local $/; <$in> };
-	close $in;
+	close $in or die $!;
 	my $cut = index($text, "\nATOM") + 1;
 	my ($head, $tail) = (substr($text, 0, $cut), substr($text, $cut));
 	my ($one, $two) = ('', '');
