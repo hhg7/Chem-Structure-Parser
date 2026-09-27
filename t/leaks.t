@@ -258,6 +258,38 @@ no_leaks_ok { structure_info("$data/empty.cif") } 'nor does an empty one';
 }
 no_leaks_ok { structure_features(structure_info("$data/empty.pdb")) }
 	'an empty structure does not leak';
+{
+	# 1cka, which has something in every list the interface returns: the
+	# residue and atom pairs are built in the XS one hash at a time, and the
+	# seeded and unseeded surfaces take different paths through the kernel
+	my $info = structure_info("$data/iface.pdb");
+	no_leaks_ok { structure_info("$data/iface.pdb") }
+		'reading a complex, interface and all, does not leak';
+	no_leaks_ok { structure_interface($info) } 'nor does looking the interface up';
+	no_leaks_ok { structure_interface($info, partners => [ ['A'], ['B'] ]) }
+		'nor computing it on its own';
+	no_leaks_ok { structure_interface($info, interface_distance => 4.0, temperature => 37) }
+		'nor with the cutoffs changed';
+	no_leaks_ok { eval { structure_interface($info, partners => [ ['A'], ['Q'] ]) } }
+		'nor a partner that is not there';
+	no_leaks_ok { eval { structure_interface($info, partners => [ ['A'], ['A'] ]) } }
+		'nor two partners that overlap';
+	my $mini = structure_info("$data/mini.pdb");
+	no_leaks_ok { structure_interface($mini, partners => [ ['A'], ['NAG_A_201'] ]) }
+		'nor a ligand as a partner';
+	no_leaks_ok { eval { structure_interface(structure_info("$data/fold.pdb")) } }
+		'nor a structure with no two partners';
+}
+{
+	my $info = structure_info("$data/iface.pdb");
+	my $x = $info->{features}{interface};
+	my $res = $x->{residues}[1][0];
+	weaken($x);
+	weaken($res);
+	undef $info;
+	is($x,   undef, 'iface.pdb: dropping the structure frees its interface');
+	is($res, undef, 'and the interface residues: nothing in it points back up');
+}
 no_leaks_ok { structure_features(structure_info("$data/bases.cif")) }
 	'nor does an mmCIF one with rings in it';
 {

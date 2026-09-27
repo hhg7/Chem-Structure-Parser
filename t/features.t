@@ -155,6 +155,14 @@ sub compare {
 			my ($ri, $name) = split /\|/, $w[1], 2;
 			my ($a32, $a64, $pt) = @w[2, 3, 4];
 			my $atom = $res->[$ri] ? $res->[$ri]{atoms}{$name} : undef;
+			# mdtraj renames a protein residue's amide hydrogen to H from any of
+			# the spellings mdtraj/formats/pdb/data/pdbNames.xml lists for it --
+			# an N-terminal H1, as iface.pdb writes it, among them -- and its
+			# mmCIF reader does so with no way to turn it off; this module keeps
+			# the name the file wrote
+			if (!$atom && $name eq 'H' && $res->[$ri]) {
+				($atom) = grep { defined } map { $res->[$ri]{atoms}{$_} } qw(HN H1 1H HN1 HT1);
+			}
 			unless ($atom && defined $atom->{sasa}) {
 				fail("$file: atom $w[1] is in mdtraj's answer and not in this one");
 				next;

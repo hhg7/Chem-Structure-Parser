@@ -547,6 +547,10 @@ that goes unnoticed until the ten-thousandth file.
                             {dssp}, where structure_dssp() would find it;
                             with features => 0 it is computed on its own,
                             and with atoms => 0 it dies
+    partners  => undef      the two sides of {features}{interface}: two
+                            lists of chain ids and ligand keys, or undef
+                            to have them worked out; see
+                            structure_interface below
 
 Every option is checked. A misspelled one is fatal, because an ignored typo is
 a wrong answer that arrives without a word: `hydrogen => 0` that is quietly
@@ -569,16 +573,19 @@ surface, size and contacts are as much a part of what it is as its sequence, and
 a caller who has to know to ask mostly does not. What it costs is measured, over
 60 structures of PDBbind:
 
-    structure_info($f, features => 0)         1.30 s   246,000 atoms/s
-    structure_info($f)                        6.07 s    52,700 atoms/s    4.7x
-    ... with interface => 0                   5.88 s    54,400 atoms/s    4.5x
-    ... with sasa => 0                        3.96 s    80,800 atoms/s    3.0x
+    structure_info($f, features => 0)         1.15 s   279,000 atoms/s
+    structure_info($f)                        7.34 s    43,600 atoms/s    6.4x
+    ... with interface => 0                   5.36 s    59,800 atoms/s    4.7x
+    ... with sasa => 0                        3.90 s    82,200 atoms/s    3.4x
 
 The largest single part is the solvent-accessible surface, at 960 sphere points
-per atom; everything else together is 3.0 times the read. `interface => 0` drops
-the per-chain surfaces, which is a thirtieth of the whole: an atom with no
-neighbour outside its own chain has the same surface alone as it has in the
-structure, and only the ones that do have such a neighbour are computed twice.
+per atom; everything else together is 3.4 times the read. `interface => 0` drops
+the per-chain surfaces and the two-partner interface, which between them are a
+quarter of the whole, and nearly all of that is the interface's surface: the
+complex of the two partners is the structure without its waters and stray
+ligands, and in a crystal structure most atoms have a water close enough to
+change their surface, so most of the complex has to be computed again. Every
+other atom keeps the surface the whole structure gave it.
 
 `features => 0` is what to reach for when reading a directory for its headers or
 its sequences. `atoms => 0` turns them off on its own — there are no coordinates
@@ -723,6 +730,10 @@ example at the top of this document is its output.
     @{ $f->{pi_stacking} };   # the stacked pairs of aromatic rings
     @{ $f->{disulfides} };    # the SG-SG pairs close enough to be bonded
     @{ $f->{base_pairs} };    # the Watson-Crick and wobble base pairs
+    $f->{charge};             # -6.96     net charge at pH 7, the chains added up
+    $f->{ss_fraction}{H};     # 0.36      the helical share of the assigned residues
+    $f->{interface};          # the two partners and what is between them;
+                              # see structure_interface below
 
 (1a22 again, the structure the summary at the top of this document is of.)
 
@@ -744,6 +755,9 @@ already are:
     $info->{chains}{A}{sasa};                          # 8450.6   the chain's surface
     $info->{chains}{A}{hydropathy};                    # -0.3144  and its mean hydropathy
     $info->{chains}{A}{aromatic_fraction};             # 0.1222
+    $info->{chains}{A}{charge};                        # -3.07    net charge at pH 7
+    $info->{chains}{A}{isoelectric_point};             # 5.49     and where it is zero
+    $info->{chains}{A}{ss_fraction};                   # { H => 0.72, E => 0, C => 0.28 }
     $info->{chains}{A}{residues}{54}{sasa};            # 24.62    one residue's surface
     $info->{chains}{A}{residues}{54}{rsa};             # 0.103    ... as a fraction of its maximum
     $info->{chains}{A}{residues}{54}{atoms}{CZ}{sasa}; # one atom's
@@ -815,6 +829,9 @@ floor.
 | `hbonds` | the arrayref `structure_hbonds()` returns |
 | `dssp` | the hashref `structure_dssp()` returns |
 | `shape` | `gyration_tensor`, `principal_moments`, `asphericity`, `acylindricity`, `anisotropy` |
+| `interface` | the hashref `structure_interface()` returns, when there are two partners |
+| `charge` | the protein chains' net charges at pH 7, added up |
+| `ss_fraction` | `H`, `E` and `C`: the three-state share of every residue the secondary structure was assigned to |
 
 `rg`, `center` and `center_of_mass` are absent from a structure with no atoms in
 it, and `rg_mass` and `center_of_mass` from one whose atoms have no mass between
@@ -838,7 +855,7 @@ surface than its neighbours in the archive unless they are taken out.
 | `disulfides` | 1 | look for SG-SG pairs close enough to be bonded |
 | `base_pairs` | 1 | look for Watson-Crick and wobble base pairs |
 | `base_stacks` | 1 | score how far every nearby pair of bases is stacked |
-| `interface` | 1 | also run the surface on each chain alone, for the buried area |
+| `interface` | 1 | also run the surface on each chain alone, for the buried area, and find the two-partner interface |
 | `shape` | 1 | the gyration tensor and the descriptors built from it |
 | `dihedrals` | 1 | phi, psi, omega and chi1-chi5 on an amino acid, alpha to zeta, chi and the pucker on a nucleotide, onto each residue and, as one array per angle, onto each chain |
 | `contacts` | 1 | which residues touch which |
@@ -863,6 +880,8 @@ surface than its neighbours in the archive unless they are taken out.
 | `base_stack_distance` | 5.0 | the furthest apart two stacked bases' centres of mass may be, angstrom |
 | `base_stack_omega` | 50 | and the largest overlap angle that is still a stack, degrees |
 | `contact_distance` | 4.5 | the largest heavy-atom separation that counts as a contact, angstrom |
+| `partners` | undef | the two sides of the interface; see `structure_interface` |
+| `interface_distance`, `salt_bridge_distance`, `polar_distance`, `cation_pi_distance`, `water_distance`, `nis_threshold`, `temperature` | | the interface's own; see `structure_interface` |
 
 A structure read with `atoms => 0` has no coordinates to work from, and saying
 so is more use than reporting no surface:
@@ -1042,6 +1061,174 @@ with `altloc => 'highest'` that the two agree residue for residue. Over a hundre
 entries of PDBbind v2020 read that way, both give a figure to the same 56,227
 residues, and the figures differ at one of them: a neighbour 0.00005° from the
 dividing plane, which Biopython's float32 coordinates put on the other side.
+
+### Charge, and the secondary structure's shares
+
+Each protein chain carries `charge`, its net charge at pH 7, and
+`isoelectric_point`, the pH at which that is zero, both over the observed
+sequence. They are Biopython's `Bio.SeqUtils.IsoelectricPoint` — its
+`charge_at_pH(7.0)` and `pi()` — with its pK values, which are Bjellqvist's
+(1993, 1994) with a residue-specific value for each terminus, and they agree
+with it to the last bit on a double perl. `$f->{charge}` is the chains' charges
+added up. There is no isoelectric point of the whole: each chain is its own
+molecule, with its own two termini.
+
+`ss_fraction` is the share of each three-state letter — `H` for the three
+helices, `E` for the strand and the bridge, `C` for the rest — among the
+residues the secondary structure was assigned to, on each chain and over the
+whole structure. It is the `dssp` roll-up counted, so it is there whenever
+`secondary` is.
+
+## structure_interface
+
+    my $x = $info->{features}{interface};             # structure_info() found two partners
+    my $y = structure_interface($info);                # the same hash
+    my $z = structure_interface($info, partners => [ ['H', 'L'], ['A'] ]);
+    my $l = structure_interface($info, partners => [ ['A'], ['STU_A_401'] ]);
+
+    scalar @{ $x->{contacts} };         # 32     residue pairs closer than 5.5 A
+    $x->{ic}{charged_charged};          # 6      PRODIGY's classes of those pairs
+    $x->{buried}{total};                # 991.7  A^2 the two partners bury
+    $x->{buried}{apolar};               # 597.9  the carbon and sulphur part of it
+    $x->{nis}{apolar};                  # 0.382  the apolar share of the exposed surface
+    $x->{prodigy}{dg};                  # -4.28  kcal/mol, PRODIGY's estimate
+    scalar @{ $x->{salt_bridges} };     # 4
+    scalar @{ $x->{polar_contacts} };   # 8      N, O or S pairs closer than 3.5 A
+    scalar @{ $x->{cation_pi} };        # 1
+    scalar @{ $x->{bridging_waters} };  # 7
+    $x->{com_distance};                 # 12.11  A between the centres of mass
+    $x->{min_distance};                 # 2.74   A between the closest heavy atoms
+
+(1cka: the N-terminal SH3 domain of c-Crk, chain A, holding the C3G peptide
+PPPALPPKK, chain B. It is `t/data/iface.pdb`.)
+
+What two partners of a complex have between them: a receptor and the peptide,
+protein or ligand it holds. A binding affinity is a question about two things,
+and the numbers that predict one in the published single-structure models are
+measured across the gap between them — which residues touch, how much surface
+the two bury, which charged groups meet.
+
+It is one of the features, computed on the way past like the rest, so
+`$info->{features}{interface}` is there after an ordinary `structure_info()`
+whenever the structure has two partners to find. With no options this function
+is a lookup. Name an option and the interface alone is computed again with it
+in force; that costs the surface of the complex, which the default read gets
+mostly for free (see below). `interface => 0` on `structure_features()` turns it
+off, and `sasa => 0` leaves the surface-based half out — `sasa`, `buried`, the
+residues' surfaces, `nis` and `prodigy` — and keeps the rest.
+
+### Choosing the partners
+
+`partners` names them: two entries, each a chain id, a ligand key as
+`structure_ligands()` writes it (`NAME_CHAIN_NUMBER`), or a list of those. A
+chain named as a partner is its amino acids and nucleotides, and the residues
+peptide-bonded into them — an ACE or NH2 cap, a non-standard amino acid the
+residue table does not know — by gemmi's C–N length. A ligand, ion or water that
+only carries the chain's letter is not part of it; name it by its key to add it.
+The two partners must not share a residue.
+
+Left out, the partners are worked out, which is a guess:
+
+| the structure has | the partners are |
+| --- | --- |
+| two or more polymer chains | the shortest, against all the others: a peptide against its receptor. A tie goes to the chain later in the file |
+| one polymer chain and a ligand | the ligand with the most heavy atoms, against the chain. An ion is never chosen, and neither is a residue bonded into the chain |
+| neither | no interface, and no `interface` key |
+
+An antibody's two chains against an antigen, or a drug against a protein that
+also holds a larger glycerol or detergent molecule, are structures whose
+partners have to be named. `$x->{partners}` says what was used, in the same
+form `partners` takes.
+
+The complex is the two partners and nothing else. Waters, ions and ligands that
+belong to neither are left out of it, as PRODIGY leaves them out, and the waters
+come back only to be asked whether they bridge the two.
+
+### What comes back
+
+| key | what it is |
+| --- | --- |
+| `partners` | `[ [names], [names] ]`: what the two sides are |
+| `n_residues`, `n_atoms` | `[ first, second ]`: how big each side is |
+| `contacts` | the residue pairs, one in each side, whose closest heavy atoms are closer than `interface_distance`: `chain1`, `residue1`, `resname1` in the first partner, the same with 2 in the second, and `distance` |
+| `n_atom_contacts` | the heavy-atom pairs closer than `interface_distance` |
+| `ic` | the contacts by PRODIGY's classes: `charged_charged`, `charged_polar`, `charged_apolar`, `polar_polar`, `apolar_polar`, `apolar_apolar` |
+| `residues` | `[ [first], [second] ]`: each side's residues that touch the other or bury any surface, with `chain`, `residue`, `resname`, `sasa`, `sasa_alone`, `buried` and `n_contacts` |
+| `sasa` | `complex`, and `alone`, `[ first, second ]`: the surface of the two together and of each on its own, angstrom^2 |
+| `buried` | `total`, `apolar`, `polar`, and `side`, `[ first, second ]`: what the two bury against each other, and each side's share |
+| `nis` | `apolar`, `charged`, `polar`: PRODIGY's non-interacting surface, as fractions |
+| `prodigy` | `dg`, kcal/mol, and `kd`, molar, at `temperature` — PRODIGY's IC_NIS estimate; only for two protein partners that touch |
+| `salt_bridges` | residue pairs with a LYS NZ or ARG NE, NH1 or NH2 and an ASP OD1, OD2 or GLU OE1, OE2 closer than `salt_bridge_distance`: the pair's fields, `atom1` and `atom2` the closest two |
+| `polar_contacts` | every N, O or S pair, one in each side, closer than `polar_distance`: the pair's fields, `atom1`, `atom2`, and `backbone1` and `backbone2`, 1 for N, CA, C, O or OXT |
+| `cation_pi` | a LYS NZ or ARG CZ within `cation_pi_distance` of a PHE, TYR or TRP ring centroid in the other side, once per residue pair at the nearer ring; `cation` says which side the cation is on |
+| `pi_stacking`, `disulfides` | the entries of `$f->{pi_stacking}` and `$f->{disulfides}` that cross from one side to the other |
+| `bridging_waters` | `chain` and `residue` of each water with a heavy atom within `water_distance` of a heavy atom of both sides |
+| `com_distance` | angstrom between the two centres of mass |
+| `min_distance` | angstrom between the closest two heavy atoms, one in each side; absent when none is within reach of the largest cutoff |
+| `bfactor` | `mean` and `interface`, each `[ first, second ]`: the mean B-factor of each side's heavy atoms, and of those within `interface_distance` of the other side |
+
+`pi_stacking` and `disulfides` come from the whole-structure lists, so an
+interface computed on its own with options has neither.
+
+### Against PRODIGY
+
+The contacts, their classes, the non-interacting surface and the estimate are
+PRODIGY's — `prodigy-prot` 2.4.0, Vangone, A and Bonvin, A M J J (2015) *eLife*
+4:e07454 — and so are its defaults: 5.5 Å for a contact and 5% exposure for the
+surface. Over 148 entries of PDBbind v2020 that PRODIGY can read, the contacts
+and their classes agree exactly in every one.
+
+The non-interacting surface does not agree exactly, because it is PRODIGY's
+threshold applied to a different surface: this module's is mdtraj's radii,
+PRODIGY's is NACCESS's through freesasa, and a residue near 5% can land on either
+side. On 1cka one does — GLY A180, 3.1% exposed here and 6.8% there. Over the
+same 148 entries the fractions are never more than two percentage points apart,
+and the estimate is never more than 0.22 kcal/mol from PRODIGY's, with a median
+of 0.057. Note that PRODIGY's non-interacting surface is every exposed residue
+of the complex, the interface included, not only the residues away from it.
+
+### Against the pepPriML feature script
+
+The salt bridges, the polar pairs and their backbone split, the bridging
+waters, the atom-pair counts at any cutoff and the two distances are the
+definitions of `features.pdb.20260806.py`, the static feature script of the
+pepPriML project, which computes them with mdtraj; on 1cka the two agree on
+every one. Two differences are deliberate. Its cation–π counts histidine as a
+cation and as a ring, and Gallivan, J P and Dougherty, D A (1999) *PNAS*
+96(17):9459-64, whose 6 Å filter this is, count it as neither. And it leaves an
+ACE or NH2 cap out of the peptide, which a chain named as a partner here takes
+in. Over twenty peptide complexes of PDBbind the two agree on every count once
+those two are allowed for, and on the buried surface to 1 Å².
+
+### Options
+
+| option | default | what it does |
+| --- | --- | --- |
+| `partners` | undef | the two sides: two chain ids, ligand keys or lists of them; undef works them out |
+| `interface_distance` | 5.5 | the largest heavy-atom separation that is a contact, angstrom — PRODIGY's `d_cutoff` |
+| `salt_bridge_distance` | 4.0 | the largest charged N to charged O separation that is a salt bridge — Barlow, D J and Thornton, J M (1983) *J Mol Biol* 168(4):867-85 |
+| `polar_distance` | 3.5 | the largest N/O/S separation that is a polar pair |
+| `cation_pi_distance` | 6.0 | the largest cation to ring centroid separation — Gallivan and Dougherty (1999) |
+| `water_distance` | 3.5 | how close a bridging water must come to each side |
+| `nis_threshold` | 0.05 | the exposure, as a fraction of NACCESS's reference surface, at which a residue is on the surface — PRODIGY's `acc_threshold` |
+| `temperature` | 25 | degrees Celsius, for turning the estimate into a Kd |
+| `probe`, `points` | 1.4, 960 | as for `structure_sasa` |
+
+The same options are taken by `structure_features()`, and `partners` by
+`structure_info()`, which is where the default read's interface is decided.
+
+### What it costs
+
+The surface of the complex is the expensive part. It starts from the whole
+structure's: an atom's surface depends only on which atoms are close enough to
+cover some of it, so an atom of either partner whose neighbours are all in the
+two partners has the surface the whole structure already gave it, bit for bit.
+Only the atoms with a neighbour outside the complex are computed again, and only
+the ones with a neighbour in the other partner a third time with that partner
+taken away. In a crystal structure most atoms have a water close enough, so it
+is most of them — 608 of 1cka's 659 — and the interface is most of what
+`interface => 0` saves; see `structure_info` above. Computed on its own, with an
+option, the complex is computed whole.
 
 ## structure_sasa
 
@@ -1895,6 +2082,11 @@ them where they are installed so the frozen answer cannot go stale.
 | hydropathy | Kyte, J; Doolittle, R F (1982) *J Mol Biol* 157(1):105-132 | Biopython's `Bio.SeqUtils.ProtParamData.kd` and `ProteinAnalysis.gravy()` |
 | aromaticity | Lobry, J R; Gautier, C (1994) *Nucleic Acids Res* 22(15):3174-3180 | Biopython's `ProteinAnalysis.aromaticity()` |
 | G+C content | | Biopython's `Bio.SeqUtils.gc_fraction()`, with its default `ambiguous => 'remove'` |
+| net charge and isoelectric point | Bjellqvist, B *et al.* (1993) *Electrophoresis* 14:1023-31 and (1994) 15:529-39 | Biopython's `Bio.SeqUtils.IsoelectricPoint` |
+| interface contacts, their classes, the non-interacting surface and the affinity estimate | Vangone, A; Bonvin, A M J J (2015) *eLife* 4:e07454 | `prodigy-prot` 2.4.0's `calculate_ic()`, `analyse_contacts()`, `analyse_nis()` and `IC_NIS()` |
+| salt bridges | Barlow, D J; Thornton, J M (1983) *J Mol Biol* 168(4):867-85 | pepPriML's `features.pdb.20260806.py`, which counts them the same way |
+| cation-pi | Gallivan, J P; Dougherty, D A (1999) *PNAS* 96(17):9459-64, the distance filter | |
+| polar pairs, bridging waters | | pepPriML's `features.pdb.20260806.py` |
 
 mdtraj works in nanometres and float32; this module works in angstrom and NV,
 which is what the two file formats are written in and what the rest of the

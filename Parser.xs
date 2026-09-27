@@ -2684,6 +2684,140 @@ static void set_free(pTHX_ structset *CSP_RESTRICT s)
 	Zero(s, 1, structset);
 }
 
+/*set_add_residue() -- one residue of an $info into the arrays above, with
+every atom of it that has a position.
+
+The body of set_build(), and of set_from_sides() below it, which walk
+different lists of residues into the same arrays.  The caller has checked that
+there is room for the residue; the atom arrays grow here if the residue holds
+more atoms than *cap_atom left room for.
+
+No CSP_RESTRICT on r: it is a hash perl built, and the perl API may reach it by
+another route inside the calls below.*/
+static void set_add_residue(pTHX_ structset *CSP_RESTRICT s, HV *r, NV probe,
+                            bool coords_only, UV *CSP_RESTRICT cap_atom)
+{
+	AV *ao;
+	HV *atoms;
+	SV *one;
+	SV *rn;
+	SSize_t ai, nai;
+	s->res_hv[s->n_res] = r;
+	s->res_first[s->n_res] = s->n_atom;
+	one = hvf_sv(aTHX_ r, "one", 3);
+	if (one) {
+		STRLEN olen;
+		const char *op = SvPV_const(one, olen);
+		//a residue with no single-letter code has an empty string here,
+		//not a missing key, so length is what tells them apart
+		s->res_one[s->n_res] = (olen == 1) ? *op : '\0';
+	} else {
+		s->res_one[s->n_res] = '\0';
+	}
+	rn = hvf_sv(aTHX_ r, "resname", 7);
+	if (rn) {
+		STRLEN rl;
+		//not `ri', which is set_build()'s residue counter, nor `info',
+		//which is the structure that walk was handed
+		res_info named;
+		const char *rp = SvPV_const(rn, rl);
+		s->res_key[s->n_res] = res_key(rp, rl);
+		s->res_type[s->n_res] = res_lookup(rp, rl, &named) ? named.type : RT_OTHER;
+	} else {
+		s->res_key[s->n_res] = 0;
+		s->res_type[s->n_res] = RT_OTHER;
+	}
+	{
+		SV *st = hvf_sv(aTHX_ r, "standard", 8);
+		s->res_std[s->n_res] = (st && SvTRUE(st)) ? 1 : 0;
+	}
+	ao = hvf_av(aTHX_ r, "atom_order", 10);
+	atoms = hvf_hv(aTHX_ r, "atoms", 5);
+	nai = (ao && atoms) ? av_len(ao) + 1 : 0;
+	s->n_atom_slots += (UV)nai;
+	for (ai = 0; ai < nai; ai++) {
+		SV **as = av_fetch(ao, ai, 0);
+		HV *a;
+		SV *xs, *ys, *zs, *es;
+		elem_prop ep;
+		unsigned char apolar;
+		if (!as || !*as || !SvOK(*as)) continue;
+		a = hvf_ent_hv(aTHX_ atoms, *as);
+		if (!a) continue;
+	/*The chain's n_atoms counts records and so is an upper bound on
+	the atoms its residues hold -- for every structure this module
+	read.  One assembled somewhere else can say less than it holds,
+	or not say at all, and the answer then has to be about the atoms
+	that are there rather than about the number the chain claimed:
+	the arrays grow instead of the walk stopping.  Never reached for
+	a structure this module built, which is why the first pass sizes
+	from the counts at all.*/
+		if (s->n_atom >= *cap_atom) {
+			*cap_atom = *cap_atom ? *cap_atom * 2 : 16;
+			Renew(s->x,   *cap_atom, NV);
+			Renew(s->y,   *cap_atom, NV);
+			Renew(s->z,   *cap_atom, NV);
+			if (!coords_only) {
+				Renew(s->rad, *cap_atom, NV);
+				Renew(s->mass, *cap_atom, NV);
+				Renew(s->apolar, *cap_atom, unsigned char);
+			}
+			Renew(s->atom_hv, *cap_atom, HV *);
+		}
+		xs = hvf_sv(aTHX_ a, "x", 1);
+		ys = hvf_sv(aTHX_ a, "y", 1);
+		zs = hvf_sv(aTHX_ a, "z", 1);
+	/*an atom whose line was truncated before the coordinates has
+	no position, and a position is what every one of these
+	calculations is about; it is left out and counted nowhere*/
+		if (!xs || !ys || !zs) continue;
+		es = coords_only ? NULL : hvf_sv(aTHX_ a, "element", 7);
+		apolar = 0;
+		if (coords_only) {
+			//the element decides rad, mass and apolar and none of the
+			//three is wanted: not fetched, not looked up, not stored,
+			//and no tally kept of the atoms that spell none
+			ep.vdw = CSP_VDW_DEFAULT;
+			ep.mass = 0.0;
+		} else if (es) {
+			STRLEN el;
+			const char *ep_s = SvPV_const(es, el);
+	/*Carbon and sulphur are the apolar surface and everything
+	else is the polar one, which is the split Chothia, C (1974)
+	Nature 248:338 made when he first added a protein's buried
+	surface up.  Only the symbol decides it, so a sulphur that
+	is part of a sulphate counts as apolar here; a caller who
+	wants a chemistry-aware split has the per-atom areas.
+
+	Asked of the packed key rather than of the field, so that a
+	field written " C" or "c" answers the same as "C" -- the
+	same normalisation the radius lookup just did.*/
+			if (!elem_prop_of(ep_s, el, &ep)) {
+				ep.vdw = CSP_VDW_DEFAULT;
+				ep.mass = 0.0;
+				s->n_no_element++;
+			} else if (ep.key == K2('C', 0) || ep.key == K2('S', 0)) {
+				apolar = 1;
+			}
+		} else {
+			s->n_no_element++;
+		}
+		s->x[s->n_atom] = SvNV(xs);
+		s->y[s->n_atom] = SvNV(ys);
+		s->z[s->n_atom] = SvNV(zs);
+		if (!coords_only) {
+			s->rad[s->n_atom] = ep.vdw + probe;
+			s->mass[s->n_atom] = ep.mass;
+			s->apolar[s->n_atom] = apolar;
+			s->mass_total += ep.mass;
+		}
+		s->atom_hv[s->n_atom] = a;
+		s->n_atom++;
+	}
+	s->res_last[s->n_res] = s->n_atom;
+	s->n_res++;
+}
+
 /*set_build() -- walk an $info into the arrays above.
 
 Sized from what the structure already says about itself rather than by counting
@@ -2770,128 +2904,10 @@ static void set_build(pTHX_ HV *CSP_RESTRICT info, structset *CSP_RESTRICT s,
 		for (ri = 0; ri < nri; ri++) {
 			SV **rs = av_fetch(ro, ri, 0);
 			HV *r;
-			AV *ao;
-			HV *atoms;
-			SV *one;
-			SV *rn;
-			SSize_t ai, nai;
 			if (!rs || !*rs || !SvOK(*rs)) continue;
 			r = hvf_ent_hv(aTHX_ residues, *rs);
 			if (!r || s->n_res >= cap_res) continue;
-			s->res_hv[s->n_res] = r;
-			s->res_first[s->n_res] = s->n_atom;
-			one = hvf_sv(aTHX_ r, "one", 3);
-			if (one) {
-				STRLEN olen;
-				const char *op = SvPV_const(one, olen);
-				//a residue with no single-letter code has an empty string here,
-				//not a missing key, so length is what tells them apart
-				s->res_one[s->n_res] = (olen == 1) ? *op : '\0';
-			} else {
-				s->res_one[s->n_res] = '\0';
-			}
-			rn = hvf_sv(aTHX_ r, "resname", 7);
-			if (rn) {
-				STRLEN rl;
-				//not `ri', which is this loop's own counter, nor `info',
-				//which is the structure this walk was handed
-				res_info named;
-				const char *rp = SvPV_const(rn, rl);
-				s->res_key[s->n_res] = res_key(rp, rl);
-				s->res_type[s->n_res] = res_lookup(rp, rl, &named) ? named.type : RT_OTHER;
-			} else {
-				s->res_key[s->n_res] = 0;
-				s->res_type[s->n_res] = RT_OTHER;
-			}
-			{
-				SV *st = hvf_sv(aTHX_ r, "standard", 8);
-				s->res_std[s->n_res] = (st && SvTRUE(st)) ? 1 : 0;
-			}
-			ao = hvf_av(aTHX_ r, "atom_order", 10);
-			atoms = hvf_hv(aTHX_ r, "atoms", 5);
-			nai = (ao && atoms) ? av_len(ao) + 1 : 0;
-			s->n_atom_slots += (UV)nai;
-			for (ai = 0; ai < nai; ai++) {
-				SV **as = av_fetch(ao, ai, 0);
-				HV *a;
-				SV *xs, *ys, *zs, *es;
-				elem_prop ep;
-				unsigned char apolar;
-				if (!as || !*as || !SvOK(*as)) continue;
-				a = hvf_ent_hv(aTHX_ atoms, *as);
-				if (!a) continue;
-	/*The chain's n_atoms counts records and so is an upper bound on
-	the atoms its residues hold -- for every structure this module
-	read.  One assembled somewhere else can say less than it holds,
-	or not say at all, and the answer then has to be about the atoms
-	that are there rather than about the number the chain claimed:
-	the arrays grow instead of the walk stopping.  Never reached for
-	a structure this module built, which is why the first pass sizes
-	from the counts at all.*/
-				if (s->n_atom >= cap_atom) {
-					cap_atom = cap_atom ? cap_atom * 2 : 16;
-					Renew(s->x,   cap_atom, NV);
-					Renew(s->y,   cap_atom, NV);
-					Renew(s->z,   cap_atom, NV);
-					if (!coords_only) {
-						Renew(s->rad, cap_atom, NV);
-						Renew(s->mass, cap_atom, NV);
-						Renew(s->apolar, cap_atom, unsigned char);
-					}
-					Renew(s->atom_hv, cap_atom, HV *);
-				}
-				xs = hvf_sv(aTHX_ a, "x", 1);
-				ys = hvf_sv(aTHX_ a, "y", 1);
-				zs = hvf_sv(aTHX_ a, "z", 1);
-	/*an atom whose line was truncated before the coordinates has
-	no position, and a position is what every one of these
-	calculations is about; it is left out and counted nowhere*/
-				if (!xs || !ys || !zs) continue;
-				es = coords_only ? NULL : hvf_sv(aTHX_ a, "element", 7);
-				apolar = 0;
-				if (coords_only) {
-					//the element decides rad, mass and apolar and none of the
-					//three is wanted: not fetched, not looked up, not stored,
-					//and no tally kept of the atoms that spell none
-					ep.vdw = CSP_VDW_DEFAULT;
-					ep.mass = 0.0;
-				} else if (es) {
-					STRLEN el;
-					const char *ep_s = SvPV_const(es, el);
-	/*Carbon and sulphur are the apolar surface and everything
-	else is the polar one, which is the split Chothia, C (1974)
-	Nature 248:338 made when he first added a protein's buried
-	surface up.  Only the symbol decides it, so a sulphur that
-	is part of a sulphate counts as apolar here; a caller who
-	wants a chemistry-aware split has the per-atom areas.
-
-	Asked of the packed key rather than of the field, so that a
-	field written " C" or "c" answers the same as "C" -- the
-	same normalisation the radius lookup just did.*/
-					if (!elem_prop_of(ep_s, el, &ep)) {
-						ep.vdw = CSP_VDW_DEFAULT;
-						ep.mass = 0.0;
-						s->n_no_element++;
-					} else if (ep.key == K2('C', 0) || ep.key == K2('S', 0)) {
-						apolar = 1;
-					}
-				} else {
-					s->n_no_element++;
-				}
-				s->x[s->n_atom] = SvNV(xs);
-				s->y[s->n_atom] = SvNV(ys);
-				s->z[s->n_atom] = SvNV(zs);
-				if (!coords_only) {
-					s->rad[s->n_atom] = ep.vdw + probe;
-					s->mass[s->n_atom] = ep.mass;
-					s->apolar[s->n_atom] = apolar;
-					s->mass_total += ep.mass;
-				}
-				s->atom_hv[s->n_atom] = a;
-				s->n_atom++;
-			}
-			s->res_last[s->n_res] = s->n_atom;
-			s->n_res++;
+			set_add_residue(aTHX_ s, r, probe, coords_only, &cap_atom);
 		}
 		s->chain_last[s->n_chain] = s->n_res;
 		s->n_chain++;
@@ -6642,6 +6658,651 @@ static HV *dssp_compute(pTHX_ structset *CSP_RESTRICT s, bool store)
 	return out;
 }
 
+/*The interface between two partners.
+
+Everything above answers a question about the structure as a whole or about
+each chain on its own.  A binding affinity is a question about two things --
+a receptor and the peptide or ligand it holds -- and the numbers that predict
+one are measured between them: which residues touch across the gap, what
+surface the two bury, which charged groups meet.  The two partners are sets of
+residues, chosen in Perl (structure_features()'s partners option, or the split
+it makes by itself), and handed down as two lists of residue hashes.  Nothing
+else in the structure is part of either: waters, ions and ligands that belong
+to neither are left out of the complex, as PRODIGY leaves them out, and the
+waters come back in only to be asked whether they bridge the two.
+
+Where each definition comes from, which is also what it is checked against:
+
+  contacts        two residues, one in each partner, with heavy atoms closer
+                  than contact_distance.  PRODIGY's calculate_ic() in
+                  prodigy-prot 2.4.0 (Vangone, A and Bonvin, A M J J (2015)
+                  eLife 4:e07454), whose d_cutoff of 5.5 A is the default.
+  salt_bridges    a LYS NZ or ARG NE/NH1/NH2 and an ASP OD1/OD2 or GLU
+                  OE1/OE2, one in each partner, closer than 4.0 A: Barlow, D J
+                  and Thornton, J M (1983) J Mol Biol 168(4):867-85, and the
+                  SB_STRICT_CUTOFF_NM of ~/ui/pepPriML/py/features.pdb.20260806.py,
+                  which counts them the same way, once per residue pair.
+  polar_contacts  an N, O or S atom in each partner closer than 3.5 A: the
+                  crystallographic hydrogen-bond criterion, which needs no
+                  hydrogens and so cannot check an angle -- that script's
+                  _geometric_hbonds(), atom pair by atom pair.
+  cation_pi       a LYS NZ or ARG CZ within 6.0 A of the centroid of a PHE,
+                  TYR or TRP ring in the other partner: the distance filter of
+                  Gallivan, J P and Dougherty, D A (1999) PNAS 96(17):9459-64,
+                  without the energy they then computed for each candidate.
+                  That script counts histidine as both a cation and a ring;
+                  Gallivan and Dougherty count it as neither, and so does this.
+  bridging_waters a water with a heavy atom within 3.5 A of a heavy atom of
+                  each partner: that script's WATER_CONTACT_NM and
+                  n_bridging_waters.
+
+The surfaces are the kernel's, run on the two partners alone.  Most of that run
+is already done: an atom's surface depends only on which atoms are its
+neighbours, so an atom of either partner whose neighbours are all in the two
+partners has, in the complex, the surface the whole structure gave it -- the
+same NV, bit for bit, because the kernel's answer is a count of open points
+and the neighbours' order does not enter into it (see sasa_kernel()).  Only the
+atoms touching something outside the partners are computed again, and only the
+atoms touching the other partner are computed a third time with that partner
+taken away.  Without the whole-structure surface to start from -- sasa => 0 --
+the complex is computed whole.*/
+typedef struct {
+	NV contact;   //residue contacts, angstrom
+	NV salt;      //salt bridges
+	NV polar;     //N/O/S pairs
+	NV cation_pi; //cation to ring centroid
+	NV water;     //a bridging water to each partner
+} iface_opt;
+
+//what an atom of either partner is, for the search across the interface
+#define IA_HEAVY    0x01 //not hydrogen or deuterium
+#define IA_POLAR    0x02 //N, O or S
+#define IA_CATION   0x04 //LYS NZ; ARG NE, NH1, NH2
+#define IA_ANION    0x08 //ASP OD1, OD2; GLU OE1, OE2
+#define IA_BACKBONE 0x10 //N, CA, C, O, OXT
+#define IA_IFACE    0x20 //within contact distance of the other partner
+
+//a residue hash's address, and where set_build() put it
+typedef struct {
+	UV addr;
+	UV res;
+} res_addr;
+
+static int res_addr_cmp(const void *pa, const void *pb)
+{
+	const res_addr *a = (const res_addr *)pa, *b = (const res_addr *)pb;
+	return a->addr < b->addr ? -1 : a->addr > b->addr ? 1 : 0;
+}
+
+//which residue of s a hash is, or s->n_res when it is none of them
+static UV res_addr_find(const res_addr *CSP_RESTRICT tab, UV n, UV addr, UV none)
+{
+	UV lo = 0, hi = n;
+	while (lo < hi) {
+		UV mid = lo + (hi - lo) / 2;
+		if (tab[mid].addr < addr) lo = mid + 1;
+		else if (tab[mid].addr > addr) hi = mid;
+		else return tab[mid].res;
+	}
+	return none;
+}
+
+/*The points of a grid within cut of (px, py, pz), into *buf, which grows.
+The grid's cells are at least cut wide, so the 27 around the point hold every
+one of them.*/
+static UV grid_within(pTHX_ const cell_grid *CSP_RESTRICT g,
+                      const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y,
+                      const NV *CSP_RESTRICT z, NV px, NV py, NV pz, NV cut,
+                      UV **CSP_RESTRICT buf, UV *CSP_RESTRICT cap)
+{
+	UV n = 0, ci, cj, ck, bx, by, bz;
+	if (g->start == NULL) return 0;
+	ci = grid_axis(px - g->x0, g->cell, g->nx);
+	cj = grid_axis(py - g->y0, g->cell, g->ny);
+	ck = grid_axis(pz - g->z0, g->cell, g->nz);
+	for (bx = ci ? ci - 1 : 0; bx <= (ci + 1 < g->nx ? ci + 1 : g->nx - 1); bx++)
+	for (by = cj ? cj - 1 : 0; by <= (cj + 1 < g->ny ? cj + 1 : g->ny - 1); by++)
+	for (bz = ck ? ck - 1 : 0; bz <= (ck + 1 < g->nz ? ck + 1 : g->nz - 1); bz++) {
+		UV cell = (bx * g->ny + by) * g->nz + bz, p;
+		for (p = g->start[cell]; p < g->start[cell + 1]; p++) {
+			UV j = g->idx[p];
+			NV dx = x[j] - px, dy = y[j] - py, dz = z[j] - pz;
+			if (dx * dx + dy * dy + dz * dz >= cut * cut) continue;
+			if (n == *cap) { *cap = *cap ? *cap * 2 : 64; Renew(*buf, *cap, UV); }
+			(*buf)[n++] = j;
+		}
+	}
+	return n;
+}
+
+//an atom's name and element, as the classification below wants them
+static unsigned char iface_class(pTHX_ HV *CSP_RESTRICT a, char one, unsigned char rtype)
+{
+	unsigned char f = 0;
+	SV *e = hvf_sv(aTHX_ a, "element", 7);
+	SV *nm = hvf_sv(aTHX_ a, "name", 4);
+	STRLEN en = 0, nn = 0;
+	const char *ep = e ? SvPV_const(e, en) : "";
+	const char *np = nm ? SvPV_const(nm, nn) : "";
+	if (!(en == 1 && (*ep == 'H' || *ep == 'D'))) f |= IA_HEAVY;
+	if (en == 1 && (*ep == 'N' || *ep == 'O' || *ep == 'S')) f |= IA_POLAR;
+	if (rtype != RT_AA) return f;
+	if ((nn == 1 && (*np == 'N' || *np == 'C' || *np == 'O'))
+	    || (nn == 2 && np[0] == 'C' && np[1] == 'A')
+	    || (nn == 3 && memcmp(np, "OXT", 3) == 0))
+		f |= IA_BACKBONE;
+	switch (one) {
+	case 'K':
+		if (nn == 2 && memcmp(np, "NZ", 2) == 0) f |= IA_CATION;
+		break;
+	case 'R':
+		if ((nn == 2 && memcmp(np, "NE", 2) == 0)
+		    || (nn == 3 && (memcmp(np, "NH1", 3) == 0 || memcmp(np, "NH2", 3) == 0)))
+			f |= IA_CATION;
+		break;
+	case 'D':
+		if (nn == 3 && (memcmp(np, "OD1", 3) == 0 || memcmp(np, "OD2", 3) == 0))
+			f |= IA_ANION;
+		break;
+	case 'E':
+		if (nn == 3 && (memcmp(np, "OE1", 3) == 0 || memcmp(np, "OE2", 3) == 0))
+			f |= IA_ANION;
+		break;
+	default:
+		break;
+	}
+	return f;
+}
+
+//the name of atom i, for the atom-level lists
+static SV *iface_name(pTHX_ HV *CSP_RESTRICT a)
+{
+	SV *nm = hvf_sv(aTHX_ a, "name", 4);
+	return nm ? newSVsv(nm) : newSVpvn("", 0);
+}
+
+/*the residue of s an atom of s is in.  The atoms are in residue order and each
+residue is the range [res_first, res_last), so it is a binary search over the
+ends.*/
+static UV res_of_atom(const structset *CSP_RESTRICT s, UV a)
+{
+	UV lo = 0, hi = s->n_res;
+	while (lo < hi) {
+		UV mid = lo + (hi - lo) / 2;
+		if (s->res_last[mid] <= a) lo = mid + 1; else hi = mid;
+	}
+	return lo;
+}
+
+//a residue pair, with both residues' chain, key and name
+static HV *iface_pair(pTHX_ HV *CSP_RESTRICT r1, HV *CSP_RESTRICT r2, NV d)
+{
+	HV *h = newHV();
+	pi_field(aTHX_ h, "chain1", 6, r1, "chain", 5);
+	pi_field(aTHX_ h, "residue1", 8, r1, "key", 3);
+	pi_field(aTHX_ h, "resname1", 8, r1, "resname", 7);
+	pi_field(aTHX_ h, "chain2", 6, r2, "chain", 5);
+	pi_field(aTHX_ h, "residue2", 8, r2, "key", 3);
+	pi_field(aTHX_ h, "resname2", 8, r2, "resname", 7);
+	(void)hv_stores(h, "distance", newSVnv(d));
+	return h;
+}
+
+//one side-1 residue's running list of what it meets in side 2
+typedef struct {
+	UV res;      //the side-2 residue
+	NV d;        //closest approach
+	UV a1, a2;   //the atoms that make it, for the salt bridges
+} iface_touch;
+
+static void touch_note(pTHX_ iface_touch **CSP_RESTRICT list, UV *CSP_RESTRICT n,
+                       UV *CSP_RESTRICT cap, UV res, NV d, UV a1, UV a2)
+{
+	UV k;
+	for (k = 0; k < *n; k++) if ((*list)[k].res == res) break;
+	if (k < *n) {
+		if (d < (*list)[k].d) { (*list)[k].d = d; (*list)[k].a1 = a1; (*list)[k].a2 = a2; }
+		return;
+	}
+	if (*n == *cap) { *cap = *cap ? *cap * 2 : 16; Renew(*list, *cap, iface_touch); }
+	(*list)[*n].res = res; (*list)[*n].d = d; (*list)[*n].a1 = a1; (*list)[*n].a2 = a2;
+	(*n)++;
+}
+
+//the NV of an array of two, or undef for a side that has no such number
+static SV *pair_av(pTHX_ const NV *CSP_RESTRICT v, const bool *CSP_RESTRICT have)
+{
+	AV *av = newAV();
+	unsigned short int k;
+	for (k = 0; k < 2; k++) av_push(av, have[k] ? newSVnv(v[k]) : newSV(0));
+	return newRV_noinc((SV *)av);
+}
+
+/*Everything the two partners' working arrays hold, so that one destructor can
+free them on the croak path as well as the ordinary one.*/
+typedef struct {
+	res_addr *tab;
+	unsigned char *side_res;  //per residue of s: 0 = neither partner, 1 or 2
+	unsigned char *side_at;   //the same, per atom of s
+	unsigned char *cls;       //IA_* per atom of s, for the partners' atoms
+	UV *map;                  //sub atom -> atom of s
+	UV *sub_first;            //per residue of s: its first atom in the sub arrays
+	NV *sx, *sy, *sz, *srad, *carea, *aarea;
+	unsigned char *ex, *other;
+	NV *h1x, *h1y, *h1z, *h2x, *h2y, *h2z;
+	UV *h1, *h2;              //heavy atoms of each partner, as atoms of s
+	UV *buf;
+	iface_touch *ct, *sb;
+	ring_t *rings;
+	NV *pts;
+	sasa_bins bins;
+	cell_grid g_all, g1, g2;
+	bool have_bins;
+} iface_work;
+
+static void iface_work_free(pTHX_ iface_work *CSP_RESTRICT w)
+{
+	Safefree(w->tab); Safefree(w->side_res); Safefree(w->side_at); Safefree(w->cls);
+	Safefree(w->map); Safefree(w->sub_first);
+	Safefree(w->sx); Safefree(w->sy); Safefree(w->sz); Safefree(w->srad);
+	Safefree(w->carea); Safefree(w->aarea); Safefree(w->ex); Safefree(w->other);
+	Safefree(w->h1x); Safefree(w->h1y); Safefree(w->h1z);
+	Safefree(w->h2x); Safefree(w->h2y); Safefree(w->h2z);
+	Safefree(w->h1); Safefree(w->h2); Safefree(w->buf);
+	Safefree(w->ct); Safefree(w->sb); Safefree(w->rings); Safefree(w->pts);
+	if (w->have_bins) sasa_bins_free(aTHX_ &w->bins);
+	grid_free(aTHX_ &w->g_all); grid_free(aTHX_ &w->g1); grid_free(aTHX_ &w->g2);
+	Zero(w, 1, iface_work);
+}
+
+//as set_free_cb(), for the same reason
+static void iface_work_free_cb(pTHX_ void *p)
+{
+	iface_work_free(aTHX_ (iface_work *)p);
+}
+
+/*iface_compute() -- the interface between two lists of residues of s.
+
+sides holds the two lists; each element must be a residue hash that set_build()
+walked into s, and a residue in both, or in neither list's structure, is an
+error the Perl has already ruled out and this only refuses.  Returns the hash
+the Perl finishes: the per-residue surfaces come back as arrays parallel to the
+two lists, and the residue pairs and atom pairs already carry the chain and
+residue keys a caller wants; no CSP_RESTRICT on sides, whose two elements are
+perl's arrays.  want_surface false leaves the surfaces out
+altogether -- no neighbour marking, no kernel, and no surface keys in the hash
+-- which is what sasa => 0 asks of the whole walk.*/
+static HV *iface_compute(pTHX_ structset *CSP_RESTRICT s, AV *sides[2], UV npts,
+                         bool want_surface, const iface_opt *CSP_RESTRICT io,
+                         const char *CSP_RESTRICT who)
+{
+	iface_work w;
+	HV *out;
+	AV *res_sasa[2], *res_alone[2], *contacts, *polar, *salt, *cpi, *bridge;
+	NV *res_c = NULL, *res_a = NULL;
+	UV n_sub = 0, n1 = 0, n_h1 = 0, n_h2 = 0, i, k, r, buf_cap = 0;
+	UV ct_cap = 0, sb_cap = 0, n_atom_contacts = 0;
+	NV reach = io->contact, min_d = 0.0;
+	NV sasa_c = 0.0, alone[2] = { 0.0, 0.0 }, bur_ap = 0.0, bur_po = 0.0;
+	NV bsum[2] = { 0.0, 0.0 }, bisum[2] = { 0.0, 0.0 }, bmean[2], bimean[2];
+	UV bn[2] = { 0, 0 }, bin[2] = { 0, 0 }, n_at[2] = { 0, 0 };
+	NV mass[2] = { 0.0, 0.0 }, com[2][3];
+	bool have_min = FALSE, have_b[2], have_bi[2];
+	unsigned short int sd;
+
+	if (io->salt > reach)      reach = io->salt;
+	if (io->polar > reach)     reach = io->polar;
+	if (io->water > reach)     reach = io->water;
+
+	ENTER;
+	Zero(&w, 1, iface_work);
+	SAVEDESTRUCTOR_X(iface_work_free_cb, &w);
+
+	//which residue of s each hash in the two lists is
+	Newx(w.tab, s->n_res ? s->n_res : 1, res_addr);
+	for (r = 0; r < s->n_res; r++) { w.tab[r].addr = PTR2UV(s->res_hv[r]); w.tab[r].res = r; }
+	qsort(w.tab, s->n_res, sizeof(res_addr), res_addr_cmp);
+	Newxz(w.side_res, s->n_res ? s->n_res : 1, unsigned char);
+	Newxz(w.side_at, s->n_atom ? s->n_atom : 1, unsigned char);
+	Newxz(res_c, s->n_res ? s->n_res : 1, NV);
+	SAVEFREEPV((char *)res_c);
+	Newxz(res_a, s->n_res ? s->n_res : 1, NV);
+	SAVEFREEPV((char *)res_a);
+	for (sd = 0; sd < 2; sd++) {
+		SSize_t e, ne = av_len(sides[sd]) + 1;
+		for (e = 0; e < ne; e++) {
+			SV **p = av_fetch(sides[sd], e, 0);
+			if (!p || !*p || !SvROK(*p) || SvTYPE(SvRV(*p)) != SVt_PVHV)
+				croak("%s: partner %u holds something that is not a residue", who,
+				      (unsigned int)sd + 1);
+			r = res_addr_find(w.tab, s->n_res, PTR2UV(SvRV(*p)), s->n_res);
+			if (r == s->n_res)
+				croak("%s: partner %u holds a residue that is not in this structure",
+				      who, (unsigned int)sd + 1);
+			if (w.side_res[r] && w.side_res[r] != sd + 1)
+				croak("%s: a residue is in both partners", who);
+			w.side_res[r] = (unsigned char)(sd + 1);
+		}
+	}
+
+	/*The two partners' atoms, partner 1 first, each in the order of s: so a
+	residue's atoms are still one run, and each partner is one range for the
+	kernel.*/
+	Newx(w.sub_first, s->n_res ? s->n_res : 1, UV);
+	for (sd = 1; sd <= 2; sd++)
+		for (r = 0; r < s->n_res; r++)
+			if (w.side_res[r] == sd) n_sub += s->res_last[r] - s->res_first[r];
+	Newx(w.map, n_sub ? n_sub : 1, UV);
+	Newx(w.sx, n_sub ? n_sub : 1, NV); Newx(w.sy, n_sub ? n_sub : 1, NV);
+	Newx(w.sz, n_sub ? n_sub : 1, NV); Newx(w.srad, n_sub ? n_sub : 1, NV);
+	Newxz(w.ex, n_sub ? n_sub : 1, unsigned char);
+	Newxz(w.other, n_sub ? n_sub : 1, unsigned char);
+	Newxz(w.cls, s->n_atom ? s->n_atom : 1, unsigned char);
+	k = 0;
+	for (sd = 1; sd <= 2; sd++) {
+		if (sd == 2) n1 = k;
+		for (r = 0; r < s->n_res; r++) {
+			if (w.side_res[r] != sd) continue;
+			w.sub_first[r] = k;
+			for (i = s->res_first[r]; i < s->res_last[r]; i++) {
+				w.map[k] = i;
+				w.sx[k] = s->x[i]; w.sy[k] = s->y[i]; w.sz[k] = s->z[i];
+				w.srad[k] = s->rad[i];
+				w.side_at[i] = (unsigned char)sd;
+				w.cls[i] = iface_class(aTHX_ s->atom_hv[i], s->res_one[r], s->res_type[r]);
+				k++;
+			}
+		}
+	}
+	n_at[0] = n1;
+	n_at[1] = n_sub - n1;
+
+	/*Which of the partners' atoms have a neighbour outside the complex (ex) and
+	which have one in the other partner (other), by the kernel's own test: a
+	neighbour is an atom whose sphere overlaps, d < ri + rj.*/
+	if (n_sub && want_surface) {
+		NV rmax = 0.0;
+		for (i = 0; i < s->n_atom; i++) if (s->rad[i] > rmax) rmax = s->rad[i];
+		grid_build(aTHX_ &w.g_all, s->x, s->y, s->z, s->n_atom, 2.0 * rmax);
+		for (k = 0; k < n_sub; k++) {
+			const UV a = w.map[k];
+			UV m = grid_within(aTHX_ &w.g_all, s->x, s->y, s->z, s->x[a], s->y[a], s->z[a],
+			                   2.0 * rmax, &w.buf, &buf_cap), q;
+			for (q = 0; q < m; q++) {
+				const UV j = w.buf[q];
+				NV dx, dy, dz, sum;
+				if (j == a) continue;
+				dx = s->x[j] - s->x[a]; dy = s->y[j] - s->y[a]; dz = s->z[j] - s->z[a];
+				sum = s->rad[a] + s->rad[j];
+				if (dx * dx + dy * dy + dz * dz >= sum * sum) continue;
+				if (w.side_at[j] == 0) w.ex[k] = 1;
+				else if (w.side_at[j] != w.side_at[a]) w.other[k] = 1;
+			}
+		}
+		grid_free(aTHX_ &w.g_all);
+	}
+
+	//the complex, then each partner alone
+	Newxz(w.carea, n_sub ? n_sub : 1, NV);
+	Newxz(w.aarea, n_sub ? n_sub : 1, NV);
+	if (n_sub && want_surface) {
+		sasa_aux only;
+		Newx(w.pts, npts * 3, NV);
+		sasa_sphere(w.pts, npts);
+		sasa_bins_build(aTHX_ &w.bins, w.pts, npts);
+		w.have_bins = TRUE;
+		Zero(&only, 1, sasa_aux);
+		if (s->area) {
+			for (k = 0; k < n_sub; k++) w.carea[k] = s->area[w.map[k]];
+			only.only = w.ex;
+			sasa_kernel(aTHX_ w.sx, w.sy, w.sz, w.srad, n_sub, &w.bins, npts, w.carea, &only);
+		} else {
+			sasa_kernel(aTHX_ w.sx, w.sy, w.sz, w.srad, n_sub, &w.bins, npts, w.carea, NULL);
+		}
+		Copy(w.carea, w.aarea, n_sub, NV);
+		only.only = w.other;
+		if (n1)
+			sasa_kernel(aTHX_ w.sx, w.sy, w.sz, w.srad, n1, &w.bins, npts, w.aarea, &only);
+		only.only = w.other + n1;
+		if (n_sub > n1)
+			sasa_kernel(aTHX_ w.sx + n1, w.sy + n1, w.sz + n1, w.srad + n1, n_sub - n1,
+			            &w.bins, npts, w.aarea + n1, &only);
+	}
+	for (k = 0; k < n_sub; k++) {
+		const UV a = w.map[k];
+		const NV b = w.aarea[k] - w.carea[k];
+		sasa_c += w.carea[k];
+		alone[k < n1 ? 0 : 1] += w.aarea[k];
+		if (s->apolar[a]) bur_ap += b; else bur_po += b;
+	}
+	for (r = 0; r < s->n_res; r++) {
+		UV f, l;
+		if (!w.side_res[r]) continue;
+		f = w.sub_first[r];
+		l = f + (s->res_last[r] - s->res_first[r]);
+		for (k = f; k < l; k++) { res_c[r] += w.carea[k]; res_a[r] += w.aarea[k]; }
+	}
+
+	//the heavy atoms of each partner, for everything that follows
+	Newx(w.h1, n_sub ? n_sub : 1, UV); Newx(w.h2, n_sub ? n_sub : 1, UV);
+	for (k = 0; k < n_sub; k++) {
+		const UV a = w.map[k];
+		if (!(w.cls[a] & IA_HEAVY)) continue;
+		if (k < n1) w.h1[n_h1++] = a; else w.h2[n_h2++] = a;
+	}
+	Newx(w.h1x, n_h1 ? n_h1 : 1, NV); Newx(w.h1y, n_h1 ? n_h1 : 1, NV);
+	Newx(w.h1z, n_h1 ? n_h1 : 1, NV);
+	Newx(w.h2x, n_h2 ? n_h2 : 1, NV); Newx(w.h2y, n_h2 ? n_h2 : 1, NV);
+	Newx(w.h2z, n_h2 ? n_h2 : 1, NV);
+	for (k = 0; k < n_h1; k++) { w.h1x[k] = s->x[w.h1[k]]; w.h1y[k] = s->y[w.h1[k]]; w.h1z[k] = s->z[w.h1[k]]; }
+	for (k = 0; k < n_h2; k++) { w.h2x[k] = s->x[w.h2[k]]; w.h2y[k] = s->y[w.h2[k]]; w.h2z[k] = s->z[w.h2[k]]; }
+	grid_build(aTHX_ &w.g1, w.h1x, w.h1y, w.h1z, n_h1, reach);
+	grid_build(aTHX_ &w.g2, w.h2x, w.h2y, w.h2z, n_h2, reach);
+
+	/*Across the gap: every side-1 heavy atom against the side-2 heavy atoms
+	within reach, residue by residue so that each side-1 residue's partners
+	are gathered and written out before the next one starts.  Partner 1's heavy
+	atoms were gathered in the order of s, so a residue's are one run.*/
+	contacts = newAV(); sv_2mortal((SV *)contacts);
+	polar    = newAV(); sv_2mortal((SV *)polar);
+	salt     = newAV(); sv_2mortal((SV *)salt);
+	{
+		UV lo = 0;
+		while (lo < n_h1) {
+			UV hi = lo, n_ct = 0, n_sb = 0, q, res1;
+			res1 = res_of_atom(s, w.h1[lo]);
+			while (hi < n_h1 && w.h1[hi] < s->res_last[res1]) hi++;
+			for (i = lo; i < hi; i++) {
+				const UV a = w.h1[i];
+				const UV m = grid_within(aTHX_ &w.g2, w.h2x, w.h2y, w.h2z,
+				                         s->x[a], s->y[a], s->z[a], reach, &w.buf, &buf_cap);
+				for (q = 0; q < m; q++) {
+					const UV b = w.h2[w.buf[q]];
+					NV dx = s->x[b] - s->x[a], dy = s->y[b] - s->y[a], dz = s->z[b] - s->z[a];
+					const NV d2 = dx * dx + dy * dy + dz * dz;
+					const NV d = nv_sqrt(d2);
+					UV res2;
+					if (!have_min || d < min_d) { min_d = d; have_min = TRUE; }
+					res2 = res_of_atom(s, b);
+					if (d2 < io->contact * io->contact) {
+						n_atom_contacts++;
+						w.cls[a] |= IA_IFACE;
+						w.cls[b] |= IA_IFACE;
+						touch_note(aTHX_ &w.ct, &n_ct, &ct_cap, res2, d, a, b);
+					}
+					if (d2 < io->polar * io->polar && (w.cls[a] & IA_POLAR) && (w.cls[b] & IA_POLAR)) {
+						HV *h = iface_pair(aTHX_ s->res_hv[res1], s->res_hv[res2], d);
+						(void)hv_stores(h, "atom1", iface_name(aTHX_ s->atom_hv[a]));
+						(void)hv_stores(h, "atom2", iface_name(aTHX_ s->atom_hv[b]));
+						(void)hv_stores(h, "backbone1", newSViv((w.cls[a] & IA_BACKBONE) ? 1 : 0));
+						(void)hv_stores(h, "backbone2", newSViv((w.cls[b] & IA_BACKBONE) ? 1 : 0));
+						av_push(polar, newRV_noinc((SV *)h));
+					}
+					if (d2 < io->salt * io->salt
+					    && (((w.cls[a] & IA_CATION) && (w.cls[b] & IA_ANION))
+					        || ((w.cls[a] & IA_ANION) && (w.cls[b] & IA_CATION))))
+						touch_note(aTHX_ &w.sb, &n_sb, &sb_cap, res2, d, a, b);
+				}
+			}
+			for (q = 0; q < n_ct; q++)
+				av_push(contacts, newRV_noinc((SV *)iface_pair(aTHX_ s->res_hv[res1],
+				                                                s->res_hv[w.ct[q].res], w.ct[q].d)));
+			for (q = 0; q < n_sb; q++) {
+				HV *h = iface_pair(aTHX_ s->res_hv[res1], s->res_hv[w.sb[q].res], w.sb[q].d);
+				(void)hv_stores(h, "atom1", iface_name(aTHX_ s->atom_hv[w.sb[q].a1]));
+				(void)hv_stores(h, "atom2", iface_name(aTHX_ s->atom_hv[w.sb[q].a2]));
+				av_push(salt, newRV_noinc((SV *)h));
+			}
+			lo = hi;
+		}
+	}
+
+	/*Cation-pi: every LYS NZ and ARG CZ against every PHE, TYR and TRP ring
+	of the other partner.  A few dozen of each at an interface, so the pairs
+	are simply all tried; one entry per cation and ring residue, at the
+	nearest ring, so a tryptophan's two rings are one aromatic residue.*/
+	cpi = newAV(); sv_2mortal((SV *)cpi);
+	{
+		UV nr = rings_find(aTHX_ s, &w.rings), q;
+		for (r = 0; r < s->n_res; r++) {
+			const char one = s->res_one[r];
+			NV px, py, pz;
+			HV *atoms;
+			UV t;
+			if (!w.side_res[r] || s->res_type[r] != RT_AA || (one != 'K' && one != 'R')) continue;
+			atoms = hvf_hv(aTHX_ s->res_hv[r], "atoms", 5);
+			if (!atoms || !atom_xyz(aTHX_ atoms, one == 'K' ? "NZ" : "CZ", &px, &py, &pz)) continue;
+			/*nearest ring per aromatic residue: rings of one residue are
+			consecutive in what rings_find() returns*/
+			for (q = 0; q < nr; q = t) {
+				const UV rres = w.rings[q].res;
+				NV best = -1.0;
+				const char ro = s->res_one[rres];
+				for (t = q; t < nr && w.rings[t].res == rres; t++) {
+					NV dx = w.rings[t].cx - px, dy = w.rings[t].cy - py, dz = w.rings[t].cz - pz;
+					NV d = nv_sqrt(dx * dx + dy * dy + dz * dz);
+					if (best < 0.0 || d < best) best = d;
+				}
+				if (!w.side_res[rres] || w.side_res[rres] == w.side_res[r]) continue;
+				if (s->res_type[rres] != RT_AA || (ro != 'F' && ro != 'Y' && ro != 'W')) continue;
+				if (!(best < io->cation_pi)) continue;
+				{
+					const bool first = w.side_res[r] == 1;
+					HV *h = iface_pair(aTHX_ s->res_hv[first ? r : rres],
+					                   s->res_hv[first ? rres : r], best);
+					(void)hv_stores(h, "cation", newSVuv(first ? 1 : 2));
+					av_push(cpi, newRV_noinc((SV *)h));
+				}
+			}
+		}
+	}
+
+	//waters that reach both partners
+	bridge = newAV(); sv_2mortal((SV *)bridge);
+	for (r = 0; r < s->n_res; r++) {
+		bool t1 = FALSE, t2 = FALSE;
+		if (s->res_type[r] != RT_WATER || w.side_res[r]) continue;
+		for (i = s->res_first[r]; i < s->res_last[r] && !(t1 && t2); i++) {
+			if (atom_is_h(aTHX_ s->atom_hv[i])) continue;
+			if (!t1 && grid_within(aTHX_ &w.g1, w.h1x, w.h1y, w.h1z, s->x[i], s->y[i], s->z[i],
+			                       io->water, &w.buf, &buf_cap)) t1 = TRUE;
+			if (!t2 && grid_within(aTHX_ &w.g2, w.h2x, w.h2y, w.h2z, s->x[i], s->y[i], s->z[i],
+			                       io->water, &w.buf, &buf_cap)) t2 = TRUE;
+		}
+		if (t1 && t2) {
+			HV *h = newHV();
+			pi_field(aTHX_ h, "chain", 5, s->res_hv[r], "chain", 5);
+			pi_field(aTHX_ h, "residue", 7, s->res_hv[r], "key", 3);
+			av_push(bridge, newRV_noinc((SV *)h));
+		}
+	}
+
+	//centres of mass, and the B-factors of each partner and of its interface
+	Zero(com, 1, NV[2][3]);
+	for (k = 0; k < n_sub; k++) {
+		const UV a = w.map[k];
+		const unsigned short int p = k < n1 ? 0 : 1;
+		mass[p] += s->mass[a];
+		com[p][0] += s->mass[a] * s->x[a];
+		com[p][1] += s->mass[a] * s->y[a];
+		com[p][2] += s->mass[a] * s->z[a];
+		if (w.cls[a] & IA_HEAVY) {
+			SV *bs = hvf_sv(aTHX_ s->atom_hv[a], "bfactor", 7);
+			if (bs && looks_like_number(bs)) {
+				const NV b = SvNV(bs);
+				bsum[p] += b; bn[p]++;
+				if (w.cls[a] & IA_IFACE) { bisum[p] += b; bin[p]++; }
+			}
+		}
+	}
+	for (sd = 0; sd < 2; sd++) {
+		have_b[sd]  = bn[sd] > 0;
+		have_bi[sd] = bin[sd] > 0;
+		bmean[sd]  = have_b[sd]  ? bsum[sd] / (NV)bn[sd]   : 0.0;
+		bimean[sd] = have_bi[sd] ? bisum[sd] / (NV)bin[sd] : 0.0;
+	}
+
+	for (sd = 0; sd < 2; sd++) {
+		SSize_t e, ne = av_len(sides[sd]) + 1;
+		res_sasa[sd]  = newAV(); sv_2mortal((SV *)res_sasa[sd]);
+		res_alone[sd] = newAV(); sv_2mortal((SV *)res_alone[sd]);
+		for (e = 0; e < ne; e++) {
+			SV **p = av_fetch(sides[sd], e, 0);
+			r = res_addr_find(w.tab, s->n_res, PTR2UV(SvRV(*p)), s->n_res);
+			av_push(res_sasa[sd],  newSVnv(res_c[r]));
+			av_push(res_alone[sd], newSVnv(res_a[r]));
+		}
+	}
+
+	//built last, so that nothing between here and the return can croak with it
+	//half-filled and unreferenced
+	out = newHV();
+	{
+		AV *na = newAV(), *al = newAV(), *rs = newAV(), *ra = newAV();
+		av_push(na, newSVuv(n_at[0])); av_push(na, newSVuv(n_at[1]));
+		av_push(al, newSVnv(alone[0])); av_push(al, newSVnv(alone[1]));
+		for (sd = 0; sd < 2; sd++) {
+			av_push(rs, newRV_inc((SV *)res_sasa[sd]));
+			av_push(ra, newRV_inc((SV *)res_alone[sd]));
+		}
+		(void)hv_stores(out, "n_atoms", newRV_noinc((SV *)na));
+		if (want_surface) {
+			(void)hv_stores(out, "sasa_alone", newRV_noinc((SV *)al));
+			(void)hv_stores(out, "residue_sasa", newRV_noinc((SV *)rs));
+			(void)hv_stores(out, "residue_sasa_alone", newRV_noinc((SV *)ra));
+		} else {
+			SvREFCNT_dec((SV *)al);
+			SvREFCNT_dec((SV *)rs);
+			SvREFCNT_dec((SV *)ra);
+		}
+	}
+	if (want_surface) {
+		(void)hv_stores(out, "sasa_complex", newSVnv(sasa_c));
+		(void)hv_stores(out, "buried_apolar", newSVnv(bur_ap));
+		(void)hv_stores(out, "buried_polar", newSVnv(bur_po));
+	}
+	(void)hv_stores(out, "contacts", newRV_inc((SV *)contacts));
+	(void)hv_stores(out, "n_atom_contacts", newSVuv(n_atom_contacts));
+	(void)hv_stores(out, "polar_contacts", newRV_inc((SV *)polar));
+	(void)hv_stores(out, "salt_bridges", newRV_inc((SV *)salt));
+	(void)hv_stores(out, "cation_pi", newRV_inc((SV *)cpi));
+	(void)hv_stores(out, "bridging_waters", newRV_inc((SV *)bridge));
+	/*the closest two heavy atoms come a pair apart, and only a pair within
+	reach is ever measured: partners further apart than that have no
+	min_distance rather than a wrong one*/
+	if (have_min) (void)hv_stores(out, "min_distance", newSVnv(min_d));
+	if (mass[0] > 0.0 && mass[1] > 0.0) {
+		NV dx = com[0][0] / mass[0] - com[1][0] / mass[1];
+		NV dy = com[0][1] / mass[0] - com[1][1] / mass[1];
+		NV dz = com[0][2] / mass[0] - com[1][2] / mass[1];
+		(void)hv_stores(out, "com_distance", newSVnv(nv_sqrt(dx * dx + dy * dy + dz * dz)));
+	}
+	(void)hv_stores(out, "bfactor_mean", pair_av(aTHX_ bmean, have_b));
+	(void)hv_stores(out, "bfactor_interface", pair_av(aTHX_ bimean, have_bi));
+	LEAVE;
+	return out;
+}
+
 //an option that is a number, with the default the caller wrote down
 static NV opt_nv(pTHX_ HV *CSP_RESTRICT o, const char *CSP_RESTRICT k, NV dflt)
 {
@@ -6684,6 +7345,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	HV *out;
 	HV *sasa_hv = NULL, *ssq = NULL;
 	AV *pi = NULL, *ss = NULL, *bp = NULL, *bs = NULL, *cont = NULL, *hb = NULL;
+	HV *iface = NULL;
 	const bool want_sasa  = opt_bool(aTHX_ o, "sasa", TRUE);
 	const bool want_iface = opt_bool(aTHX_ o, "interface", TRUE);
 	const bool want_shape = opt_bool(aTHX_ o, "shape", TRUE);
@@ -6852,6 +7514,39 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	}
 	if (want_hse && store) hse_compute(aTHX_ &s, CSP_HSE_RADIUS);
 
+	/*The two partners, when the Perl found or was told of two: `sides' is
+	the Perl's own key, holding the two residue lists, and never an option a
+	caller writes.  Run after the whole-structure surface, which it starts
+	from.*/
+	if (want_iface) {
+		AV *sd = hvf_av(aTHX_ o, "sides", 5);
+		if (sd && av_len(sd) == 1) {
+			SV **p0 = av_fetch(sd, 0, 0), **p1 = av_fetch(sd, 1, 0);
+			AV *two[2];
+			iface_opt io;
+			if (!p0 || !*p0 || !SvROK(*p0) || SvTYPE(SvRV(*p0)) != SVt_PVAV
+			    || !p1 || !*p1 || !SvROK(*p1) || SvTYPE(SvRV(*p1)) != SVt_PVAV)
+				croak("%s: sides must be two array references", who);
+			two[0] = (AV *)SvRV(*p0);
+			two[1] = (AV *)SvRV(*p1);
+			io.contact   = opt_nv(aTHX_ o, "interface_distance", 5.5);
+			io.salt      = opt_nv(aTHX_ o, "salt_bridge_distance", 4.0);
+			io.polar     = opt_nv(aTHX_ o, "polar_distance", 3.5);
+			io.cation_pi = opt_nv(aTHX_ o, "cation_pi_distance", 6.0);
+			io.water     = opt_nv(aTHX_ o, "water_distance", 3.5);
+			if (io.contact <= 0.0 || io.salt <= 0.0 || io.polar <= 0.0
+			    || io.cation_pi <= 0.0 || io.water <= 0.0)
+				croak("%s: the interface distances must be positive numbers", who);
+			/*sasa => 0 is a request for no surface, and the interface's is
+			one; interface_sasa is the Perl's own key, set by
+			structure_interface(), which wants the interface's surface
+			without paying for the whole structure's*/
+			iface = iface_compute(aTHX_ &s, two, (UV)points,
+			                      opt_bool(aTHX_ o, "interface_sasa", want_sasa), &io, who);
+			sv_2mortal((SV *)iface);
+		}
+	}
+
 	if (want_ss) {
 		const NV cut = opt_nv(aTHX_ o, "disulfide_distance", 3.0);
 		if (cut < 0.0) croak("%s: disulfide_distance must not be negative", who);
@@ -6948,6 +7643,7 @@ static HV *features_do(pTHX_ HV *CSP_RESTRICT info, HV *CSP_RESTRICT o,
 	if (want_cont) (void)hv_stores(out, "contacts", newRV_inc((SV *)cont));
 	if (want_hb) (void)hv_stores(out, "hbonds", newRV_inc((SV *)hb));
 	if (want_ssq) (void)hv_stores(out, "dssp", newRV_inc((SV *)ssq));
+	if (iface) (void)hv_stores(out, "interface", newRV_inc((SV *)iface));
 	LEAVE;
 	return out;
 }

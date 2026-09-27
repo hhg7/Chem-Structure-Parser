@@ -19,7 +19,7 @@ our @EXPORT_OK = qw(
 	chain_sequence structure_summary is_single_ion
 	structure_features structure_sasa structure_pi_stacking structure_disulfides
 	structure_base_pairs structure_base_stacks structure_contacts structure_hbonds
-	structure_dssp structure_rmsd
+	structure_dssp structure_interface structure_rmsd
 	aa3to1 aa1to3 res1 res_type formats h
 );
 our @EXPORT = @EXPORT_OK;
@@ -89,6 +89,7 @@ my %DEFAULT = (
 	chains    => undef,   # arrayref: read only these chains
 	format    => undef,   # override format detection
 	dssp      => 0,       # also put the secondary structure roll-up at $info->{dssp}
+	partners  => undef,   # the two sides of the interface feature; undef = worked out
 );
 
 # residues that need no explanation.  Everything else that res_type() calls an
@@ -421,6 +422,65 @@ my %GC     = map { $_ => 1 } qw(C G);
 # one; it is the same five-letter denominator with a different numerator.
 my %PURINE = map { $_ => 1 } qw(A G);
 
+# PRODIGY's residue classes and relative-surface denominators, copied from
+# prodigy_prot/modules/aa_properties.py of prodigy-prot 2.4.0 (Vangone, A and
+# Bonvin, A M J J (2015) eLife 4:e07454), which is what the interface's ic,
+# nis and prodigy figures are compared against.  Two tables of classes because
+# PRODIGY has two: aa_character_ic sorts the residues of a contact, and calls
+# cysteine and tyrosine apolar and histidine charged; aa_character_protorp
+# sorts the non-interacting surface, and calls all three polar.  A = apolar,
+# C = charged, P = polar.
+my %IC_CLASS = (
+	ALA => 'A', CYS => 'A', GLU => 'C', ASP => 'C', GLY => 'A', PHE => 'A',
+	ILE => 'A', HIS => 'C', LYS => 'C', MET => 'A', LEU => 'A', ASN => 'P',
+	GLN => 'P', PRO => 'A', SER => 'P', ARG => 'C', THR => 'P', TRP => 'A',
+	VAL => 'A', TYR => 'A',
+);
+my %NIS_CLASS = (
+	ALA => 'A', CYS => 'P', GLU => 'C', ASP => 'C', GLY => 'A', PHE => 'A',
+	ILE => 'A', HIS => 'P', LYS => 'C', MET => 'A', LEU => 'A', ASN => 'P',
+	GLN => 'P', PRO => 'A', SER => 'P', ARG => 'C', THR => 'P', TRP => 'P',
+	VAL => 'A', TYR => 'P',
+);
+# rel_asa{total}: NACCESS's surface of each residue in an extended ALA-X-ALA
+# peptide, angstrom^2.  Not the max_asa[] the residues' own rsa divides by
+# (Tien et al. 2013): the non-interacting surface is PRODIGY's, and the 5%
+# threshold it applies was fitted with these.
+my %NACCESS_REL = (
+	ALA => 107.95, CYS => 134.28, ASP => 140.39, GLU => 172.25, PHE => 199.48,
+	GLY =>  80.10, HIS => 182.88, ILE => 175.12, LYS => 200.81, LEU => 178.63,
+	MET => 194.15, ASN => 143.94, PRO => 136.13, GLN => 178.50, ARG => 238.76,
+	SER => 116.50, THR => 139.27, VAL => 151.44, TRP => 249.36, TYR => 212.76,
+);
+# the pair of contact classes, sorted as PRODIGY's analyse_contacts() sorts
+# them, and the name it comes back under
+my %IC_BIN = (
+	AA => 'apolar_apolar',  CC => 'charged_charged', PP => 'polar_polar',
+	AC => 'charged_apolar', AP => 'apolar_polar',    CP => 'charged_polar',
+);
+# PRODIGY's IC_NIS model, prodigy_prot/modules/models.py of prodigy-prot 2.4.0:
+# the coefficients of the contact counts and of the non-interacting surface
+# percentages, and the intercept, kcal/mol.  R is dg_to_kd()'s, in
+# prodigy_prot/modules/utils.py, kcal/(mol K).
+my %PRODIGY = (
+	charged_charged => -0.09459, charged_apolar => -0.10007,
+	polar_polar     =>  0.19577, apolar_polar   => -0.22671,
+	nis_apolar      =>  0.18681, nis_charged    =>  0.13810,
+	intercept       => -15.9433,
+);
+my $PRODIGY_R = 0.0019858775;
+
+# The pK values of Bjellqvist et al. (1993) Electrophoresis 14:1023-31 and
+# (1994) 15:529-39, as Bio/SeqUtils/IsoelectricPoint.py of Biopython 1.87
+# writes them: the side chains, and the termini with the residue-specific
+# values that replace the default one when that residue is at the end.  In
+# Biopython's order, which is the order the partial charges are added up in,
+# so that the sum is the same NV.
+my @PK_POS = ([ Nterm => 7.5 ], [ K => 10.0 ], [ R => 12.0 ], [ H => 5.98 ]);
+my @PK_NEG = ([ Cterm => 3.55 ], [ D => 4.05 ], [ E => 4.45 ], [ C => 9.0 ], [ Y => 10.0 ]);
+my %PK_NTERM = (A => 7.59, M => 7.0, S => 6.93, P => 8.36, T => 6.82, V => 7.44, E => 7.7);
+my %PK_CTERM = (D => 4.55, E => 4.75);
+
 # The options the three feature functions take, with what they mean and what
 # they default to.  This table is the one place the defaults are written down:
 # the XS carries the same numbers as a fallback, and never sees it, because
@@ -493,6 +553,30 @@ my %FEATURE_DEFAULT = (
 	# rather than a threshold, and are constants in Parser.xs.
 	base_stack_distance => 5.0, # angstrom: the furthest apart two centres of mass may be
 	base_stack_omega    => 50,  # degrees: the largest overlap angle that is a stack
+	# The two sides of the interface: undef to have them worked out, or two
+	# lists of chain ids and ligand keys.  See _partners().
+	partners             => undef,
+	# the contact cutoff of PRODIGY's calculate_ic() in prodigy-prot 2.4.0,
+	# d_cutoff, which the ic counts and the prodigy estimate were fitted with
+	interface_distance   => 5.5, # angstrom
+	# Barlow and Thornton (1983) J Mol Biol 168:867-85: a salt bridge is a
+	# charged N and a charged O within 4 A
+	salt_bridge_distance => 4.0, # angstrom
+	# the heavy-atom hydrogen-bond criterion of features.pdb.20260806.py's
+	# HBOND_DA_CUTOFF_NM, for structures that have no hydrogens to measure
+	polar_distance       => 3.5, # angstrom
+	# Gallivan and Dougherty (1999) PNAS 96:9459-64's distance filter, cation
+	# to ring centroid
+	cation_pi_distance   => 6.0, # angstrom
+	# the first hydration shell of features.pdb.20260806.py's
+	# WATER_CONTACT_NM, which a bridging water reaches on both sides
+	water_distance       => 3.5, # angstrom
+	# PRODIGY's analyse_nis() acc_threshold: a residue is on the surface when
+	# at least this fraction of its NACCESS reference area is exposed
+	nis_threshold        => 0.05,
+	# degrees Celsius, for turning the prodigy estimate into a Kd; PRODIGY's
+	# default
+	temperature          => 25,
 );
 
 # which of those each function takes.  A geometry threshold passed to
@@ -510,6 +594,10 @@ my @BS_OPT   = qw(store base_stack_distance base_stack_omega);
 my @TORS_OPT = qw(store peptide_bond phosphodiester_bond);
 my @CONT_OPT = qw(store contact_distance);
 my @HB_OPT   = qw(peptide_bond);
+my @IFACE_OPT = qw(
+	partners interface_distance salt_bridge_distance polar_distance
+	cation_pi_distance water_distance nis_threshold temperature probe points
+);
 
 # The options that are a switch, in either table.  undef is a false value and
 # means off, which is what the caller who wrote hydrogens => $keep with $keep
@@ -579,6 +667,17 @@ sub _feature_options {
 	  . "not '$o{base_stack_omega}'"
 		unless $o{base_stack_omega} =~ /\A[0-9]*\.?[0-9]+\z/
 		    && $o{base_stack_omega} <= 180;
+	for my $k (qw(interface_distance salt_bridge_distance polar_distance
+	              cation_pi_distance water_distance)) {
+		die "$who: $k must be a positive number, not '$o{$k}'"
+			unless $o{$k} =~ /\A[0-9]*\.?[0-9]+\z/ && $o{$k} > 0;
+	}
+	die "$who: nis_threshold must be a number between 0 and 1, not '$o{nis_threshold}'"
+		unless $o{nis_threshold} =~ /\A[0-9]*\.?[0-9]+\z/ && $o{nis_threshold} <= 1;
+	# absolute zero, below which there is no Kd to speak of
+	die "$who: temperature must be a number of degrees Celsius above -273.15, "
+	  . "not '$o{temperature}'"
+		unless $o{temperature} =~ /\A-?[0-9]*\.?[0-9]+\z/ && $o{temperature} > -273.15;
 	return \%o;
 }
 
@@ -587,14 +686,30 @@ sub _feature_options {
 # $info->{features} holds, and so what the wrappers can hand back without doing
 # the work a second time.
 sub _all_features {
-	my ($info, $who) = @_;
-	my $o = _feature_options({}, $who,
+	my ($info, $who, $partners) = @_;
+	my $o = _feature_options({ (defined $partners ? (partners => $partners) : ()) }, $who,
 		[ qw(sasa pi_stacking disulfides base_pairs base_stacks shape dihedrals
 		     contacts exposure hbonds secondary),
 		  @SASA_OPT, @PI_OPT, @SS_OPT, @BP_OPT, @BS_OPT, @TORS_OPT, @CONT_OPT,
-		  @HB_OPT ]);
+		  @HB_OPT, @IFACE_OPT ]);
+	return _features_and_after($info, $o, $who);
+}
+
+# _features_and_after($info, \%o, $who) -- the XS walk, and what the Perl
+# makes of it afterwards: the interface is finished and the sequence and
+# secondary-structure roll-ups are added.  The partners are worked out first,
+# because they are what the walk is handed.
+sub _features_and_after {
+	my ($info, $o, $who) = @_;
+	my $sides;
+	if ($o->{interface}) {
+		$sides = _partners($info, $o->{partners}, $who);
+		$o = { %$o, sides => [ $sides->{residues}[0], $sides->{residues}[1] ] } if $sides;
+	}
 	my $f = _features($info, $o, $who);
-	_sequence_features($info, $f, 1);
+	_finish_interface($info, $f, $o, $sides) if $f->{interface};
+	_sequence_features($info, $f, $o->{store});
+	_secondary_fractions($info, $f, $o->{store});
 	return $f;
 }
 
@@ -612,10 +727,39 @@ sub structure_features {
 		[ qw(sasa pi_stacking disulfides base_pairs base_stacks shape dihedrals
 		     contacts exposure hbonds secondary),
 		  @SASA_OPT, @PI_OPT, @SS_OPT, @BP_OPT, @BS_OPT, @TORS_OPT, @CONT_OPT,
-		  @HB_OPT ]);
-	my $f = _features($info, $o, 'structure_features');
-	_sequence_features($info, $f, $o->{store});
-	return $f;
+		  @HB_OPT, @IFACE_OPT ]);
+	return _features_and_after($info, $o, 'structure_features');
+}
+
+# structure_interface($info, %opt) -- what two partners of a complex have
+# between them.
+#
+# A lookup when structure_info() found two partners and no option is named, as
+# the other wrappers are.  Otherwise the interface alone is computed, with the
+# rest of the features off: the surface of the complex is then run whole
+# rather than started from the whole structure's, which is the one thing the
+# rest of the walk would have saved it.
+sub structure_interface {
+	my ($info, %opt) = @_;
+	_check_info($info, 'structure_interface');
+	if (!%opt && $info->{features}) {
+		return $info->{features}{interface} if $info->{features}{interface};
+		die 'structure_interface: this structure has no two partners to split: '
+		  . 'name them with partners => [ [...], [...] ]';
+	}
+	my $o = _feature_options(\%opt, 'structure_interface', \@IFACE_OPT);
+	$o->{$_} = 0 for qw(sasa pi_stacking disulfides base_pairs base_stacks shape
+	                    dihedrals contacts exposure hbonds secondary store);
+	$o->{interface} = 1;
+	# the interface's own surface, which sasa => 0 would otherwise switch off
+	# with the whole structure's
+	$o->{interface_sasa} = 1;
+	my $sides = _partners($info, $o->{partners}, 'structure_interface')
+		or die 'structure_interface: this structure has no two partners to split: '
+		     . 'name them with partners => [ [...], [...] ]';
+	$o->{sides} = [ $sides->{residues}[0], $sides->{residues}[1] ];
+	my $f = _features($info, $o, 'structure_interface');
+	return _finish_interface($info, $f, $o, $sides);
 }
 
 # structure_sasa($info, %opt) -- the solvent-accessible surface, and nothing else.
@@ -956,6 +1100,7 @@ sub _sequence_features {
 	my ($info, $f, $store) = @_;
 	my ($sum, $scored, $arom, $len) = (0, 0, 0, 0);
 	my ($gc, $pur, $counted, $nlen) = (0, 0, 0, 0);
+	my ($charge, $n_charged) = (0, 0);
 	my %bases;
 	for my $cid (@{ $info->{chain_order} }) {
 		my $c = $info->{chains}{$cid};
@@ -996,14 +1141,23 @@ sub _sequence_features {
 		$scored += $cn;
 		$arom   += $ca;
 		$len    += length $seq;
+		my ($q, $pi) = _charge_and_pi($seq);
+		$charge += $q;
+		$n_charged++;
 		next unless $store;
 		$c->{hydropathy}        = $csum / $cn if $cn;
 		$c->{aromatic_fraction} = $ca / length $seq;
+		$c->{charge}            = $q;
+		$c->{isoelectric_point} = $pi;
 	}
 	$f->{hydropathy}        = $sum / $scored if $scored;
 	$f->{aromatic_fraction} = $arom / $len   if $len;
 	$f->{n_aromatic}        = $arom;
 	$f->{sequence_length}   = $len;
+	# the sum of the protein chains' net charges at pH 7, each chain its own
+	# molecule with its own two termini; there is no isoelectric point of the
+	# whole, since a complex does not focus as one sequence
+	$f->{charge}            = $charge if $n_charged;
 	# the nucleic half, and only when there is one: a structure with no nucleic
 	# acid in it gets no gc_fraction rather than a zero that would read as a
 	# chain of nothing but A and T
@@ -1015,6 +1169,315 @@ sub _sequence_features {
 		$f->{base_counts}       = \%bases;
 	}
 	return $f;
+}
+
+# _partners($info, $spec, $who) -- the two sides of the interface, as residues.
+#
+# $spec is what the caller wrote -- two entries, each a chain id, a ligand key
+# as structure_ligands() writes it (NAME_CHAIN_NUMBER), or a list of those --
+# or undef, and then the split is worked out:
+#
+#   two or more polymer chains   the shortest against all the others, which is
+#                                a peptide against its receptor; a tie goes to
+#                                the chain later in the file
+#   one polymer chain            the ligand with the most heavy atoms against
+#                                it; a tie goes to the one earlier in the file
+#   neither                      no interface, and undef back
+#
+# which is a guess, and says so in the documentation: an antibody's two chains
+# against an antigen, or a drug against a protein that also holds a glycerol
+# molecule bigger than it, is a structure whose partners have to be named.
+#
+# A chain named as a partner is its amino acids and nucleotides, modified ones
+# included, and nothing else in it: a ligand, an ion or a water that happens to
+# carry the chain's letter is not part of the polymer, and a cap or cofactor
+# that should be is named by its key alongside the chain.  PRODIGY takes the
+# chain without its HETATM residues at all, which is the same thing for the
+# twenty standard residues it accepts.
+#
+# Returns { partners => [ [names], [names] ], residues => [ [hashes], [hashes] ] }.
+sub _partners {
+	my ($info, $spec, $who) = @_;
+	my $chains = $info->{chains} || {};
+	my @order  = @{ $info->{chain_order} || [] };
+	my %poly_type = (amino_acid => 1, nucleotide => 1);
+	# A chain's amino acids and nucleotides, and the residues the table does
+	# not know that are peptide-bonded into them: an ACE or NH2 cap, or a
+	# non-standard amino acid such as 3fe7's PM3, is part of the peptide it
+	# caps, and a drug that only shares the chain's letter is not.  Bonded is
+	# gemmi's test, as _bonded() applies it, asked of each such residue and the
+	# residues either side of it in the chain until nothing more joins.
+	my $polymer = sub {
+		my ($cid) = @_;
+		my $c = $chains->{$cid};
+		my @res = map { $c->{residues}{$_} } @{ $c->{residue_order} };
+		my @in = map { $poly_type{ $_->{type} || '' } ? 1 : 0 } @res;
+		my $grew = 1;
+		while ($grew) {
+			$grew = 0;
+			for my $k (0 .. $#res) {
+				next if $in[$k] || ($res[$k]{type} || '') ne 'ligand';
+				next unless ($k > 0 && $in[$k - 1] && _peptide_linked($res[$k - 1], $res[$k]))
+				         || ($k < $#res && $in[$k + 1] && _peptide_linked($res[$k], $res[$k + 1]));
+				$in[$k] = $grew = 1;
+			}
+		}
+		return [ map { $res[$_] } grep { $in[$_] } 0 .. $#res ];
+	};
+	my (@names, @res);
+	if (defined $spec) {
+		die "$who: partners must be an array reference of two partners"
+			unless (reftype($spec) || '') eq 'ARRAY' && @$spec == 2;
+		my $lig;
+		for my $i (0, 1) {
+			my @want = ref $spec->[$i] ? @{ $spec->[$i] } : ($spec->[$i]);
+			die "$who: partner " . ($i + 1) . ' is empty' unless @want;
+			for my $w (@want) {
+				die "$who: partner " . ($i + 1) . ' names an undefined chain or ligand'
+					unless defined $w;
+				if ($chains->{$w}) {
+					my $r = $polymer->($w);
+					die "$who: chain '$w' has no amino acid or nucleotide in it; name "
+					  . 'what is in it by the keys structure_ligands() gives'
+						unless @$r;
+					push @{ $res[$i] }, @$r;
+				} else {
+					$lig ||= structure_ligands($info);
+					die "$who: partner '$w' is neither a chain nor a ligand key; the "
+					  . 'chains are ' . join(', ', map { "'$_'" } @order)
+					  . ', and structure_ligands() has the ligand keys'
+						unless $lig->{$w};
+					push @{ $res[$i] }, $lig->{$w};
+				}
+				push @{ $names[$i] }, $w;
+			}
+		}
+		my %seen = map { ($_ => 1) } map { "$_" } @{ $res[0] };
+		for (@{ $res[1] }) {
+			die "$who: the two partners share residue $_->{resname} $_->{chain} $_->{key}"
+				if $seen{"$_"};
+		}
+		return { partners => \@names, residues => \@res };
+	}
+	my @poly = grep { @{ $polymer->($_) } } @order;
+	if (@poly >= 2) {
+		my $short;
+		for my $cid (@poly) {
+			$short = $cid if !defined $short
+			              || @{ $polymer->($cid) } <= @{ $polymer->($short) };
+		}
+		my @rest = grep { $_ ne $short } @poly;
+		return {
+			partners => [ \@rest, [ $short ] ],
+			residues => [ [ map { @{ $polymer->($_) } } @rest ], $polymer->($short) ],
+		};
+	}
+	return undef unless @poly == 1;
+	# a cap or a non-standard residue bonded into the chain is part of the
+	# first partner already, and cannot be the second
+	my $side1 = $polymer->($poly[0]);
+	my %taken = map { ("$_" => 1) } @$side1;
+	my ($best, $best_n);
+	for my $cid (@order) {
+		my $c = $chains->{$cid};
+		for my $rk (@{ $c->{residue_order} }) {
+			my $r = $c->{residues}{$rk};
+			next unless ($r->{type} || '') eq 'ligand' && !$taken{"$r"};
+			my $n = grep {
+				my $e = $r->{atoms}{$_}{element};
+				!defined $e || ($e ne 'H' && $e ne 'D')
+			} @{ $r->{atom_order} || [] };
+			next unless $n;
+			($best, $best_n) = ("$r->{resname}_${cid}_$rk", $n)
+				if !defined $best_n || $n > $best_n;
+		}
+	}
+	return undef unless defined $best;
+	return {
+		partners => [ [ $poly[0] ], [ $best ] ],
+		residues => [ $side1, [ structure_ligands($info)->{$best} ] ],
+	};
+}
+
+# _finish_interface($info, $f, \%o, $sides) -- what the XS measured, made into
+# what a caller reads: the residues of each side that take part, PRODIGY's
+# classes and estimate, and the ring and disulfide pairs that cross, taken out
+# of the whole-structure lists rather than looked for twice.
+sub _finish_interface {
+	my ($info, $f, $o, $sides) = @_;
+	my $raw = $f->{interface};
+	my %on;    # "chain\0key" => 0 or 1: which side a residue is on
+	for my $i (0, 1) {
+		$on{"$_->{chain}\0$_->{key}"} = $i for @{ $sides->{residues}[$i] };
+	}
+	my (%n_ct, %ic);
+	$ic{$_} = 0 for values %IC_BIN;
+	for my $c (@{ $raw->{contacts} }) {
+		$n_ct{"$c->{chain1}\0$c->{residue1}"}++;
+		$n_ct{"$c->{chain2}\0$c->{residue2}"}++;
+		my ($x, $y) = ($IC_CLASS{ $c->{resname1} }, $IC_CLASS{ $c->{resname2} });
+		next unless defined $x && defined $y;
+		$ic{ $IC_BIN{ join '', sort $x, $y } }++;
+	}
+	# with sasa => 0 there are no surfaces, and an interface residue is one
+	# that touches the other side
+	my $surf = exists $raw->{residue_sasa};
+	my (@taking, %nis, $n_nis, $side_amino);
+	my @buried = (0, 0);
+	for my $i (0, 1) {
+		my $list = $sides->{residues}[$i];
+		for my $e (0 .. $#$list) {
+			my $r = $list->[$e];
+			my $n = $n_ct{"$r->{chain}\0$r->{key}"} || 0;
+			$side_amino->[$i]++ if ($r->{type} || '') eq 'amino_acid';
+			my %one = (chain => $r->{chain}, residue => $r->{key}, resname => $r->{resname},
+			           n_contacts => $n);
+			if ($surf) {
+				my $area  = $raw->{residue_sasa}[$i][$e];
+				my $alone = $raw->{residue_sasa_alone}[$i][$e];
+				$buried[$i] += $alone - $area;
+				if (my $cls = $NIS_CLASS{ $r->{resname} }) {
+					if ($area / $NACCESS_REL{ $r->{resname} } >= $o->{nis_threshold}) {
+						$nis{$cls}++;
+						$n_nis++;
+					}
+				}
+				next unless $n || $alone > $area;
+				@one{qw(sasa sasa_alone buried)} = ($area, $alone, $alone - $area);
+			} else {
+				next unless $n;
+			}
+			push @{ $taking[$i] }, \%one;
+		}
+	}
+	my $cross = sub {
+		my ($list) = @_;
+		return [ grep {
+			my ($a, $b) = ($on{"$_->{chain1}\0$_->{residue1}"}, $on{"$_->{chain2}\0$_->{residue2}"});
+			defined $a && defined $b && $a != $b
+		} @{ $list || [] } ];
+	};
+	my %out = (
+		partners        => $sides->{partners},
+		n_residues      => [ map { scalar @{ $sides->{residues}[$_] } } 0, 1 ],
+		n_atoms         => $raw->{n_atoms},
+		residues        => [ $taking[0] || [], $taking[1] || [] ],
+		contacts        => $raw->{contacts},
+		n_atom_contacts => $raw->{n_atom_contacts},
+		ic              => \%ic,
+		($surf ? (
+			sasa   => { complex => $raw->{sasa_complex}, alone => $raw->{sasa_alone} },
+			buried => {
+				total  => $raw->{buried_apolar} + $raw->{buried_polar},
+				apolar => $raw->{buried_apolar},
+				polar  => $raw->{buried_polar},
+				side   => \@buried,
+			},
+		) : ()),
+		salt_bridges    => $raw->{salt_bridges},
+		polar_contacts  => $raw->{polar_contacts},
+		cation_pi       => $raw->{cation_pi},
+		bridging_waters => $raw->{bridging_waters},
+		bfactor         => { mean => $raw->{bfactor_mean}, interface => $raw->{bfactor_interface} },
+		# computed on this walk only when it was the whole-structure one; the
+		# interface alone asks for neither and has neither
+		(exists $f->{pi_stacking} ? (pi_stacking => $cross->($f->{pi_stacking})) : ()),
+		(exists $f->{disulfides}  ? (disulfides  => $cross->($f->{disulfides}))  : ()),
+		(exists $raw->{min_distance} ? (min_distance => $raw->{min_distance}) : ()),
+		(exists $raw->{com_distance} ? (com_distance => $raw->{com_distance}) : ()),
+	);
+	# The non-interacting surface is PRODIGY's: every residue of either side
+	# whose surface in the complex is at least nis_threshold of its NACCESS
+	# reference, sorted by class.  It is over the whole complex, interface
+	# included, as analyse_nis() has it, and not only the residues away from
+	# the interface that the name suggests.
+	if ($n_nis) {
+		$out{nis} = { map { ($_->[1] => ($nis{ $_->[0] } || 0) / $n_nis) }
+		              [ A => 'apolar' ], [ C => 'charged' ], [ P => 'polar' ] };
+	}
+	# PRODIGY is fitted on protein-protein complexes and refuses a structure
+	# with no contact between the two, so the estimate is only made for two
+	# sides that are both protein and touch
+	if ($out{nis} && @{ $raw->{contacts} } && $side_amino->[0] && $side_amino->[1]) {
+		my $dg = $PRODIGY{intercept};
+		$dg += $PRODIGY{$_} * $ic{$_} for qw(charged_charged charged_apolar polar_polar apolar_polar);
+		$dg += $PRODIGY{nis_apolar}  * 100 * $out{nis}{apolar};
+		$dg += $PRODIGY{nis_charged} * 100 * $out{nis}{charged};
+		$out{prodigy} = {
+			dg => $dg,
+			kd => exp($dg / ($PRODIGY_R * ($o->{temperature} + 273.15))),
+			temperature => $o->{temperature},
+		};
+	}
+	return $f->{interface} = \%out;
+}
+
+# _bjellqvist_charge(\%count, $pos, $neg, $ph) -- the net charge of a sequence
+# at a pH, by Henderson-Hasselbalch over Bio.SeqUtils.IsoelectricPoint's pK
+# tables: charge_at_pH() of Biopython 1.87, term for term and in its order.
+sub _bjellqvist_charge {
+	my ($count, $pos, $neg, $ph) = @_;
+	my ($p, $n) = (0.0, 0.0);
+	$p += $count->{ $_->[0] } * (1.0 / (10 ** ($ph - $_->[1]) + 1.0)) for @$pos;
+	$n += $count->{ $_->[0] } * (1.0 / (10 ** ($_->[1] - $ph) + 1.0)) for @$neg;
+	return $p - $n;
+}
+
+# _charge_and_pi($seq) -- the net charge at pH 7 and the isoelectric point of a
+# protein sequence, Biopython's IsoelectricPoint(seq).charge_at_pH(7.0) and
+# .pi().  pi() is a bisection written as recursion; this is the same bisection,
+# from the same starting bracket and to the same width, written as a loop, so
+# every pH it tries is the one Biopython tried.
+sub _charge_and_pi {
+	my ($seq) = @_;
+	$seq = uc $seq;
+	my %count = map { ($_ => 0) } qw(K R H D E C Y);
+	for my $aa (split //, $seq) { $count{$aa}++ if exists $count{$aa} }
+	@count{qw(Nterm Cterm)} = (1.0, 1.0);
+	my ($first, $last) = (substr($seq, 0, 1), substr($seq, -1));
+	my @pos = map { [ @$_ ] } @PK_POS;
+	my @neg = map { [ @$_ ] } @PK_NEG;
+	$pos[0][1] = $PK_NTERM{$first} if exists $PK_NTERM{$first};
+	$neg[0][1] = $PK_CTERM{$last}  if exists $PK_CTERM{$last};
+	# Biopython's starting bracket: 4.05 is below a sequence of nothing but
+	# aspartate and 12 above one of nothing but arginine; 0.0001 is its width
+	my ($ph, $lo, $hi) = (7.775, 4.05, 12);
+	while (1) {
+		my $q = _bjellqvist_charge(\%count, \@pos, \@neg, $ph);
+		last unless $hi - $lo > 0.0001;
+		if ($q > 0.0) { $lo = $ph } else { $hi = $ph }
+		$ph = ($lo + $hi) / 2;
+	}
+	return (_bjellqvist_charge(\%count, \@pos, \@neg, 7.0), $ph);
+}
+
+# _secondary_fractions($info, $f, $store) -- the three-state share of each
+# chain's assigned residues, from the dssp roll-up: H is the three helices
+# (H, G, I), E the strand and the bridge (E, B), C the rest -- ss_simple's
+# reduction, counted rather than read off every residue.  A chain with no
+# assigned residue gets none, as it has no key in the roll-up.
+sub _secondary_fractions {
+	my ($info, $f, $store) = @_;
+	my $d = $f->{dssp} or return;
+	my %three = (H => 'H', G => 'H', I => 'H', E => 'E', B => 'E');
+	my %all = (H => 0, E => 0, C => 0);
+	my $n_all = 0;
+	for my $cid (sort keys %$d) {
+		my %n = (H => 0, E => 0, C => 0);
+		my $tot = 0;
+		for my $letter (keys %{ $d->{$cid} }) {
+			my $k = scalar @{ $d->{$cid}{$letter} };
+			$n{ $three{$letter} || 'C' } += $k;
+			$tot += $k;
+		}
+		next unless $tot;
+		$all{$_} += $n{$_} for keys %n;
+		$n_all += $tot;
+		$info->{chains}{$cid}{ss_fraction} = { map { ($_ => $n{$_} / $tot) } keys %n }
+			if $store && $info->{chains}{$cid};
+	}
+	$f->{ss_fraction} = { map { ($_ => $all{$_} / $n_all) } keys %all } if $n_all;
+	return;
 }
 
 # Options and format detection
@@ -1294,10 +1757,10 @@ sub _build_structure {
 	# They are on by default because a structure's surface, size and contacts
 	# are as much a part of what it *is* as its sequence, and a caller who has
 	# to know to ask for them mostly does not.  What that costs is real and is
-	# measured in notes.txt: reading a structure goes from about 246,000 atoms a
-	# second to about 52,700, which is 4.7 times the cost.  The largest part is
-	# the solvent-accessible surface, at 960 sphere points per atom -- with
-	# sasa => 0 the rest together come to 3.0x the read.  features => 0 is the
+	# measured in notes.txt: reading a structure goes from about 279,000 atoms a
+	# second to about 43,600, which is 6.4 times the cost.  The largest part is
+	# the solvent-accessible surfaces, at 960 sphere points per atom -- with
+	# sasa => 0 the rest together come to 3.4x the read.  features => 0 is the
 	# way back to the old speed, and is what to reach for when reading a
 	# directory for its headers or its sequences.
 	#
@@ -1305,7 +1768,7 @@ sub _build_structure {
 	# documented way to read a file for its residues without its coordinates,
 	# structure_sequences() passes it, and a fast path that started dying would
 	# be a worse answer than one that quietly has nothing to compute from.
-	$info->{features} = _all_features($info, 'structure_info')
+	$info->{features} = _all_features($info, 'structure_info', $o->{partners})
 		if $o->{features} && $o->{atoms};
 
 	# dssp => 1 lifts the secondary structure roll-up out of the features and
@@ -1639,6 +2102,18 @@ sub _bonded {
 	my $d2 = 0;
 	$d2 += ($p->[$_] - $q->[$_]) ** 2 for 0 .. 2;
 	return $d2 < $l->[2] ** 2 ? 1 : 0;
+}
+
+# _peptide_linked($a, $b) -- whether $a's carbonyl carbon is bonded to $b's
+# nitrogen, by gemmi's C-N length in %LINK; for residues whose type says
+# nothing, which is where _bonded() would give up
+sub _peptide_linked {
+	my ($a, $b) = @_;
+	my ($c, $n) = ($a->{atoms}{C}, $b->{atoms}{N});
+	return 0 unless $c && $n;
+	return 0 if grep { !defined } @$c{qw(x y z)}, @$n{qw(x y z)};
+	my $d2 = ($c->{x} - $n->{x}) ** 2 + ($c->{y} - $n->{y}) ** 2 + ($c->{z} - $n->{z}) ** 2;
+	return $d2 < $LINK{amino_acid}[2] ** 2 ? 1 : 0;
 }
 
 sub _chain_type {
@@ -3381,6 +3856,10 @@ that goes unnoticed until the ten-thousandth file.
                          {dssp}, where structure_dssp() would find it;
                          with features => 0 it is computed on its own,
                          and with atoms => 0 it dies
+ partners  => undef      the two sides of {features}{interface}: two
+                         lists of chain ids and ligand keys, or undef
+                         to have them worked out; see
+                         structure_interface below
 
 Every option is checked. A misspelled one is fatal, because an ignored typo is
 a wrong answer that arrives without a word: C<< hydrogen =E<gt> 0 >> that is quietly
@@ -3403,16 +3882,19 @@ surface, size and contacts are as much a part of what it is as its sequence, and
 a caller who has to know to ask mostly does not. What it costs is measured, over
 60 structures of PDBbind:
 
- structure_info($f, features => 0)         1.30 s   246,000 atoms/s
- structure_info($f)                        6.07 s    52,700 atoms/s    4.7x
- ... with interface => 0                   5.88 s    54,400 atoms/s    4.5x
- ... with sasa => 0                        3.96 s    80,800 atoms/s    3.0x
+ structure_info($f, features => 0)         1.15 s   279,000 atoms/s
+ structure_info($f)                        7.34 s    43,600 atoms/s    6.4x
+ ... with interface => 0                   5.36 s    59,800 atoms/s    4.7x
+ ... with sasa => 0                        3.90 s    82,200 atoms/s    3.4x
 
 The largest single part is the solvent-accessible surface, at 960 sphere points
-per atom; everything else together is 3.0 times the read. C<< interface =E<gt> 0 >> drops
-the per-chain surfaces, which is a thirtieth of the whole: an atom with no
-neighbour outside its own chain has the same surface alone as it has in the
-structure, and only the ones that do have such a neighbour are computed twice.
+per atom; everything else together is 3.4 times the read. C<< interface =E<gt> 0 >> drops
+the per-chain surfaces and the two-partner interface, which between them are a
+quarter of the whole, and nearly all of that is the interface's surface: the
+complex of the two partners is the structure without its waters and stray
+ligands, and in a crystal structure most atoms have a water close enough to
+change their surface, so most of the complex has to be computed again. Every
+other atom keeps the surface the whole structure gave it.
 
 C<< features =E<gt> 0 >> is what to reach for when reading a directory for its headers or
 its sequences. C<< atoms =E<gt> 0 >> turns them off on its own — there are no coordinates
@@ -3557,6 +4039,10 @@ example at the top of this document is its output.
  @{ $f->{pi_stacking} };   # the stacked pairs of aromatic rings
  @{ $f->{disulfides} };    # the SG-SG pairs close enough to be bonded
  @{ $f->{base_pairs} };    # the Watson-Crick and wobble base pairs
+ $f->{charge};             # -6.96     net charge at pH 7, the chains added up
+ $f->{ss_fraction}{H};     # 0.36      the helical share of the assigned residues
+ $f->{interface};          # the two partners and what is between them;
+                           # see structure_interface below
 
 (1a22 again, the structure the summary at the top of this document is of.)
 
@@ -3578,6 +4064,9 @@ already are:
  $info->{chains}{A}{sasa};                          # 8450.6   the chain's surface
  $info->{chains}{A}{hydropathy};                    # -0.3144  and its mean hydropathy
  $info->{chains}{A}{aromatic_fraction};             # 0.1222
+ $info->{chains}{A}{charge};                        # -3.07    net charge at pH 7
+ $info->{chains}{A}{isoelectric_point};             # 5.49     and where it is zero
+ $info->{chains}{A}{ss_fraction};                   # { H => 0.72, E => 0, C => 0.28 }
  $info->{chains}{A}{residues}{54}{sasa};            # 24.62    one residue's surface
  $info->{chains}{A}{residues}{54}{rsa};             # 0.103    ... as a fraction of its maximum
  $info->{chains}{A}{residues}{54}{atoms}{CZ}{sasa}; # one atom's
@@ -3728,6 +4217,18 @@ C<structure_features()> yourself.
   <td><code>shape</code></td>
   <td><code>gyration_tensor</code>, <code>principal_moments</code>, <code>asphericity</code>, <code>acylindricity</code>, <code>anisotropy</code></td>
 </tr>
+<tr>
+  <td><code>interface</code></td>
+  <td>the hashref <code>structure_interface()</code> returns, when there are two partners</td>
+</tr>
+<tr>
+  <td><code>charge</code></td>
+  <td>the protein chains' net charges at pH 7, added up</td>
+</tr>
+<tr>
+  <td><code>ss_fraction</code></td>
+  <td><code>H</code>, <code>E</code> and <code>C</code>: the three-state share of every residue the secondary structure was assigned to</td>
+</tr>
 </tbody>
 </table>
 
@@ -3791,7 +4292,7 @@ surface than its neighbours in the archive unless they are taken out.
 <tr>
   <td><code>interface</code></td>
   <td>1</td>
-  <td>also run the surface on each chain alone, for the buried area</td>
+  <td>also run the surface on each chain alone, for the buried area, and find the two-partner interface</td>
 </tr>
 <tr>
   <td><code>shape</code></td>
@@ -3912,6 +4413,16 @@ surface than its neighbours in the archive unless they are taken out.
   <td><code>contact_distance</code></td>
   <td>4.5</td>
   <td>the largest heavy-atom separation that counts as a contact, angstrom</td>
+</tr>
+<tr>
+  <td><code>partners</code></td>
+  <td>undef</td>
+  <td>the two sides of the interface; see <code>structure_interface</code></td>
+</tr>
+<tr>
+  <td><code>interface_distance</code>, <code>salt_bridge_distance</code>, <code>polar_distance</code>, <code>cation_pi_distance</code>, <code>water_distance</code>, <code>nis_threshold</code>, <code>temperature</code></td>
+  <td></td>
+  <td>the interface's own; see <code>structure_interface</code></td>
 </tr>
 </tbody>
 </table>
@@ -4150,6 +4661,322 @@ with C<< altloc =E<gt> 'highest' >> that the two agree residue for residue. Over
 entries of PDBbind v2020 read that way, both give a figure to the same 56,227
 residues, and the figures differ at one of them: a neighbour 0.00005° from the
 dividing plane, which Biopython's float32 coordinates put on the other side.
+
+=head3 Charge, and the secondary structure's shares
+
+Each protein chain carries C<charge>, its net charge at pH 7, and
+C<isoelectric_point>, the pH at which that is zero, both over the observed
+sequence. They are Biopython's C<Bio.SeqUtils.IsoelectricPoint> — its
+C<charge_at_pH(7.0)> and C<pi()> — with its pK values, which are Bjellqvist's
+(1993, 1994) with a residue-specific value for each terminus, and they agree
+with it to the last bit on a double perl. C<< $f-E<gt>{charge} >> is the chains' charges
+added up. There is no isoelectric point of the whole: each chain is its own
+molecule, with its own two termini.
+
+C<ss_fraction> is the share of each three-state letter — C<H> for the three
+helices, C<E> for the strand and the bridge, C<C> for the rest — among the
+residues the secondary structure was assigned to, on each chain and over the
+whole structure. It is the C<dssp> roll-up counted, so it is there whenever
+C<secondary> is.
+
+=head2 structure_interface
+
+ my $x = $info->{features}{interface};             # structure_info() found two partners
+ my $y = structure_interface($info);                # the same hash
+ my $z = structure_interface($info, partners => [ ['H', 'L'], ['A'] ]);
+ my $l = structure_interface($info, partners => [ ['A'], ['STU_A_401'] ]);
+
+ scalar @{ $x->{contacts} };         # 32     residue pairs closer than 5.5 A
+ $x->{ic}{charged_charged};          # 6      PRODIGY's classes of those pairs
+ $x->{buried}{total};                # 991.7  A^2 the two partners bury
+ $x->{buried}{apolar};               # 597.9  the carbon and sulphur part of it
+ $x->{nis}{apolar};                  # 0.382  the apolar share of the exposed surface
+ $x->{prodigy}{dg};                  # -4.28  kcal/mol, PRODIGY's estimate
+ scalar @{ $x->{salt_bridges} };     # 4
+ scalar @{ $x->{polar_contacts} };   # 8      N, O or S pairs closer than 3.5 A
+ scalar @{ $x->{cation_pi} };        # 1
+ scalar @{ $x->{bridging_waters} };  # 7
+ $x->{com_distance};                 # 12.11  A between the centres of mass
+ $x->{min_distance};                 # 2.74   A between the closest heavy atoms
+
+(1cka: the N-terminal SH3 domain of c-Crk, chain A, holding the C3G peptide
+PPPALPPKK, chain B. It is C<t/data/iface.pdb>.)
+
+What two partners of a complex have between them: a receptor and the peptide,
+protein or ligand it holds. A binding affinity is a question about two things,
+and the numbers that predict one in the published single-structure models are
+measured across the gap between them — which residues touch, how much surface
+the two bury, which charged groups meet.
+
+It is one of the features, computed on the way past like the rest, so
+C<< $info-E<gt>{features}{interface} >> is there after an ordinary C<structure_info()>
+whenever the structure has two partners to find. With no options this function
+is a lookup. Name an option and the interface alone is computed again with it
+in force; that costs the surface of the complex, which the default read gets
+mostly for free (see below). C<< interface =E<gt> 0 >> on C<structure_features()> turns it
+off, and C<< sasa =E<gt> 0 >> leaves the surface-based half out — C<sasa>, C<buried>, the
+residues' surfaces, C<nis> and C<prodigy> — and keeps the rest.
+
+=head3 Choosing the partners
+
+C<partners> names them: two entries, each a chain id, a ligand key as
+C<structure_ligands()> writes it (C<NAME_CHAIN_NUMBER>), or a list of those. A
+chain named as a partner is its amino acids and nucleotides, and the residues
+peptide-bonded into them — an ACE or NH2 cap, a non-standard amino acid the
+residue table does not know — by gemmi's C–N length. A ligand, ion or water that
+only carries the chain's letter is not part of it; name it by its key to add it.
+The two partners must not share a residue.
+
+Left out, the partners are worked out, which is a guess:
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>the structure has</th>
+  <th>the partners are</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>two or more polymer chains</td>
+  <td>the shortest, against all the others: a peptide against its receptor. A tie goes to the chain later in the file</td>
+</tr>
+<tr>
+  <td>one polymer chain and a ligand</td>
+  <td>the ligand with the most heavy atoms, against the chain. An ion is never chosen, and neither is a residue bonded into the chain</td>
+</tr>
+<tr>
+  <td>neither</td>
+  <td>no interface, and no <code>interface</code> key</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+An antibody's two chains against an antigen, or a drug against a protein that
+also holds a larger glycerol or detergent molecule, are structures whose
+partners have to be named. C<< $x-E<gt>{partners} >> says what was used, in the same
+form C<partners> takes.
+
+The complex is the two partners and nothing else. Waters, ions and ligands that
+belong to neither are left out of it, as PRODIGY leaves them out, and the waters
+come back only to be asked whether they bridge the two.
+
+=head3 What comes back
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>key</th>
+  <th>what it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>partners</code></td>
+  <td><code>[ [names], [names] ]</code>: what the two sides are</td>
+</tr>
+<tr>
+  <td><code>n_residues</code>, <code>n_atoms</code></td>
+  <td><code>[ first, second ]</code>: how big each side is</td>
+</tr>
+<tr>
+  <td><code>contacts</code></td>
+  <td>the residue pairs, one in each side, whose closest heavy atoms are closer than <code>interface_distance</code>: <code>chain1</code>, <code>residue1</code>, <code>resname1</code> in the first partner, the same with 2 in the second, and <code>distance</code></td>
+</tr>
+<tr>
+  <td><code>n_atom_contacts</code></td>
+  <td>the heavy-atom pairs closer than <code>interface_distance</code></td>
+</tr>
+<tr>
+  <td><code>ic</code></td>
+  <td>the contacts by PRODIGY's classes: <code>charged_charged</code>, <code>charged_polar</code>, <code>charged_apolar</code>, <code>polar_polar</code>, <code>apolar_polar</code>, <code>apolar_apolar</code></td>
+</tr>
+<tr>
+  <td><code>residues</code></td>
+  <td><code>[ [first], [second] ]</code>: each side's residues that touch the other or bury any surface, with <code>chain</code>, <code>residue</code>, <code>resname</code>, <code>sasa</code>, <code>sasa_alone</code>, <code>buried</code> and <code>n_contacts</code></td>
+</tr>
+<tr>
+  <td><code>sasa</code></td>
+  <td><code>complex</code>, and <code>alone</code>, <code>[ first, second ]</code>: the surface of the two together and of each on its own, angstrom^2</td>
+</tr>
+<tr>
+  <td><code>buried</code></td>
+  <td><code>total</code>, <code>apolar</code>, <code>polar</code>, and <code>side</code>, <code>[ first, second ]</code>: what the two bury against each other, and each side's share</td>
+</tr>
+<tr>
+  <td><code>nis</code></td>
+  <td><code>apolar</code>, <code>charged</code>, <code>polar</code>: PRODIGY's non-interacting surface, as fractions</td>
+</tr>
+<tr>
+  <td><code>prodigy</code></td>
+  <td><code>dg</code>, kcal/mol, and <code>kd</code>, molar, at <code>temperature</code> — PRODIGY's IC_NIS estimate; only for two protein partners that touch</td>
+</tr>
+<tr>
+  <td><code>salt_bridges</code></td>
+  <td>residue pairs with a LYS NZ or ARG NE, NH1 or NH2 and an ASP OD1, OD2 or GLU OE1, OE2 closer than <code>salt_bridge_distance</code>: the pair's fields, <code>atom1</code> and <code>atom2</code> the closest two</td>
+</tr>
+<tr>
+  <td><code>polar_contacts</code></td>
+  <td>every N, O or S pair, one in each side, closer than <code>polar_distance</code>: the pair's fields, <code>atom1</code>, <code>atom2</code>, and <code>backbone1</code> and <code>backbone2</code>, 1 for N, CA, C, O or OXT</td>
+</tr>
+<tr>
+  <td><code>cation_pi</code></td>
+  <td>a LYS NZ or ARG CZ within <code>cation_pi_distance</code> of a PHE, TYR or TRP ring centroid in the other side, once per residue pair at the nearer ring; <code>cation</code> says which side the cation is on</td>
+</tr>
+<tr>
+  <td><code>pi_stacking</code>, <code>disulfides</code></td>
+  <td>the entries of <code>$f-&gt;{pi_stacking}</code> and <code>$f-&gt;{disulfides}</code> that cross from one side to the other</td>
+</tr>
+<tr>
+  <td><code>bridging_waters</code></td>
+  <td><code>chain</code> and <code>residue</code> of each water with a heavy atom within <code>water_distance</code> of a heavy atom of both sides</td>
+</tr>
+<tr>
+  <td><code>com_distance</code></td>
+  <td>angstrom between the two centres of mass</td>
+</tr>
+<tr>
+  <td><code>min_distance</code></td>
+  <td>angstrom between the closest two heavy atoms, one in each side; absent when none is within reach of the largest cutoff</td>
+</tr>
+<tr>
+  <td><code>bfactor</code></td>
+  <td><code>mean</code> and <code>interface</code>, each <code>[ first, second ]</code>: the mean B-factor of each side's heavy atoms, and of those within <code>interface_distance</code> of the other side</td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+C<pi_stacking> and C<disulfides> come from the whole-structure lists, so an
+interface computed on its own with options has neither.
+
+=head3 Against PRODIGY
+
+The contacts, their classes, the non-interacting surface and the estimate are
+PRODIGY's — C<prodigy-prot> 2.4.0, Vangone, A and Bonvin, A M J J (2015) I<eLife>
+4:e07454 — and so are its defaults: 5.5 Å for a contact and 5% exposure for the
+surface. Over 148 entries of PDBbind v2020 that PRODIGY can read, the contacts
+and their classes agree exactly in every one.
+
+The non-interacting surface does not agree exactly, because it is PRODIGY's
+threshold applied to a different surface: this module's is mdtraj's radii,
+PRODIGY's is NACCESS's through freesasa, and a residue near 5% can land on either
+side. On 1cka one does — GLY A180, 3.1% exposed here and 6.8% there. Over the
+same 148 entries the fractions are never more than two percentage points apart,
+and the estimate is never more than 0.22 kcal/mol from PRODIGY's, with a median
+of 0.057. Note that PRODIGY's non-interacting surface is every exposed residue
+of the complex, the interface included, not only the residues away from it.
+
+=head3 Against the pepPriML feature script
+
+The salt bridges, the polar pairs and their backbone split, the bridging
+waters, the atom-pair counts at any cutoff and the two distances are the
+definitions of C<features.pdb.20260806.py>, the static feature script of the
+pepPriML project, which computes them with mdtraj; on 1cka the two agree on
+every one. Two differences are deliberate. Its cation–π counts histidine as a
+cation and as a ring, and Gallivan, J P and Dougherty, D A (1999) I<PNAS>
+96(17):9459-64, whose 6 Å filter this is, count it as neither. And it leaves an
+ACE or NH2 cap out of the peptide, which a chain named as a partner here takes
+in. Over twenty peptide complexes of PDBbind the two agree on every count once
+those two are allowed for, and on the buried surface to 1 Å².
+
+=head3 Options
+
+
+
+=begin html
+
+<table>
+<thead>
+<tr>
+  <th>option</th>
+  <th>default</th>
+  <th>what it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>partners</code></td>
+  <td>undef</td>
+  <td>the two sides: two chain ids, ligand keys or lists of them; undef works them out</td>
+</tr>
+<tr>
+  <td><code>interface_distance</code></td>
+  <td>5.5</td>
+  <td>the largest heavy-atom separation that is a contact, angstrom — PRODIGY's <code>d_cutoff</code></td>
+</tr>
+<tr>
+  <td><code>salt_bridge_distance</code></td>
+  <td>4.0</td>
+  <td>the largest charged N to charged O separation that is a salt bridge — Barlow, D J and Thornton, J M (1983) <i>J Mol Biol</i> 168(4):867-85</td>
+</tr>
+<tr>
+  <td><code>polar_distance</code></td>
+  <td>3.5</td>
+  <td>the largest N/O/S separation that is a polar pair</td>
+</tr>
+<tr>
+  <td><code>cation_pi_distance</code></td>
+  <td>6.0</td>
+  <td>the largest cation to ring centroid separation — Gallivan and Dougherty (1999)</td>
+</tr>
+<tr>
+  <td><code>water_distance</code></td>
+  <td>3.5</td>
+  <td>how close a bridging water must come to each side</td>
+</tr>
+<tr>
+  <td><code>nis_threshold</code></td>
+  <td>0.05</td>
+  <td>the exposure, as a fraction of NACCESS's reference surface, at which a residue is on the surface — PRODIGY's <code>acc_threshold</code></td>
+</tr>
+<tr>
+  <td><code>temperature</code></td>
+  <td>25</td>
+  <td>degrees Celsius, for turning the estimate into a Kd</td>
+</tr>
+<tr>
+  <td><code>probe</code>, <code>points</code></td>
+  <td>1.4, 960</td>
+  <td>as for <code>structure_sasa</code></td>
+</tr>
+</tbody>
+</table>
+
+=end html
+
+
+
+The same options are taken by C<structure_features()>, and C<partners> by
+C<structure_info()>, which is where the default read's interface is decided.
+
+=head3 What it costs
+
+The surface of the complex is the expensive part. It starts from the whole
+structure's: an atom's surface depends only on which atoms are close enough to
+cover some of it, so an atom of either partner whose neighbours are all in the
+two partners has the surface the whole structure already gave it, bit for bit.
+Only the atoms with a neighbour outside the complex are computed again, and only
+the ones with a neighbour in the other partner a third time with that partner
+taken away. In a crystal structure most atoms have a water close enough, so it
+is most of them — 608 of 1cka's 659 — and the interface is most of what
+C<< interface =E<gt> 0 >> saves; see C<structure_info> above. Computed on its own, with an
+option, the complex is computed whole.
 
 =head2 structure_sasa
 
@@ -5413,6 +6240,31 @@ them where they are installed so the frozen answer cannot go stale.
   <td>G+C content</td>
   <td></td>
   <td>Biopython's <code>Bio.SeqUtils.gc_fraction()</code>, with its default <code>ambiguous =&gt; 'remove'</code></td>
+</tr>
+<tr>
+  <td>net charge and isoelectric point</td>
+  <td>Bjellqvist, B <i>et al.</i> (1993) <i>Electrophoresis</i> 14:1023-31 and (1994) 15:529-39</td>
+  <td>Biopython's <code>Bio.SeqUtils.IsoelectricPoint</code></td>
+</tr>
+<tr>
+  <td>interface contacts, their classes, the non-interacting surface and the affinity estimate</td>
+  <td>Vangone, A; Bonvin, A M J J (2015) <i>eLife</i> 4:e07454</td>
+  <td><code>prodigy-prot</code> 2.4.0's <code>calculate_ic()</code>, <code>analyse_contacts()</code>, <code>analyse_nis()</code> and <code>IC_NIS()</code></td>
+</tr>
+<tr>
+  <td>salt bridges</td>
+  <td>Barlow, D J; Thornton, J M (1983) <i>J Mol Biol</i> 168(4):867-85</td>
+  <td>pepPriML's <code>features.pdb.20260806.py</code>, which counts them the same way</td>
+</tr>
+<tr>
+  <td>cation-pi</td>
+  <td>Gallivan, J P; Dougherty, D A (1999) <i>PNAS</i> 96(17):9459-64, the distance filter</td>
+  <td></td>
+</tr>
+<tr>
+  <td>polar pairs, bridging waters</td>
+  <td></td>
+  <td>pepPriML's <code>features.pdb.20260806.py</code></td>
 </tr>
 </tbody>
 </table>

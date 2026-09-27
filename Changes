@@ -109,6 +109,26 @@ Revision history for Chem-Structure-Parser
    number reader leaves fractions to strtod().  Its division was rounded
    twice there, and 103 of 400,001 six-decimal strings came back one ulp away
    from strtod()'s answer; no one- to five-decimal string tried was affected.
+ - The features include the interface between two partners, at
+   $info->{features}{interface}, and structure_interface() is new: the
+   residue pairs in contact across it and their classes, the surface the two
+   bury (apolar and polar), salt bridges, polar N/O/S pairs, cation-pi pairs,
+   bridging waters, the centre-of-mass and closest-atom distances, and the
+   B-factors of each side and of its interface.  It is on by default, like
+   the rest, with the partners worked out -- the shortest polymer chain
+   against the others, or the largest ligand against a single chain -- or
+   named with partners => [ [...], [...] ] to structure_info(),
+   structure_features() or structure_interface().  interface => 0 turns it
+   off and sasa => 0 leaves out its surface.  It makes the default read
+   6.4 times a bare one, where it was 4.7.
+ - The interface carries PRODIGY's non-interacting surface and binding
+   affinity estimate (prodigy-prot 2.4.0).  Over 148 PDBbind entries the
+   contacts and their classes are PRODIGY's exactly, and the estimate is
+   within 0.22 kcal/mol of it; the difference is the two surfaces' radii.
+ - Each protein chain has a charge at pH 7 and an isoelectric point, which
+   are Biopython's to the bit, and each chain with secondary structure an
+   ss_fraction of H, E and C.  The whole structure has the charges added up
+   and the fractions over all its chains.
 
 0.033 2026-09-25 CDT
 

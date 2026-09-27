@@ -105,22 +105,38 @@ left as the file wrote it rather than dressed up as one.
 # What the physical properties cost
 
 `benchmark.pl` measures these too.  Over 60 structures of PDBbind v2020, with
-everything the module computes by default:
+everything the module computes by default -- the "with" rows are a read with
+features => 0 followed by structure_features() with that option, each row the
+best of three, and every row includes freeing what it built:
 
-    structure_info, features => 0     1.30 s    246,000 atoms/s
-    structure_info, the default       6.07 s     52,700 atoms/s    4.7x
-      ... with interface => 0         5.88 s     54,400 atoms/s    4.5x
-      ... with sasa => 0              3.96 s     80,800 atoms/s    3.0x
+    structure_info, features => 0     1.15 s    279,000 atoms/s
+    structure_info, the default       7.34 s     43,600 atoms/s    6.4x
+      ... with interface => 0         5.36 s     59,800 atoms/s    4.7x
+      ... with sasa => 0              3.90 s     82,200 atoms/s    3.4x
 
-So the properties cost between four and five times the read, and the surface
-is the largest part of that: everything else together -- the shape, the
-torsion angles, the contacts, the exposure, the hydrogen bonds, the secondary
-structure, the disulfides and the ring geometry -- comes to 3.0x the read
-between them.  It was 10.77 s and 8.3x before the sphere points were binned by
-direction (see below), when the surface was nearly all of it.
+(0.034, with the two-partner interface on by default.  Before it, the same
+four rows were 1.30, 6.07, 5.88 and 3.96 s: 4.7x, 4.5x and 3.0x.)
+
+So the properties cost about six times the read, and the surfaces are the
+largest part of that: everything else together -- the shape, the torsion
+angles, the contacts, the exposure, the hydrogen bonds, the secondary
+structure, the disulfides, the ring geometry and the interface's contacts --
+comes to 3.4x the read between them.  It was 10.77 s and 8.3x before the
+sphere points were binned by direction (see below), when the whole-structure
+surface was nearly all of it.
+
+The interface is a quarter of the default, and it is its surface: timed on the
+properties alone, over structures already read, it adds 2.0 s to 2.76, and
+0.03 s of that is everything but the surface.  The complex of the two partners
+is the structure without its waters and stray ligands, and in a crystal
+structure most atoms have a water close enough to change their surface -- 608
+of 1cka's 659 partner atoms -- so most of the complex is computed again.  The
+atoms that have none keep the whole structure's surface, which is exact rather
+than close: t/interface.t and t/real.t compare the two paths, and over 300
+entries of PDBbind the seeded and the unseeded interface agree in every field.
 
 The per-chain runs that give the buried area used to be a third of what the
-properties cost and are now a thirtieth -- 0.19 s of the 6.07 above; they were
+properties cost and were a thirtieth before the interface -- 0.19 s of 6.07; they were
 0.75 s of 10.77 before the bins, and 5.7 s of 16.38 before that.  An atom's surface is decided by the atoms whose spheres reach it, so
 an atom with no neighbour outside its own chain has the same surface with the
 other chains there and taken away; the whole-structure run marks the ones that
