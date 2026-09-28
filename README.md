@@ -1242,7 +1242,8 @@ surfaces are nm^2 where these are angstrom^2:
 | `pocket_sasa_nm2`, `pocket_hydrophobic_sasa_nm2`, `pocket_polar_sasa_nm2` | `sasa` `total`, `hydrophobic`, `polar`, divided by 100 |
 | `pocket_mean_rel_sasa`, `pocket_frac_buried_residues` | `rsa`, `buried_fraction` |
 | `pocket_packing_density` | `packing_density` |
- Two differences are deliberate. Its cation–π counts histidine as a
+
+Two differences are deliberate. Its cation–π counts histidine as a
 cation and as a ring, and Gallivan, J P and Dougherty, D A (1999) *PNAS*
 96(17):9459-64, whose 6 Å filter this is, count it as neither. And it leaves an
 ACE or NH2 cap out of the peptide, which a chain named as a partner here takes

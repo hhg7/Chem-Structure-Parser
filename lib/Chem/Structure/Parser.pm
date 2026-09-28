@@ -5108,7 +5108,7 @@ surfaces are nm^2 where these are angstrom^2:
 
 
 
- Two differences are deliberate. Its cation–π counts histidine as a
+Two differences are deliberate. Its cation–π counts histidine as a
 cation and as a ring, and Gallivan, J P and Dougherty, D A (1999) I<PNAS>
 96(17):9459-64, whose 6 Å filter this is, count it as neither. And it leaves an
 ACE or NH2 cap out of the peptide, which a chain named as a partner here takes
