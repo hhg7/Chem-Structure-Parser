@@ -135,6 +135,12 @@ atoms that have none keep the whole structure's surface, which is exact rather
 than close: t/interface.t and t/real.t compare the two paths, and over 300
 entries of PDBbind the seeded and the unseeded interface agree in every field.
 
+The pocket is two neighbour searches on top of that and no surface of its own:
+its atoms' surfaces alone are the ones the interface already computed for the
+buried area.  Over the same 60 entries, structure_interface() with the
+partners named takes 2.535 s with it and 2.496 s with pocket => 0, best of
+five (2026-09-27): 0.04 s, which is under the noise of the whole default read.
+
 The per-chain runs that give the buried area used to be a third of what the
 properties cost and were a thirtieth before the interface -- 0.19 s of 6.07; they were
 0.75 s of 10.77 before the bins, and 5.7 s of 16.38 before that.  An atom's surface is decided by the atoms whose spheres reach it, so
