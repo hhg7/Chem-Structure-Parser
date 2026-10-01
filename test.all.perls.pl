@@ -335,9 +335,9 @@ sub prereqs {
 }
 
 # Modules the suite loads only if they are there (t/leaks.t needs
-# Test::LeakTrace, t/gzip.t needs IO::Compress::Gzip).  Without them those
-# files skip, which looks like a pass while testing nothing, so --deps
-# installs them too.
+# Test::LeakTrace, t/compressed.t needs IO::Compress::Gzip and ::Bzip2).
+# Without them those files skip, which looks like a pass while testing
+# nothing, so --deps installs them too.
 sub optional_test_deps {
     my (%seen, @mods);
     for my $t (sort glob 't/*.t') {

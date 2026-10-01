@@ -388,6 +388,17 @@ for my $opt ([ { hydrogens => 0 },        'hydrogens => 0' ],
 		is_deeply(coords($gz), coords(structure_info("$data/mini.cif")),
 			'and reads the same as the file it was made from');
 	}
+	# .bz2, which IO::Compress has had only since perl 5.10.1
+	SKIP: {
+		eval { require IO::Compress::Bzip2; 1 } or skip 'IO::Compress::Bzip2 is not installed', 2;
+		IO::Compress::Bzip2::bzip2("$data/mini.cif" => "$dir/mini.cif.bz2")
+			or skip 'cannot bzip2 the fixture: '
+			        . do { no warnings 'once'; $IO::Compress::Bzip2::Bzip2Error }, 2;
+		my $bz = structure_info("$dir/mini.cif.bz2");
+		is($bz->{format}, 'mmcif', 'a .cif.bz2 is still an mmCIF');
+		is_deeply(coords($bz), coords(structure_info("$data/mini.cif")),
+			'and reads the same as the file it was made from');
+	}
 }
 
 #--------------------------------------------------------------------

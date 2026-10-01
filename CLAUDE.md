@@ -316,9 +316,9 @@ prevent is still prevented, by hand.
   rather than introducing `Carp` for one new call; changing all thirty-six
   over is a decision to take on purpose, in one edit, with `t/errors.t`
   rewritten to match, and not a thing to drift into.
-- **A method call was never autodie's job.** `IO::Uncompress::Gunzip->new` and
-  `$z->read` are not builtins and were unchecked even when the pragma was
-  loaded, which is why `_slurp_maybe_gzipped()` checks them itself. Keep that
+- **A method call was never autodie's job.** `IO::Uncompress::Gunzip->new` (and
+  `Bunzip2->new`) and `$z->read` are not builtins and were unchecked even when the pragma was
+  loaded, which is why `_slurp_maybe_compressed()` checks them itself. Keep that
   up: a new dependency's failure return is checked whether or not anything else
   on the line is.
 - The author-only helpers in the distribution root (`md2pod.pl`, `use.pl`,
