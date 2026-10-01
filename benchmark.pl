@@ -8,7 +8,7 @@
 # would write it if there were no XS.  The Perl reader below is not a straw
 # man -- it slices the same columns, in the same order, and builds the same
 # nested hash -- it is simply doing per line in Perl what the C does per file.
-require 5.010;
+require 5.010001;
 use strict;
 use warnings FATAL => 'all';
 use Time::HiRes 'time';

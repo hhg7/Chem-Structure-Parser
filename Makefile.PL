@@ -69,7 +69,7 @@ WriteMakefile(
 	ABSTRACT_FROM    => 'lib/Chem/Structure/Parser.pm',
 	AUTHOR           => 'David E. Condon <dec986@gmail.com>',
 	LICENSE          => 'perl',
-	MIN_PERL_VERSION => '5.010',
+	MIN_PERL_VERSION => '5.010001',
 	CONFIGURE_REQUIRES => {
 		'ExtUtils::MakeMaker' => 6.52,
 	},

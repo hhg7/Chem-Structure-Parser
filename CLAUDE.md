@@ -484,15 +484,17 @@ applied while writing, not something a run here will catch.
   a `char *` into the file buffer to a wider pointer type and dereference it —
   the packed keys are built by shifting bytes for exactly this reason.
 
-### Back-compatible to perl 5.10
+### Back-compatible to perl 5.10.1
 
-`dist.ini` declares `perl = 5.010`, `Makefile.PL` sets
-`MIN_PERL_VERSION => '5.010'`, and `lib/Chem/Structure/Parser.pm` says
-`require 5.010`. Both sides must honour it.
+`dist.ini` declares `perl = 5.010001`, `Makefile.PL` sets
+`MIN_PERL_VERSION => '5.010001'`, and `lib/Chem/Structure/Parser.pm` says
+`require 5.010001`. Both sides must honour it. It was 5.10.0 until 0.037, which
+raised it so that `IO::Uncompress::Bunzip2` is in core wherever the module
+installs.
 
 - Perl code (module and tests) is limited to 5.10 syntax: no signatures, no
   postfix dereference, no `say` without the feature, no `isa`, no chained
-  comparisons. Tests follow the existing header — `require 5.010; use strict;
+  comparisons. Tests follow the existing header — `require 5.010001; use strict;
   use warnings FATAL => 'all';` — not `use 5.044`. The author-only helpers in
   the distribution root (`test.all.perls.pl`, `structure.info.pl`,
   `benchmark.pl`) are exempt: they are not shipped (`PruneFiles` in `dist.ini`

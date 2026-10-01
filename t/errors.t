@@ -5,7 +5,7 @@
 # reader that quietly returns an empty structure for a missing file turns a
 # typo in a path into an afternoon of wondering why every protein came back
 # with no chains.
-require 5.010;
+require 5.010001;
 use strict;
 use warnings FATAL => 'all';
 use Cwd 'abs_path';

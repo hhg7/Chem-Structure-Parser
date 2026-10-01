@@ -7,10 +7,10 @@
 # underneath (IO::Uncompress::Gunzip and IO::Uncompress::Bunzip2) and a case
 # that holds for one says nothing about the other.  Each fixture is compressed
 # here from t/data rather than shipped compressed, so the comparison is always
-# with the file it was made from.  bzip2 is skipped on its own where
-# IO::Compress::Bzip2 is missing -- it is not in perl 5.10.0's core -- and gzip
-# is not skipped with it.
-require 5.010;
+# with the file it was made from.  Each is skipped on its own where its
+# IO::Compress module is missing -- core since 5.10.1, but some vendors package
+# it apart from perl -- and the other is not skipped with it.
+require 5.010001;
 use strict;
 use warnings FATAL => 'all';
 use Cwd 'abs_path';

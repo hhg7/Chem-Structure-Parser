@@ -15,7 +15,7 @@
 # label_asym_id and label_seq_id that deliberately disagree with the chain ids
 # and residue numbers, because auth_* is what a PDB record carries and auth_*
 # is what a reader has to use.
-require 5.010;
+require 5.010001;
 use strict;
 use warnings FATAL => 'all';
 use Cwd 'abs_path';
@@ -388,7 +388,7 @@ for my $opt ([ { hydrogens => 0 },        'hydrogens => 0' ],
 		is_deeply(coords($gz), coords(structure_info("$data/mini.cif")),
 			'and reads the same as the file it was made from');
 	}
-	# .bz2, which IO::Compress has had only since perl 5.10.1
+	# .bz2
 	SKIP: {
 		eval { require IO::Compress::Bzip2; 1 } or skip 'IO::Compress::Bzip2 is not installed', 2;
 		IO::Compress::Bzip2::bzip2("$data/mini.cif" => "$dir/mini.cif.bz2")

@@ -14,7 +14,7 @@
 #
 # PDB and mmCIF are read the same way and print the same thing, so a mixed
 # directory needs no sorting out first.
-require 5.010;
+require 5.010001;
 use strict;
 use warnings FATAL => 'all';
 use Getopt::Long;

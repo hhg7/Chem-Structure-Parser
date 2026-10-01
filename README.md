@@ -218,8 +218,8 @@ are read as they are, without unpacking to a temporary file — a file of severa
 gzip or bzip2 members, as `bgzip` and `pbzip2` write, included — and so is every
 function below that takes a file name in place of a structure. The suffix is
 what says a file is compressed, in either case (`.GZ`, `.BZ2`), and the name
-with it taken off is what says the format. bzip2 needs `IO::Uncompress::Bunzip2`,
-which perl has shipped since 5.10.1. A `.Z` file dies saying so: `compress` is
+with it taken off is what says the format. Both are read through IO::Compress,
+which is part of perl. A `.Z` file dies saying so: `compress` is
 not unpacked, and read as it stands one would be a structure with no atoms in it.
 
 A plain string in second place names a *view*, and asks for that and nothing

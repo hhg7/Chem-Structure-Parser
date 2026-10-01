@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 # ABSTRACT: Read a molecular structure file into a hash of hashes, sequences and all, using XS for the coordinate section
-require 5.010;
+require 5.010001;
 use strict;
 package Chem::Structure::Parser;
 our $VERSION = 0.037;
@@ -1679,9 +1679,10 @@ sub _head {
 # structures is usually kept compressed, and unpacking into a temporary file
 # first is both slower and something the caller then has to clean up.
 #
-# Both decompressors are IO::Compress.  Gunzip has been in core since 5.9.4,
-# Bunzip2 only since 5.10.1 -- not in the 5.10.0 this module still supports --
-# so each is loaded when a file needs it rather than asked of every installer.
+# Both decompressors are IO::Compress, which is in core on every perl this
+# module installs on -- Bunzip2 joined it in 5.10.1, which is why that is the
+# minimum -- but which some vendors package apart from perl, so each is loaded
+# when a file needs it rather than asked of every installer.
 # The suffix is the whole of the rule: a file is unpacked because it is named
 # as compressed, and its name is what says how.
 my %UNPACK = (
@@ -3648,8 +3649,8 @@ are read as they are, without unpacking to a temporary file — a file of severa
 gzip or bzip2 members, as C<bgzip> and C<pbzip2> write, included — and so is every
 function below that takes a file name in place of a structure. The suffix is
 what says a file is compressed, in either case (C<.GZ>, C<.BZ2>), and the name
-with it taken off is what says the format. bzip2 needs C<IO::Uncompress::Bunzip2>,
-which perl has shipped since 5.10.1. A C<.Z> file dies saying so: C<compress> is
+with it taken off is what says the format. Both are read through IO::Compress,
+which is part of perl. A C<.Z> file dies saying so: C<compress> is
 not unpacked, and read as it stands one would be a structure with no atoms in it.
 
 A plain string in second place names a I<view>, and asks for that and nothing

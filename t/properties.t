@@ -6,7 +6,7 @@
 # What the numbers *are* is t/features.t's job -- it compares them against
 # mdtraj and Biopython.  This file is about the parts that are this module's own
 # and that no other implementation has an opinion on.
-require 5.010;
+require 5.010001;
 use strict;
 use warnings FATAL => 'all';
 use Cwd 'abs_path';
