@@ -322,7 +322,7 @@ prevent is still prevented, by hand.
   up: a new dependency's failure return is checked whether or not anything else
   on the line is.
 - The author-only helpers in the distribution root (`md2pod.pl`, `use.pl`,
-  `benchmark.pl`, `structure.info.pl`, `test.all.perls.pl`) may keep `use
+  `benchmark.pl`, `structure.info.pl`, `test.all.perls.pl`, `xs.check.pl`) may keep `use
   autodie` — they are not shipped, so they cost an installer nothing. So may
   `t/data/generate.pl`, `t/data/features.pl` and `t/data/oracle.pl`, which are
   shipped but are run by hand: no `.t` file executes them, they only name them
@@ -426,6 +426,28 @@ Aim to exercise every path, not one representative call:
 ## Every change must hold across the whole support matrix
 
 A modification is not finished when it works on the default perl.
+
+### `xs.check.pl` runs on every change to `Parser.xs`
+
+Run `perl xs.check.pl` from the distribution root after every edit to
+`Parser.xs`, before the build and before `./test.all.perls.pl`, and do not call
+the change finished until it prints `0 findings in Parser.xs` and exits 0. It
+runs `XS::Check` over the file and then this file's own rules, and it catches
+what neither the compiler nor the suite will: a dereferenced `av_fetch()` or
+`hv_fetch()` that can return NULL, an `SvPV` length that is not a `STRLEN`, a
+`Perl_` prefix that should not be spelled, and a call to
+`Perl_isnan`/`Perl_isinf`/`Perl_isfinite` (see "Numbers must be exact").
+
+- Fix a finding in `Parser.xs`; do not quiet it in the script. A finding that
+  really is wrong for this file is corrected in `xs.check.pl` with a comment
+  saying why, the way `decl_type()` corrects `XS::Check`'s one-type-per-name
+  bookkeeping.
+- An `SvPV` whose encoding has been checked by reading the code that uses it
+  goes into `%svpv_audited`, keyed by its line and with the reason. Editing that
+  line brings the finding back, and that is intended.
+- It is author-only, like the other root helpers: `PruneFiles` keeps it out of
+  the release, so it may `use 5.044` and `use autodie`, and `XS::Check` is not a
+  prerequisite of the distribution.
 
 ### All installed perls
 
