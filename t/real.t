@@ -45,7 +45,7 @@ my @files = map { "$DIRS[0]/$all[$_]" } grep { $_ % $step == 0 } 0 .. $#all;
 
 diag(sprintf('reading %d of %d structures in %s', scalar @files, scalar @all, $DIRS[0]));
 
-# --- an independent reader, for the things worth checking twice ------------
+#  an independent reader, for the things worth checking twice:
 #
 # The point of the XS is to slice fixed columns quickly.  This does the same
 # slicing in the most obvious Perl there is, and the two are compared on every
@@ -105,7 +105,7 @@ for my $file (@files) {
 	}
 	$checked++;
 
-	# --- the counts have to add up ---------------------------------------
+	#  the counts have to add up 
 	my $chain_atoms = 0;
 	$chain_atoms += $info->{chains}{$_}{n_atoms} for @{ $info->{chain_order} };
 	is($chain_atoms, $info->{stats}{n_atoms}, "$name: the chains account for every atom")
@@ -130,7 +130,7 @@ for my $file (@files) {
 	}
 	ok($ok, "$name: residues, atoms and sequence lengths agree inside every chain");
 
-	# --- against the naive reader ----------------------------------------
+	#  against the naive reader 
 	my ($ref_res, $ref_seq) = reference_read($file);
 	my $got_res = {};
 	for my $cid (@{ $info->{chain_order} }) {
@@ -159,7 +159,7 @@ for my $file (@files) {
 	is_deeply($got_seq, { map { $_ => $ref_seq->{$_} } grep { length $ref_seq->{$_} } keys %$ref_seq },
 		"$name: and the same amino acid sequence");
 
-	# --- what the header said, where it said anything --------------------
+	#  what the header said, where it said anything 
 	if (defined $info->{resolution}) {
 		ok($info->{resolution} > 0 && $info->{resolution} < 100,
 			"$name: resolution $info->{resolution} is a plausible number");
@@ -190,7 +190,7 @@ ok(@over <= $chains_with_seqres / 20,
 	sprintf('the observed sequence is no longer than SEQRES in all but a few chains (%d of %d)',
 		scalar @over, $chains_with_seqres));
 
-# --- the id in the file agrees with the name of the file -------------------
+#  the id in the file agrees with the name of the file 
 {
 	my $named = 0;
 	for my $file (@files[0 .. ($#files > 20 ? 20 : $#files)]) {
@@ -204,7 +204,7 @@ ok(@over <= $chains_with_seqres / 20,
 	ok($named > 0, 'at least one file had an id to check');
 }
 
-# --- the physical properties, on real structures --------------------------
+#  the physical properties, on real structures 
 #
 # What is checked here is what the file itself settles, in the spirit of the
 # rest of this file: a total that is the sum of its parts, a surface no atom can
@@ -448,8 +448,8 @@ ok(@over <= $chains_with_seqres / 20,
 			is_deeply($alone->{pocket}, $p, "$name: the pocket computed alone is the same, to the bit");
 		}
 	}
-	# --- the disulfides the coordinates show, against the ones the file
-	#     declares in its SSBOND records ---------------------------------------
+	#  the disulfides the coordinates show, against the ones the file
+	#     declares in its SSBOND records 
 	#
 	# Two independent answers to the same question, one computed here and one
 	# written by the depositor, so a disagreement is a fact about the entry
