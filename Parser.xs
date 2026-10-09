@@ -260,9 +260,12 @@ static bool res_lookup(const char *CSP_RESTRICT s, STRLEN len, res_info *CSP_RES
 		case K3('C','Y','T'): one = 'C'; type = RT_NUC; break;
 		case K3('G','U','A'): one = 'G'; type = RT_NUC; break;
 		case K3('T','H','Y'): one = 'T'; type = RT_NUC; break;
+		/*5MU is 5-methyluridine, ribothymidine: a U methylated in the tRNA, and
+		so a U by the rule the rest of this table follows -- 5MC is a C, 1MA an
+		A.  gemmi 0.7.5 ('u') and Biopython 1.85's PDBData ("5MU": "U") agree;
+		a T here put a DNA letter in an RNA sequence.*/
 		case K3('U','R','I'): case K3('P','S','U'): case K3('H','2','U'): case K3('4','S','U'):
-			one = 'U'; type = RT_NUC; break;//PSU pseudouridine
-		case K3('5','M','U'): one = 'T'; type = RT_NUC; break;
+		case K3('5','M','U'): one = 'U'; type = RT_NUC; break;//PSU pseudouridine
 		case K3('5','M','C'): case K3('O','M','C'): one = 'C'; type = RT_NUC; break;
 		case K3('1','M','A'): one = 'A'; type = RT_NUC; break;
 		case K3('2','M','G'): case K3('7','M','G'): case K3('1','M','G'): case K3('M','2','G'):
@@ -604,6 +607,46 @@ static bool charge_ok(const char *CSP_RESTRICT s, STRLEN n){
 	return digits <= 1 && signs <= 1;
 }
 
+/*nv_is_finite() -- x - x is 0 for a finite x and NaN for a NaN or an infinity,
+which is the test without isfinite(), a C99 macro, or Perl_isinf(); see
+grid_build() for why neither of those.  str2nv() hands a field that says nan or
+inf through as the NV it names, so everything that sums or compares
+coordinates over a whole structure asks this first.*/
+static bool nv_is_finite(NV v){
+	return v - v == 0.0;
+}
+
+//the first n characters of a record name, compared without regard to case; kw
+//is upper case
+static bool rec_is(const char *CSP_RESTRICT s, const char *CSP_RESTRICT kw, STRLEN n){
+	for (STRLEN i = 0; i < n; i++)
+		if (toUPPER((unsigned char)s[i]) != kw[i]) return FALSE;
+	return TRUE;
+}
+
+/*pdb_coord_rec() -- whether a record is an ATOM or a HETATM, and the column its
+serial number starts in.
+
+The record name is six columns and the serial the five after it.  A writer
+with more than 99,999 atoms to number lets the serial run leftwards into the
+record name -- 'ATOM 100000' -- and every other column stays where it was; gemmi
+0.7.5 reads such a line by its first four letters, as the atom it is, and so
+does this, the serial taken from the digits that start in column 5 or 6.  Those
+atoms used to be filed as header records named 'ATOM 1' and missing from every
+count.  HETATM has no blank to give up and cannot be written that way.  The name
+is matched without regard to case, as gemmi matches it.*/
+static bool pdb_coord_rec(const char *CSP_RESTRICT line, STRLEN llen, bool *CSP_RESTRICT het,
+                          STRLEN *CSP_RESTRICT serial_from){
+	if (llen < 6) return FALSE;
+	if (rec_is(line, "HETATM", 6)) { *het = TRUE; *serial_from = 6; return TRUE; }
+	if (!rec_is(line, "ATOM", 4)) return FALSE;
+	*het = FALSE;
+	if (line[4] == ' ' && line[5] == ' ') { *serial_from = 6; return TRUE; }
+	if (line[4] == ' ' && isDIGIT((unsigned char)line[5])) { *serial_from = 5; return TRUE; }
+	if (isDIGIT((unsigned char)line[4]) && isDIGIT((unsigned char)line[5])) { *serial_from = 4; return TRUE; }
+	return FALSE;
+}
+
 /*guess_element() -- only when columns 77-78 are absent, which happens in
 files written before the element column existed and in files written by
 programs that should know better.
@@ -702,6 +745,70 @@ static void elem_case(char *CSP_RESTRICT buf, STRLEN n)
 			break;
 		default: break;//not a symbol: leave it as the file wrote it
 	}
+}
+
+/*elem_symbol() -- whether n upper-case letters spell an element: one of the
+fourteen one-letter symbols or D, which elem_case() keeps for deuterium, or one
+of the two-letter ones, which are exactly the fields elem_case() changes.*/
+static bool elem_symbol(const char *CSP_RESTRICT buf, STRLEN n){
+	if (n == 1) return memchr("HBCNOFPSKVYIWUD", buf[0], 15) != NULL;
+	if (n == 2) {
+		char t[2];
+		t[0] = buf[0];
+		t[1] = buf[1];
+		elem_case(t, 2);
+		return t[1] != buf[1];
+	}
+	return FALSE;
+}
+
+/*guess_element_res() -- guess_element(), for a name in a residue named resname.
+
+guess_element() reads the symbol off where the name sits in its four columns,
+which is right for a name in its proper place and gives a symbol that spells
+nothing for one that is not: a zinc written ' ZN ' reads as Z, an 'HB1 ' or 'OXT '
+started in column 13 as HB or OX, and every name read out of an mmCIF file,
+which has no columns, is put in column 14 first -- so its ZN, MG and FE came back
+Z, M and F.  Two readings are tried before that one:
+
+  * an atom named for its own residue, in two letters that spell an element, is
+    the ion of that element: ZN in ZN, NA in NA, CL in CL.  A carbon alpha is
+    named CA in a residue called something else, so it is not taken for calcium.
+  * a guess that spells no element is read the other way: a one-letter one as
+    the two letters the name starts with (' ZN ' is Zn), a two-letter one as its
+    first letter ('HB1 ' is H).
+
+A guess that already spells an element is not second-guessed, so a name in its
+proper place reads exactly as it did.*/
+static STRLEN guess_element_res(const char *CSP_RESTRICT raw, STRLEN rawlen,
+                                const char *CSP_RESTRICT resname, STRLEN resname_len,
+                                char *CSP_RESTRICT buf)
+{
+	STRLEN from = 0, to = rawlen, n;
+	while (from < to && raw[from] == ' ') from++;
+	while (to > from && raw[to - 1] == ' ') to--;
+	if (to - from == 2 && resname_len == 2
+	    && isALPHA((unsigned char)raw[from]) && isALPHA((unsigned char)raw[from + 1])
+	    && toUPPER((unsigned char)raw[from]) == toUPPER((unsigned char)resname[0])
+	    && toUPPER((unsigned char)raw[from + 1]) == toUPPER((unsigned char)resname[1])) {
+		char two[2];
+		two[0] = (char)toUPPER((unsigned char)raw[from]);
+		two[1] = (char)toUPPER((unsigned char)raw[from + 1]);
+		if (elem_symbol(two, 2)) { buf[0] = two[0]; buf[1] = two[1]; return 2; }
+	}
+	n = guess_element(raw, rawlen, buf);
+	if (n == 2 && !elem_symbol(buf, 2) && elem_symbol(buf, 1)) return 1;
+	if (n == 1 && !elem_symbol(buf, 1)) {
+		STRLEN i = from;
+		while (i < to && !isALPHA((unsigned char)raw[i])) i++;
+		if (i + 1 < to && isALPHA((unsigned char)raw[i + 1])) {
+			char two[2];
+			two[0] = (char)toUPPER((unsigned char)raw[i]);
+			two[1] = (char)toUPPER((unsigned char)raw[i + 1]);
+			if (elem_symbol(two, 2)) { buf[0] = two[0]; buf[1] = two[1]; return 2; }
+		}
+	}
+	return n;
 }
 
 /*elem_bump() -- add one to a tally kept in a hash.
@@ -937,15 +1044,41 @@ static void filer_init(pTHX_ atom_filer *CSP_RESTRICT f, bool highest){
 	f->highest   = highest;
 }
 
-//a residue run begins; model, chain and number as the record gave them
-static void filer_run(pTHX_ atom_filer *CSP_RESTRICT f, IV model, const char *CSP_RESTRICT chain,
-                      STRLEN chain_len, bool have_rs, IV rs, const char *CSP_RESTRICT icode)
-{
-	/*model, a NUL, the chain, a NUL, the number and insertion code as Perl
-	stringifies them.  The NULs cannot be in a chain id read off a record
-	line, which is what makes the three fields one unambiguous key.
+/*run_key() -- the key a residue run is filed under, and whether it is a residue
+of its own that shares its chain, number and insertion code with an earlier one.
 
-	An IV prints in at most 21 characters, so 64 holds either number.*/
+Runs that share those three are one residue -- an altloc group written apart, a
+ligand interleaved with the polymer -- and are filed together, here and in the
+Perl half.  The exception is a run of another residue name, whose first record
+has no altloc letter, where one of the two is a HETATM: a water written after
+TER under the protein's chain and a number the protein already used, or a
+docked ligand numbered 1 in the protein's chain.  The archive never writes one;
+other programs do, and it used to vanish into the residue it collided with, its
+atoms filed as that residue's conformers.
+
+Both conditions are other readers'.  Biopython 1.85 identifies a residue by its
+hetero field, number and insertion code, and the hetero field of a HETATM
+residue is its name ('H_LIG', or 'W' for a water) where an ATOM residue's is
+blank -- so it keeps an ATOM and a HETATM residue apart, and two HETATM residues
+of different names, as gemmi 0.7.5 does; two ATOM residues under one number are
+one residue to it, which is the reading t/foreign.t takes from its
+a_structure.pdb.  And one residue modelled in two chemical states writes every
+record of the second with an altloc letter -- 3zeu's MSE/MET, 2ftm's IAS/ASP,
+5nai's CSD/CYS, 5za2's SEP/SER and 6e4z's NEP/HIP all start each run with one --
+which keeps those one residue here, as they always were.
+
+The key is the model, a NUL, the chain, a NUL, and the number and insertion
+code as Perl stringifies them.  The NULs cannot be in a chain id read off a
+record line, which is what makes the three fields one unambiguous key.  A run
+that is apart has a NUL and its residue name on the end, so that the next run of
+the same residue finds it.  seen maps each key to 'H' or 'A', for the record
+type the residue was first filed under, followed by its residue name.  An IV
+prints in at most 21 characters, so 64 holds either number.*/
+static SV *run_key(pTHX_ HV *CSP_RESTRICT seen, IV model, const char *CSP_RESTRICT chain,
+                   STRLEN chain_len, bool have_rs, IV rs, const char *CSP_RESTRICT icode,
+                   const char *CSP_RESTRICT resname, STRLEN resname_len, bool het,
+                   bool lettered, bool *CSP_RESTRICT apart)
+{
 	char head[64];
 	SV *key = sv_2mortal(newSVpvs(""));
 	SV **slot;
@@ -959,7 +1092,28 @@ static void filer_run(pTHX_ atom_filer *CSP_RESTRICT f, IV model, const char *CS
 		sv_catpvn(key, head, hn);
 	}
 	sv_catpv(key, icode);
-	slot = hv_fetch(f->index, SvPVX(key), (I32)SvCUR(key), 0);
+	*apart = FALSE;
+	slot = hv_fetch(seen, SvPVX(key), (I32)SvCUR(key), 0);
+	if (!slot || !*slot) {
+		SV *first = newSVpvn(het ? "H" : "A", 1);
+		sv_catpvn(first, resname, resname_len);
+		(void)hv_store(seen, SvPVX(key), (I32)SvCUR(key), first, 0);
+		return key;
+	}
+	if (lettered) return key;
+	if (SvCUR(*slot) == resname_len + 1 && memcmp(SvPVX(*slot) + 1, resname, resname_len) == 0)
+		return key;
+	if (!het && SvPVX(*slot)[0] == 'A') return key;//two ATOM residues: one, to Biopython
+	*apart = TRUE;
+	sv_catpvn(key, "\0", 1);
+	sv_catpvn(key, resname, resname_len);
+	return key;
+}
+
+//a residue run begins, under the key run_key() gave it
+static void filer_run(pTHX_ atom_filer *CSP_RESTRICT f, SV *CSP_RESTRICT key)
+{
+	SV **slot = hv_fetch(f->index, SvPVX(key), (I32)SvCUR(key), 0);
 	if (slot && *slot) {
 		const SSize_t at = (SSize_t)SvIV(*slot);
 		SV **a = av_fetch(f->res_atoms, at, 0);
@@ -1081,6 +1235,9 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	/*the tally of the chain the current residue belongs to, refreshed at each
 	residue boundary; see chain_tally()*/
 	HV *cur_chain = NULL, *want_chain = NULL;
+	//every residue key met so far, for run_key(); and per run, whether it was apart
+	HV *res_seen;
+	AV *res_apart;
 	AV *atom_hv, *col[NCOL], *res_sum[NRSUM], *res_first, *res_last, *ter, *model_nums;
 	//whole-structure statistics over the atoms that were kept
 	UV n_hydrogen = 0, n_water_atom = 0, bn = 0;
@@ -1133,6 +1290,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 	atom_hv = newAV();
 	res_first = newAV(); res_last = newAV();
 	ter = newAV(); model_nums = newAV();
+	res_seen = newHV(); res_apart = newAV();
 	for (unsigned short i = 0; i < NCOL; i++)  col[i] = newAV();
 	for (unsigned short i = 0; i < NRSUM; i++) res_sum[i] = newAV();
 	if (build_atoms) filer_init(aTHX_ &filer, highest);
@@ -1141,18 +1299,28 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 		const char *CSP_RESTRICT line = buf + pos;
 		const char *nl = (const char *)memchr(line, '\n', len - pos);
 		STRLEN llen = nl ? (STRLEN)(nl - line) : (len - pos);
+		bool het;
+		STRLEN serial_from;
+		bool at_end;//this line is END, and the last one read
 		pos += llen + (nl ? 1 : 0);
 		lineno++;
 		while (llen && (line[llen - 1] == '\r' || line[llen - 1] == ' ' || line[llen - 1] == '\t'))
 			llen--;//DOS line ends, and the trailing blanks of a padded record
 		if (llen == 0) continue;
+		/*END closes the file, as gemmi 0.7.5 reads it.  What follows it -- the
+		second pose a docking program appends, a second structure concatenated
+		onto the first -- is not this structure, and was read into it, its
+		residues filed over the first one's under the same numbers.  The record
+		itself is filed and counted below, as it always was; the loop ends after
+		it.*/
+		at_end = (llen == 3 && rec_is(line, "END", 3));
 
-		if (llen >= 6 && (memcmp(line, "ATOM  ", 6) == 0 || memcmp(line, "HETATM", 6) == 0)) {
+		if (pdb_coord_rec(line, llen, &het, &serial_from)) {
 			const char *s, *nm_raw;
 			STRLEN nm_rawlen, n;
 			char elbuf[4], chain[4], icode[2], resname[8];;
 			STRLEN ellen;
-			bool known, have_rs, het = (line[0] == 'H');
+			bool known, have_rs;
 			res_info ri;
 			//the residue number, read once: the boundary test below wants it,
 			//and so does whichever of the two shapes the record is emitted in
@@ -1209,7 +1377,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 					if (!isALPHA((unsigned char)elbuf[k])) { ellen = 0; break; }
 				}
 			}
-			if (!ellen) ellen = guess_element(nm_raw, nm_rawlen, elbuf);
+			if (!ellen) ellen = guess_element_res(nm_raw, nm_rawlen, resname, resname_len, elbuf);
 	/*settled: the one spelling everything downstream sees, so that the
 	atom's own element, the whole-structure tally and the per-chain
 	tally cannot disagree about what to call a zinc*/
@@ -1250,12 +1418,19 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 					my_strlcpy(p_resname, resname, sizeof(p_resname));
 					cur_chain = chain_tally(aTHX_ chain_elements, cur_model,
 					                        chain, strlen(chain));
+					{
+						//the altloc, column 17, of the record the run starts on
+						bool apart;
+						SV *key = run_key(aTHX_ res_seen, cur_model, chain, strlen(chain),
+						                  have_rs, rs, icode, resname, resname_len, het,
+						                  llen > 16 && line[16] != ' ', &apart);
+						av_push(res_apart, newSViv(apart));
 	/*and the residue's identity, once, where the residue
 	begins: see the note where the atom's own fields are
 	emitted for why this is per residue in this shape and per
 	atom in the other*/
-					if (build_atoms)
-						filer_run(aTHX_ &filer, cur_model, chain, strlen(chain), have_rs, rs, icode);
+						if (build_atoms) filer_run(aTHX_ &filer, key);
+					}
 					if (build_atoms || slim) {
 						av_push(col[C_RESNAME], csp_str(aTHX_ resname, resname_len));
 						av_push(col[C_CHAIN],   csp_str(aTHX_ chain, strlen(chain)));
@@ -1282,7 +1457,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 				bool have_b = fld_nv(line, llen, 60, 65, &bv);
 
 				have_occ    = fld_nv(line, llen, 54, 59, &ov);
-				have_serial = fld_hy36(line, llen, 6, 10, &serial);
+				have_serial = fld_hy36(line, llen, serial_from, 10, &serial);
 				nm_n  = fld(line, llen, 12, 15, &nm_s);
 				alt_n = fld(line, llen, 16, 16, &alt_s);
 				chg_n = fld(line, llen, 78, 79, &chg_s);
@@ -1295,12 +1470,22 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 					chg_swap[1] = chg_s[0];
 					chg_s = chg_swap;
 				}
+				/*and zero has no sign: 4iu3 writes '0-', which is the '0' the
+				mmCIF reader gives for the same charge, and which was true in Perl
+				where a charge of zero is not*/
+				if (chg_n == 2 && chg_s[0] == '0') chg_n = 1;
 	/*The sums and extremes are gathered here rather than in Perl
 	because they have to touch every atom whether or not the caller
 	wanted per-atom hashes.  Doing them in the loop that is already
 	reading the numbers costs nothing; doing them again in Perl
-	costs more than the whole parse.*/
-				if (have_xyz) {
+	costs more than the whole parse.
+
+	Over the finite ones only.  A field that says nan is passed through
+	as the NaN it names, and the box, the centres and the B-factor
+	extremes took it in or not according to where in the file it fell:
+	first, and every comparison after it failed, so the box was NaN;
+	anywhere later, and it was quietly left out.*/
+				if (have_xyz && nv_is_finite(xv) && nv_is_finite(yv) && nv_is_finite(zv)) {
 					rsx += xv; rsy += yv; rsz += zv; rnc++;
 					if (!have_bbox) {
 						xmin = xmax = xv; ymin = ymax = yv; zmin = zmax = zv;
@@ -1311,7 +1496,7 @@ static HV *parse_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP_RES
 						if (zv < zmin) zmin = zv; else if (zv > zmax) zmax = zv;
 					}
 				}
-				if (have_b) {
+				if (have_b && nv_is_finite(bv)) {
 					rsb += bv; rnb++;
 					if (!bn++) { bmin = bmax = bv; }
 					else if (bv < bmin) bmin = bv;
@@ -1441,6 +1626,7 @@ a fact about the record rather than about the residue.*/
 				av_push(av, newSVpvn(line, llen));
 			}
 		}
+		if (at_end) break;
 	}
 	if (have_res) {
 		av_push(res_last, newSVuv(n_atom - 1));
@@ -1490,6 +1676,8 @@ a fact about the record rather than about the residue.*/
 	}
 	(void)hv_stores(out, "res_first",    newRV_noinc((SV *)res_first));
 	(void)hv_stores(out, "res_last",     newRV_noinc((SV *)res_last));
+	(void)hv_stores(out, "res_apart",    newRV_noinc((SV *)res_apart));
+	SvREFCNT_dec((SV *)res_seen);
 	if (build_atoms) filer_done(aTHX_ &filer, out);
 	(void)hv_stores(out, "ter",          newRV_noinc((SV *)ter));
 	(void)hv_stores(out, "meta",         newRV_noinc((SV *)meta));
@@ -1533,6 +1721,10 @@ and "unknown" -- comes back as the empty field the PDB record would have had*/
 
 typedef struct {
 	const char *buf, *end, *p;
+	/*per quote character, ' then ": the stretch of one line that has been
+	scanned for a closing quote and has none, from where the scan started to
+	the line's end; NULL until one is found.  See cif_next().*/
+	const char *open_from[2], *open_eol[2];
 } cif_lex;
 
 typedef struct {
@@ -1608,15 +1800,29 @@ static void cif_next(cif_lex *CSP_RESTRICT lx, cif_tok *CSP_RESTRICT t){
 	atom's name; ending the value at the line end would keep the rows but
 	leave this one short, and every value after it one column out.  Read as
 	a word, 'CA in an _atom_site row is an atom named 'CA and the loop stays
-	in step.*/
+	in step.
+
+	Every such word sent the scan to the end of its line again, so a line of
+	them cost the square of its length: 40,000 unclosed quotes on one line
+	took a second, against a hundredth for the same words without the quotes.
+	A scan that found no closing quote from s to the end of the line has
+	answered the question for any later s on that line too, since the stretch
+	it would search is part of the one already searched; that answer is kept
+	per quote character, and reused.*/
 		char qc = *p;
+		const unsigned short qi = (qc == '"');//which slot of open_from[]
 		const char *CSP_RESTRICT s = p + 1, *q = s;
 		bool closed = TRUE;//FALSE = the line or file ended first: not a quote after all
-		for (;;) {
-			while (q < end && *q != qc && *q != '\n') q++;
-			if (q >= end || *q == '\n') { closed = FALSE; break; }
-			if (q + 1 >= end || cif_space(q[1])) break;
-			q++;
+		if (lx->open_eol[qi] && s >= lx->open_from[qi] && s <= lx->open_eol[qi]) {
+			closed = FALSE;
+		} else {
+			for (;;) {
+				while (q < end && *q != qc && *q != '\n') q++;
+				if (q >= end || *q == '\n') { closed = FALSE; break; }
+				if (q + 1 >= end || cif_space(q[1])) break;
+				q++;
+			}
+			if (!closed) { lx->open_from[qi] = s; lx->open_eol[qi] = q; }
 		}
 		if (closed) {
 			t->s = s;
@@ -1714,6 +1920,9 @@ static STRLEN cif_charge(const char *CSP_RESTRICT s, STRLEN n, char *CSP_RESTRIC
 	two characters: an integer too wide for an IV -- twenty digits of one, or
 	ten on a 32-bit perl -- came back as "-9".*/
 		if (n > 2) return 0;
+		//and a zero has no sign in that spelling either: '0-' reads as the '0'
+		//the PDB reader gives for 4iu3's '0-'
+		if (n == 2 && s[0] == '0' && (s[1] == '+' || s[1] == '-')) { buf[0] = '0'; return 1; }
 		memcpy(buf, s, n);
 		return n;
 	}
@@ -1730,15 +1939,19 @@ static STRLEN cif_charge(const char *CSP_RESTRICT s, STRLEN n, char *CSP_RESTRIC
 it, and its rule is where in those four the name starts.  mmCIF has no columns,
 so the name goes back where the PDB convention would have put it before the
 question is asked.  Only reached when _atom_site.type_symbol is missing, which
-is rare -- but a file without it should still not read CA as calcium.*/
-static STRLEN cif_guess_element(const char *CSP_RESTRICT s, STRLEN n, char *CSP_RESTRICT buf){
+is rare -- but a file without it should still not read CA as calcium, and, the
+residue name being what tells an ion apart, should not read ZN as Z either; see
+guess_element_res().*/
+static STRLEN cif_guess_element(const char *CSP_RESTRICT s, STRLEN n,
+                                const char *CSP_RESTRICT resname, STRLEN resname_len,
+                                char *CSP_RESTRICT buf){
 	char pad[4];
-	if (n >= 4) return guess_element(s, 4, buf);
+	if (n >= 4) return guess_element_res(s, 4, resname, resname_len, buf);
 	pad[0] = ' ';
 	STRLEN i;
 	for (i = 0; i < n; i++)     pad[1 + i] = s[i];
 	for (i = n + 1; i < 4; i++) pad[i] = ' ';
-	return guess_element(pad, 4, buf);
+	return guess_element_res(pad, 4, resname, resname_len, buf);
 }
 
 /*Everything one _atom_site row needs to add itself to, gathered up so that a
@@ -1747,7 +1960,10 @@ table and a run of plain tags is the legal way to write a table with one row in
 it; both end up in cif_atom_row() rather than in two copies of it.*/
 typedef struct {
 	AV **col, **res_sum, *res_first, *res_last, *atom_hv, *model_nums;
+	AV *res_apart;//per run, as in parse_buf(); see run_key()
 	HV *elements, *chain_elements, *want_chain;
+	HV *res_seen;//every residue key met so far, for run_key()
+	HV *models_seen;//every model number met so far, as its decimal string
 	//the tally of the chain the current residue belongs to; see chain_tally()
 	HV *cur_chain;
 	UV n_hydrogen, n_water_atom, bn;
@@ -1767,6 +1983,21 @@ typedef struct {
 	STRLEN p_chain_len;
 	IV p_resseq, p_model;
 } cif_state;
+
+/*cif_model_seen() -- a row of a model not met before: counted, and listed.
+
+Counted as distinct numbers, not as changes of number from one row to the
+next.  mmCIF does not require the rows to be in model order, and a file that
+lists chain A of models 1 and 2 and then chain B of models 1 and 2 has two
+models, not the four the changes add up to -- gemmi 0.7.5 finds two.*/
+static void cif_model_seen(pTHX_ cif_state *CSP_RESTRICT st, IV model){
+	char mbuf[32];//an IV prints in at most 21 characters, sign included
+	const STRLEN mlen = (STRLEN)my_snprintf(mbuf, sizeof(mbuf), "%" IVdf, model);
+	if (hv_exists(st->models_seen, mbuf, (I32)mlen)) return;
+	(void)hv_store(st->models_seen, mbuf, (I32)mlen, newSV(0), 0);
+	st->n_models++;
+	av_push(st->model_nums, newSViv(model));
+}
 
 /*one row of _atom_site.  v[] holds a pointer and a length per known column, or
 NULL where the row said `.' or `?' or the file has no such column, so that "the
@@ -1791,14 +2022,12 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st, const char **CSP_REST
 		if (!st->seen_model || model != st->cur_model) {
 			st->cur_model = model;
 			st->seen_model = 1;
-			st->n_models++;
-			av_push(st->model_nums, newSViv(model));
+			cif_model_seen(aTHX_ st, model);
 		}
 	} else if (!st->seen_model) {
 		st->cur_model = 1;
 		st->seen_model = 1;
-		st->n_models++;
-		av_push(st->model_nums, newSViv(1));
+		cif_model_seen(aTHX_ st, 1);
 	}
 
 	het = v[A_GROUP] && vn[A_GROUP] >= 6 && cif_iskw(v[A_GROUP], vn[A_GROUP], "hetatm", 6);
@@ -1848,7 +2077,7 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st, const char **CSP_REST
 		for (k = 0; k < ellen; k++)
 			if (!isALPHA((unsigned char)elbuf[k])) { ellen = 0; break; }
 	}
-	if (!ellen) ellen = cif_guess_element(nm_s, nm_n, elbuf);
+	if (!ellen) ellen = cif_guess_element(nm_s, nm_n, resname, resname_len, elbuf);
 	//settled, and spelled as the PDB reader spells it; see elem_case()
 	elem_case(elbuf, ellen);
 	if (!st->keep_h && ellen == 1 && (elbuf[0] == 'H' || elbuf[0] == 'D')) {
@@ -1893,8 +2122,13 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st, const char **CSP_REST
 		my_strlcpy(st->p_resname, resname, sizeof(st->p_resname));
 		st->cur_chain = chain_tally(aTHX_ st->chain_elements, st->cur_model,
 		                            chain, chain_len);
-		if (st->build_atoms)
-			filer_run(aTHX_ &st->filer, st->cur_model, chain, chain_len, have_rs, rs, icode);
+		{
+			bool apart;
+			SV *key = run_key(aTHX_ st->res_seen, st->cur_model, chain, chain_len,
+			                  have_rs, rs, icode, resname, resname_len, het, alt_n > 0, &apart);
+			av_push(st->res_apart, newSViv(apart));
+			if (st->build_atoms) filer_run(aTHX_ &st->filer, key);
+		}
 		//and the residue's identity, once per residue, as parse_buf() emits it
 		if (st->build_atoms || st->slim) {
 			av_push(st->col[C_RESNAME], csp_str(aTHX_ resname, resname_len));
@@ -1916,7 +2150,8 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st, const char **CSP_REST
 	have_serial = v[A_ID]  && str2iv(v[A_ID],  vn[A_ID],  &serial);
 	chg_n = v[A_CHARGE] ? cif_charge(v[A_CHARGE], vn[A_CHARGE], chgbuf) : 0;
 
-	if (have_xyz) {
+	//over the finite values only, as parse_buf() gathers them and for its reason
+	if (have_xyz && nv_is_finite(xv) && nv_is_finite(yv) && nv_is_finite(zv)) {
 		st->rsx += xv; st->rsy += yv; st->rsz += zv; st->rnc++;
 		if (!st->have_bbox) {
 			st->xmin = st->xmax = xv; st->ymin = st->ymax = yv; st->zmin = st->zmax = zv;
@@ -1927,7 +2162,7 @@ static void cif_atom_row(pTHX_ cif_state *CSP_RESTRICT st, const char **CSP_REST
 			if (zv < st->zmin) st->zmin = zv; else if (zv > st->zmax) st->zmax = zv;
 		}
 	}
-	if (have_b) {
+	if (have_b && nv_is_finite(bv)) {
 		st->rsb += bv; st->rnb++;
 		if (!st->bn++) { st->bmin = st->bmax = bv; }
 		else if (bv < st->bmin) st->bmin = bv;
@@ -2048,6 +2283,9 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	cif_lex lx;
 	cif_tok tk;
 	bool keep_meta, have_single = 0;;
+	//an _atom_site_anisotrop of one row written as plain tags; see below
+	bool have_aniso_single = FALSE;
+	bool seen_block = FALSE;
 	UV lineno = 0;
 	SV *block = NULL;
 	const char *v[A_NFIELD], *sv_[A_NFIELD];
@@ -2079,6 +2317,9 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	st.res_last   = newAV();
 	st.atom_hv    = newAV();
 	st.model_nums = newAV();
+	st.res_apart  = newAV();
+	st.res_seen   = newHV();
+	st.models_seen = newHV();
 	st.elements   = newHV();
 	st.chain_elements = newHV();
 	if (st.build_atoms) filer_init(aTHX_ &st.filer, st.filer.highest);
@@ -2096,13 +2337,22 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 	lx.buf = buf;
 	lx.end = buf + len;
 	lx.p   = buf;
+	lx.open_from[0] = lx.open_from[1] = lx.open_eol[0] = lx.open_eol[1] = NULL;
 
 	for (;;) {
 		cif_next(&lx, &tk);
 		if (tk.kind == CT_EOF) break;
 
+		/*The first data block is the structure, and a second one ends it.  The
+		blocks were read as one, so a file of two structures came back as one
+		with every atom twice -- the second block's under the first's residue
+		numbers, as conformers of them -- and the second block's header over the
+		first's.  gemmi 0.7.5 takes a file of several blocks only when the
+		first is the one with the coordinates, and reads that one.*/
 		if (tk.kind == CT_DATA) {
-			if (!block && tk.n) block = newSVpvn(tk.s, tk.n);
+			if (seen_block) break;
+			seen_block = TRUE;
+			if (tk.n) block = newSVpvn(tk.s, tk.n);
 			continue;
 		}
 		if (tk.kind == CT_STOP || tk.kind == CT_SAVE) continue;
@@ -2177,6 +2427,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 				const char *CSP_RESTRICT save = lx.p;
 				size_t col_i;
 				HV *row = NULL;
+				bool whole = FALSE;//the row had a value for every tag
 				cif_next(&lx, &tk);
 				if (tk.kind != CT_VALUE) { lx.p = save; break; }
 				if (is_atom) for (i = 0; i < A_NFIELD; i++) { v[i] = NULL; vn[i] = 0; }
@@ -2199,7 +2450,20 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 					} else if (row) {
 						(void)hv_store_ent(row, col_key[col_i], cif_sv(aTHX_ &tk), 0);
 					}
-					if (col_i + 1 >= ntags) break;
+					if (col_i + 1 >= ntags) { whole = TRUE; break; }
+				}
+				/*A row with fewer values than the loop has tags is the last one,
+				since only something other than a value can have ended it, and it
+				means the file was cut short: gemmi 0.7.5 refuses the file, 'Wrong
+				number of values in loop'.  It is left out rather than read as a row,
+				which made an atom of an _atom_site row that stopped after its x --
+				no y, no z, and the label_* chain and number for want of the auth_*
+				ones further along -- and counted it among the atoms.  Every whole
+				row before it is read, as the whole lines of a cut-short PDB file
+				are.*/
+				if (!whole) {
+					if (row) SvREFCNT_dec((SV *)row);
+					break;
 				}
 				if (is_atom)      cif_atom_row(aTHX_ &st, v, vn);
 				else if (is_aniso) st.n_anisou++;
@@ -2225,8 +2489,14 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 				if (f >= 0 && !cif_null(&tk)) { sv_[f] = tk.s; svn_[f] = tk.n; have_single = 1; }
 				continue;
 			}
+			/*One row of _atom_site_anisotrop written as plain tags, which is the
+			table the loop above counts a row of at a time: one record, however
+			many tags it took, and counted below.  Each tag counted one, so a
+			record of eight tags came back as eight; and, kept nowhere, it was lost
+			with anisou => 1 where the loop's rows were kept.*/
 			if (catn == 20 && cif_iskw(tag, catn, "_atom_site_anisotrop", 20)) {
-				st.n_anisou++;
+				have_aniso_single = TRUE;
+				if (keep_meta && st.keep_anisou) cif_store_lc(aTHX_ cif, tag, tagn, cif_sv(aTHX_ &tk));
 				continue;
 			}
 			if (keep_meta) cif_store_lc(aTHX_ cif, tag, tagn, cif_sv(aTHX_ &tk));
@@ -2234,6 +2504,7 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 		}
 		//a stray value with no tag in front of it: nothing to attach it to
 	}
+	if (have_aniso_single) st.n_anisou++;
 	if (have_single) cif_atom_row(aTHX_ &st, sv_, svn_);
 	if (st.have_res) {
 		av_push(st.res_last, newSVuv(st.n_atom - 1));
@@ -2282,6 +2553,9 @@ static HV *parse_cif_buf(pTHX_ const char *CSP_RESTRICT buf, STRLEN len, HV *CSP
 		               newRV_noinc((SV *)col[i]), 0);
 	}
 	(void)hv_stores(out, "res_first",     newRV_noinc((SV *)st.res_first));
+	(void)hv_stores(out, "res_apart",     newRV_noinc((SV *)st.res_apart));
+	SvREFCNT_dec((SV *)st.res_seen);
+	SvREFCNT_dec((SV *)st.models_seen);
 	if (st.build_atoms) filer_done(aTHX_ &st.filer, out);
 	(void)hv_stores(out, "res_last",      newRV_noinc((SV *)st.res_last));
 	//TER is a PDB record and has no mmCIF counterpart; the key is here so that
@@ -2364,6 +2638,36 @@ static char *slurp(pTHX_ const char *CSP_RESTRICT path, STRLEN *CSP_RESTRICT len
 	PerlIO_close(fh);
 	*lenp = len;
 	return buf;
+}
+
+/*text_bytes() -- the bytes of a structure handed over as a string, the same
+bytes whichever way perl happens to be holding it.
+
+SvPV() hands back a string's buffer as it is stored, and a string perl has
+upgraded to UTF-8 stores an author's name with one accented letter in it as a
+byte longer than the same string not upgraded -- equal strings, eq says so,
+that parsed differently: the upgraded one's author came back as those bytes,
+the accented letter printing as two, and a character past ASCII in an ATOM
+line put every column after it one out.  A caller who decoded a file before
+handing it over got that.  So a string holding UTF-8 is read through a copy
+downgraded to one byte per character, which every string whose characters fit
+in a byte has, and that is every structure file there is.  A string with a
+character beyond U+00FF cannot be downgraded and is read as the UTF-8 it
+holds, which is what reading the file it came from would have given.
+
+The string is fetched once, so a tied one is read once, and the flag is asked
+after the fetch, which is when it is true of what was fetched.  The copy is
+mortal and lives until the XSUB that asked for it has returned, and is only
+read, as the whole-file buffer is.*/
+//text is not CSP_RESTRICT: it is a perl SV, and perl may alias it
+static const char *text_bytes(pTHX_ SV *text, STRLEN *CSP_RESTRICT len){
+	const char *p = SvPV_const(text, *len);
+	SV *copy;
+	if (!SvUTF8(text)) return p;
+	copy = sv_2mortal(newSVpvn(p, *len));
+	SvUTF8_on(copy);
+	(void)sv_utf8_downgrade(copy, TRUE);
+	return SvPV_const(copy, *len);
 }
 
 /*asking a parsed chain a question.
@@ -3162,6 +3466,62 @@ static UV grid_axis(NV d, NV cell, UV n){
 	return (UV)k;//truncation is floor here: k is positive
 }
 
+//qsort()'s order for NVs; grid_trim() hands it finite values only
+static int nv_cmp(const void *pa, const void *pb){
+	const NV a = *(const NV *)pa, b = *(const NV *)pb;
+	return (a > b) - (a < b);
+}
+
+/*grid_trim() -- the box over the bulk of the points, leaving out the few far
+from the rest.
+
+grid_build() caps the cells at eight per point, and a box much larger than the
+structure meets the cap by widening the cells.  One far point is enough to make
+the box that: a zinc at (9999.999, 9999.999, 9999.999) beside 4fqr's 90,792 atoms
+(PDBbind v2020) widened the cells to 110 A, made every atom a neighbour of
+thousands, and took structure_sasa() of it from 1.4 s to 29.5 s.  So where the
+box over every point would need wider cells, the box is taken per axis from the
+k-th smallest coordinate to the k-th largest, k a hundredth of the points, and
+grid_axis() puts the points outside it in the end cells, as it already does a
+non-finite one.
+
+That changes no answer, only the time and the order a search meets the points
+in -- which is the order a list of pairs found by walking the grid comes out
+in, and structure_contacts() and the rest promise none.  Clamping into the box
+never moves two coordinates further apart, so two points within a cell's width
+of each other still land in the same or adjacent cells, which are the ones
+every search here looks in; a point outside the box is compared with what lies
+near the box's edge, and the distance test, not the cell, is what decides
+whether it is a neighbour.
+
+lo and hi hold the box over every finite point on the way in and the trimmed one
+on the way out, x then y then z.  x, y and z are not CSP_RESTRICT: each is read
+again through the axis pointer the loop below takes from it.  Sorted with
+qsort() rather than selected, because this runs only for a box the cap has
+already had to widen, which in a real structure is a sparse set of a few
+hundred points at most -- ring or base centroids -- and in a whole structure
+only one with a point far from the rest.*/
+static void grid_trim(pTHX_ const NV *x, const NV *y, const NV *z, UV n,
+                      NV *CSP_RESTRICT lo, NV *CSP_RESTRICT hi)
+{
+	NV *CSP_RESTRICT v;
+	const NV *axis[3];
+	axis[0] = x; axis[1] = y; axis[2] = z;
+	Newx(v, n, NV);
+	for (unsigned short a = 0; a < 3; a++) {
+		UV m = 0, k;
+		for (UV i = 0; i < n; i++)
+			if (nv_is_finite(x[i]) && nv_is_finite(y[i]) && nv_is_finite(z[i]))
+				v[m++] = axis[a][i];
+		k = m / 100;
+		if (k == 0) continue;//too few points to leave any out
+		qsort(v, (size_t)m, sizeof(NV), nv_cmp);
+		lo[a] = v[k];
+		hi[a] = v[m - 1 - k];
+	}
+	Safefree(v);
+}
+
 static void grid_build(pTHX_ cell_grid *CSP_RESTRICT g, const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y, const NV *CSP_RESTRICT z, UV n, NV cut){
 	NV xmax, ymax, zmax, cells = 0.0;
 	UV ncell, c;
@@ -3173,8 +3533,9 @@ static void grid_build(pTHX_ cell_grid *CSP_RESTRICT g, const NV *CSP_RESTRICT x
 	anywhere in the set made the extent non-finite, so the loop below never
 	settled and every point went into one cell: a whole-structure surface
 	quadratic in the atoms.  grid_axis() already puts a non-finite point in an
-	end cell, where it is found as nobody's neighbour, since every distance to
-	it compares false.  x - x is 0 for a finite x and NaN otherwise, which is
+	end cell, where it is found as nobody's neighbour: every distance to it
+	compares false, and every search is written as the test a neighbour passes,
+	so false is no.  x - x is 0 for a finite x and NaN otherwise, which is
 	the test without isfinite(), a C99 macro, or Perl_isinf(), which on perls
 	before 5.22 can route through a Perl_fp_class() block that never compiled.*/
 	g->x0 = g->y0 = g->z0 = xmax = ymax = zmax = 0.0;
@@ -3190,6 +3551,31 @@ static void grid_build(pTHX_ cell_grid *CSP_RESTRICT g, const NV *CSP_RESTRICT x
 		if (z[i] < g->z0) g->z0 = z[i]; else if (z[i] > zmax) zmax = z[i];
 	}
 	g->cell = (cut > 0.0) ? cut : 1.0;
+	/*A box the cells would have to be widened for, which a few far points can
+	make of one that is otherwise compact: see grid_trim().  The trimmed box is
+	taken only where it is at least eight times smaller in cells, which takes a
+	point far outside the rest.  A sparse set needs the widening without one --
+	the ring centroids of a large protein, a few hundred points through its
+	whole volume -- and trimming a hundredth of them off each end moved its
+	grid enough to list the same pi-stacked pairs in another order: 50 of 1,012
+	entries of PDBbind v2020 did, with grid_trim() taken on any box the cap
+	widened.  At eight times, none does, and 4fqr with a zinc at 9999.999 is
+	trimmed by a factor of a million.*/
+	if (have_box) {
+		const NV whole = ((xmax - g->x0) / g->cell + 1.0) * ((ymax - g->y0) / g->cell + 1.0)
+		               * ((zmax - g->z0) / g->cell + 1.0);
+		if (whole > (NV)n * 8.0 + 1024.0) {
+			NV lo[3], hi[3];
+			lo[0] = g->x0; lo[1] = g->y0; lo[2] = g->z0;
+			hi[0] = xmax;  hi[1] = ymax;  hi[2] = zmax;
+			grid_trim(aTHX_ x, y, z, n, lo, hi);
+			if (((hi[0] - lo[0]) / g->cell + 1.0) * ((hi[1] - lo[1]) / g->cell + 1.0)
+			    * ((hi[2] - lo[2]) / g->cell + 1.0) * 8.0 < whole) {
+				g->x0 = lo[0]; g->y0 = lo[1]; g->z0 = lo[2];
+				xmax  = hi[0]; ymax  = hi[1]; zmax  = hi[2];
+			}
+		}
+	}
 	/*Widen the cells until there are at most eight per point.  Doubling, so a
 	box a kilometre across settles in a few dozen turns; the counter is there for
 	the case the extent is not a finite number at all, where the test below can
@@ -3530,7 +3916,7 @@ static void sasa_kernel(pTHX_ const NV *CSP_RESTRICT x, const NV *CSP_RESTRICT y
 				dx = x[a] - xi; dy = y[a] - yi; dz = z[a] - zi;
 				sum = ri + rad[a];
 				d2 = dx * dx + dy * dy + dz * dz;
-				if (d2 >= sum * sum) continue;
+				if (!(d2 < sum * sum)) continue;//not >=: a NaN distance is no neighbour
 				if (n_nbr == nbr_cap) {
 					nbr_cap *= 2;
 					Renew(nx,  nbr_cap, NV);
@@ -4005,7 +4391,7 @@ static AV *pi_stacking(pTHX_ structset *CSP_RESTRICT s, const pi_opt *CSP_RESTRI
 				if (rings[i].res == rings[j].res) continue;//fused, not stacked
 				vx = cx[j] - cx[i]; vy = cy[j] - cy[i]; vz = cz[j] - cz[i];
 				d = nv_sqrt(vx * vx + vy * vy + vz * vz);
-				if (d > cut) continue;
+				if (!(d <= cut)) continue;//not >: a NaN distance is no pair
 				plane = vec_angle_capped(rings[i].nx, rings[i].ny, rings[i].nz,
 				                         rings[j].nx, rings[j].ny, rings[j].nz);
 				/*One capped angle serves for both of mdtraj's: it takes the
@@ -4264,7 +4650,7 @@ static AV *base_pairs(pTHX_ structset *CSP_RESTRICT s, NV hb, NV stagger, bool s
 				if (!kind) continue;
 				vx = cx[j] - cx[i]; vy = cy[j] - cy[i]; vz = cz[j] - cz[i];
 				d = nv_sqrt(vx * vx + vy * vy + vz * vz);
-				if (d > cut) continue;
+				if (!(d <= cut)) continue;//not >: a NaN distance is no pair
 				for (k = 0; k < kind->n; k++) {
 					/*the table names the purine's atom first, so a pair whose
 					purine is the later residue reads its two names backwards*/
@@ -5051,7 +5437,13 @@ static bool dihedral4(const NV *CSP_RESTRICT p0, const NV *CSP_RESTRICT p1, cons
 	cr[2] = b1[0] * v[1] - b1[1] * v[0];
 	x = v[0] * w[0] + v[1] * w[1] + v[2] * w[2];
 	y = cr[0] * w[0] + cr[1] * w[1] + cr[2] * w[2];
-	*out = nv_atan2(y, x);
+	/*an infinite coordinate passes every test above and arrives here as a
+	NaN, which is no angle: refused, as a point that makes none is*/
+	{
+		const NV angle = nv_atan2(y, x);
+		if (!nv_is_finite(angle)) return FALSE;
+		*out = angle;
+	}
 	return 1;
 }
 
@@ -5304,8 +5696,10 @@ static void nuc_torsions(pTHX_ HV *CSP_RESTRICT me, HV *CSP_RESTRICT my_at,
 		/*A ring flat to the last bit has no phase -- every P describes it as
 		well as every other, and atan2(0, 0) would answer 0 as though one of
 		them did.  Real geometry never gets there; a fixture built on a straight
-		line has no nu at all, dihedral4() having refused them.*/
-		if (num != 0.0 || den != 0.0) {
+		line has no nu at all, dihedral4() having refused them.  Nor does a
+		phase that is not a number name a pucker: it is cast to an index
+		below, and a NaN cast to an integer is undefined behaviour.*/
+		if ((num != 0.0 || den != 0.0) && nv_is_finite(num) && nv_is_finite(den)) {
 			const NV pr = nv_atan2(num, den);
 			const NV cp = nv_cos(pr);
 			NV phase = pr * to_deg;
@@ -5617,7 +6011,7 @@ static AV *contacts_find(pTHX_ structset *CSP_RESTRICT s, NV cut, bool store){
 					if (hres[j] <= r) continue;//each residue pair once
 					dx = hx[j] - hx[i]; dy = hy[j] - hy[i]; dz = hz[j] - hz[i];
 					d2 = dx * dx + dy * dy + dz * dz;
-					if (d2 >= cut * cut) continue;
+					if (!(d2 < cut * cut)) continue;//not >=: a NaN distance is no contact
 					d = nv_sqrt(d2);
 					for (k = 0; k < n_touch; k++)
 						if (touching[k].res == hres[j]) break;
@@ -5777,7 +6171,7 @@ static void hse_compute(pTHX_ structset *CSP_RESTRICT s, NV radius){
 					NV dx, dy, dz;
 					if (j == r) continue;
 					dx = cax[j] - cax[r]; dy = cay[j] - cay[r]; dz = caz[j] - caz[r];
-					if (dx * dx + dy * dy + dz * dz >= radius * radius) continue;
+					if (!(dx * dx + dy * dy + dz * dz < radius * radius)) continue;//a NaN is no neighbour
 					if (dx * pcb[0] + dy * pcb[1] + dz * pcb[2] > 0.0) up++;
 					else down++;
 				}
@@ -5875,6 +6269,11 @@ static NV ks_energy(const backbone *CSP_RESTRICT a, const NV *CSP_RESTRICT h,
 	}
 	r_on = nv_sqrt(r_on); r_ch = nv_sqrt(r_ch);
 	r_oh = nv_sqrt(r_oh); r_cn = nv_sqrt(r_cn);
+	/*an atom that read as nan is no bond at all.  It failed the `> 0.0' tests
+	below the way two atoms at one point do, and came back as the strongest
+	bond there is: a NaN on one carbonyl O gave eleven bonds of -9.9 to fold.pdb,
+	which crowded real ones out of each donor's best two.*/
+	if (!nv_is_finite(r_on + r_ch + r_oh + r_cn)) return 0.0;
 	if (!(r_on > 0.0) || !(r_ch > 0.0) || !(r_oh > 0.0) || !(r_cn > 0.0))
 		return CSP_KS_FLOOR;
 	e = CSP_KS_Q * (1.0 / r_on + 1.0 / r_ch - 1.0 / r_oh - 1.0 / r_cn);
@@ -5944,7 +6343,7 @@ static void ks_compute(pTHX_ structset *CSP_RESTRICT s, const backbone *CSP_REST
 				NV dx, dy, dz, e;
 				if (a == d || (d > 0 && a == d - 1)) continue;
 				dx = cx[q] - cx[k]; dy = cy[q] - cy[k]; dz = cz[q] - cz[k];
-				if (dx * dx + dy * dy + dz * dz >= CSP_KS_CA * CSP_KS_CA) continue;
+				if (!(dx * dx + dy * dy + dz * dz < CSP_KS_CA * CSP_KS_CA)) continue;//a NaN is no neighbour
 				e = ks_energy(&bb[a], h, bb[d].n);
 				if (!(e < CSP_KS_CUTOFF)) continue;
 				//keep the two best, best first
@@ -6410,9 +6809,11 @@ kept rather than the runs.  n_i is the count the join does not disturb, and
 tells an isolated bridge from a ladder.*/
 typedef struct {
 	unsigned char type;//BR_PARA or BR_ANTI
-	UV chain_i;//the DSSP chain the i run is in; mdtraj's Bridge keeps
-//the j run's as well and never reads it, so this does not
-	UV i_first, i_last, j_first, j_last, n_i, seq;//the order it was found in, so the sort below is stable
+	/*the DSSP chain the i run is in.  mdtraj's Bridge keeps the j run's as well
+	and never reads it, so this does not keep it.*/
+	UV chain_i;
+	UV i_first, i_last, j_first, j_last, n_i;
+	UV seq;//the order it was found in, so the sort below is stable
 } dssp_bridge;
 
 static int dssp_bridge_cmp(const void *pa, const void *pb){
@@ -6863,7 +7264,12 @@ static UV grid_within(pTHX_ const cell_grid *CSP_RESTRICT g, const NV *CSP_RESTR
 		for (p = g->start[cell]; p < g->start[cell + 1]; p++) {
 			UV j = g->idx[p];
 			NV dx = x[j] - px, dy = y[j] - py, dz = z[j] - pz;
-			if (dx * dx + dy * dy + dz * dz >= cut * cut) continue;
+			/*written as the test a neighbour passes, not the one it fails: a
+			distance to a NaN coordinate compares false either way, and `>='
+			let it through, so an atom that read as nan was every atom's
+			neighbour -- a contact with each residue near the end cell it was
+			put in, at a distance of NaN*/
+			if (!(dx * dx + dy * dy + dz * dz < cut * cut)) continue;
 			if (n == *cap) { *cap = *cap ? *cap * 2 : 64; Renew(*buf, *cap, UV); }
 			(*buf)[n++] = j;
 		}
@@ -7158,7 +7564,7 @@ static HV *iface_compute(pTHX_ structset *CSP_RESTRICT s, AV *sides[2], UV npts,
 				if (j == a) continue;
 				dx = s->x[j] - s->x[a]; dy = s->y[j] - s->y[a]; dz = s->z[j] - s->z[a];
 				sum = s->rad[a] + s->rad[j];
-				if (dx * dx + dy * dy + dz * dz >= sum * sum) continue;
+				if (!(dx * dx + dy * dy + dz * dz < sum * sum)) continue;//a NaN is no neighbour
 				if (w.side_at[j] == 0) w.ex[k] = 1;
 				else if (w.side_at[j] != w.side_at[a]) w.other[k] = 1;
 			}
@@ -8116,6 +8522,89 @@ Newton had not converged, and the answer is then whatever the last iterate
 was, which is what qcprot does too.*/
 #define CSP_QCP_ITER 50
 
+/*sym4_top() -- the eigenvector of the largest eigenvalue of a symmetric 4x4, by
+the cyclic Jacobi method sym3_eigenvalues() uses, with the rotations gathered
+into the eigenvectors as they are applied.  m is worked on in place.  A Jacobi
+rotation neither knows nor cares whether an eigenvalue repeats, which is the
+case qcp_rotation() needs it for; the answer is then any unit vector of that
+eigenvalue's plane, and every one of them is as good a rotation as the others.
+
+A matrix that is zero, or already diagonal, is left alone, and the eigenvector
+is the axis of its largest diagonal entry -- the first axis, the identity
+quaternion, for the zero one.  Sixty-four sweeps is a bound and not a tuning
+parameter: a 4x4 converges quadratically in a handful.  m and out are array
+parameters, without CSP_RESTRICT for qcp_rotation()'s reason.*/
+static void sym4_top(NV m[4][4], NV out[4]){
+	NV v[4][4];
+	unsigned short sweep, p, q, k, top;
+	for (p = 0; p < 4; p++)
+		for (q = 0; q < 4; q++)
+			v[p][q] = (p == q) ? 1.0 : 0.0;
+	for (sweep = 0; sweep < 64; sweep++) {
+		NV off = 0.0, diag = 0.0;
+		for (p = 0; p < 4; p++) {
+			diag += m[p][p] * m[p][p];
+			for (q = (unsigned short)(p + 1); q < 4; q++) off += m[p][q] * m[p][q];
+		}
+		if (!(off > NV_EPSILON * NV_EPSILON * diag)) break;
+		for (p = 0; p < 3; p++) {
+			for (q = (unsigned short)(p + 1); q < 4; q++) {
+				const NV apq = m[p][q];
+				NV theta, th2, t, c, sn;
+				if (!(nv_fabs(apq) > 0.0)) continue;
+				theta = (m[q][q] - m[p][p]) / (2.0 * apq);
+				th2 = theta * theta;
+				//the smaller root, as in sym3_eigenvalues(); 1/(2 theta) is its
+				//limit where theta squared would overflow
+				t = nv_is_finite(th2)
+				  ? (theta >= 0.0 ? 1.0 : -1.0) / (nv_fabs(theta) + nv_sqrt(1.0 + th2))
+				  : 0.5 / theta;
+				c = 1.0 / nv_sqrt(1.0 + t * t);
+				sn = t * c;
+				for (k = 0; k < 4; k++) {
+					const NV mkp = m[k][p], mkq = m[k][q];
+					m[k][p] = c * mkp - sn * mkq;
+					m[k][q] = sn * mkp + c * mkq;
+				}
+				for (k = 0; k < 4; k++) {
+					const NV mpk = m[p][k], mqk = m[q][k];
+					m[p][k] = c * mpk - sn * mqk;
+					m[q][k] = sn * mpk + c * mqk;
+				}
+				for (k = 0; k < 4; k++) {
+					const NV vkp = v[k][p], vkq = v[k][q];
+					v[k][p] = c * vkp - sn * vkq;
+					v[k][q] = sn * vkp + c * vkq;
+				}
+			}
+		}
+	}
+	top = 0;
+	for (k = 1; k < 4; k++) if (m[k][k] > m[top][top]) top = k;
+	for (k = 0; k < 4; k++) out[k] = v[k][top];
+}
+
+/*quat_rot() -- the rotation a quaternion stands for, normalised first, in the
+column-vector convention qcp_rotation() returns; the arithmetic is Biopython
+1.85's qcprot.py, transposed.  Array parameters, so no CSP_RESTRICT, for
+qcp_rotation()'s reason.*/
+static void quat_rot(const NV qv[4], NV rot[3][3]){
+	const NV qn = nv_sqrt(qv[0] * qv[0] + qv[1] * qv[1] + qv[2] * qv[2] + qv[3] * qv[3]);
+	const NV q1 = qv[0] / qn, q2 = qv[1] / qn, q3 = qv[2] / qn, q4 = qv[3] / qn;
+	const NV a2 = q1 * q1, x2 = q2 * q2, y2 = q3 * q3, z2 = q4 * q4;
+	const NV xy = q2 * q3, az = q1 * q4, zx = q4 * q2;
+	const NV ay = q1 * q3, yz = q3 * q4, ax = q1 * q2;
+	rot[0][0] = a2 + x2 - y2 - z2;
+	rot[1][0] = 2.0 * (xy + az);
+	rot[2][0] = 2.0 * (zx - ay);
+	rot[0][1] = 2.0 * (xy - az);
+	rot[1][1] = a2 - x2 + y2 - z2;
+	rot[2][1] = 2.0 * (yz + ax);
+	rot[0][2] = 2.0 * (zx + ay);
+	rot[1][2] = 2.0 * (yz - ax);
+	rot[2][2] = a2 - x2 - y2 + z2;
+}
+
 /*qcp_rotation() -- the rotation that best superposes one centred point set on
 another, from the inner-product matrix of the two.
 
@@ -8149,9 +8638,8 @@ clears 1e-6, which is an absolute threshold on a quantity that scales as the
 sixth power of the coordinates -- what it means for a tetrapeptide and what it
 means for a ribosome are different things.  All four are computed here and the
 longest is taken, which is the same vector whenever qcprot finds one and needs
-no threshold to choose.  Only "all four vanish" is left to decide, and that one
-is scaled: it says the key matrix is numerically zero, and there is nothing to
-rotate.
+no threshold to choose.  Only "all four are too short to trust" is left to
+decide, and that one is scaled; what is done then is argued where it is done.
 
 Returns the rotation as rot[p][q] with b = rot . a, the column-vector
 convention -- the transpose of the one Biopython applies as coords.dot(rot).
@@ -8195,8 +8683,7 @@ static void qcp_rotation(NV s[3][3], NV e0, NV rot[3][3])
 	NV a11, a12, a13, a14, a21, a22, a23, a24;
 	NV a31, a32, a33, a34, a41, a42, a43, a44;
 	NV a3344_4334, a3244_4234, a3243_4233, a3143_4133, a3144_4134, a3142_4132;
-	NV q[4][4], qsqr[4], best, scale, qn;
-	NV a2, x2, y2, z2, xy, az, zx, ay, yz, ax;
+	NV q[4][4], qsqr[4], best, scale;
 	unsigned short it, k, kbest;
 
 	for (it = 0; it < CSP_QCP_ITER; it++) {
@@ -8253,13 +8740,36 @@ static void qcp_rotation(NV s[3][3], NV e0, NV rot[3][3])
 		qsqr[k] = q[k][0] * q[k][0] + q[k][1] * q[k][1] + q[k][2] * q[k][2] + q[k][3] * q[k][3];
 		if (qsqr[k] > best) { best = qsqr[k]; kbest = k; }
 	}
-	/*"all four rows vanish", scaled so that it means the same at every size.
-	Each cofactor is a 3x3 determinant of a[][] entries, so it scales as the
-	cube of the largest of them and its square as the sixth power; a row whose
-	squared length is below the working precision of that is a row of rounding
-	error.  Reached when the key matrix is zero, which is one paired atom, or
-	several atoms all at one point: there is no rotation to find and the
-	identity is the honest answer.*/
+	/*How long the longest row is, against the size of a row's entries.  Each
+	cofactor is a 3x3 determinant of a[][] entries, so it scales as the cube of
+	the largest of them and its square as the sixth power.
+
+	A short row is a row that has lost its figures.  The rows vanish together
+	when the largest eigenvalue of the key matrix is a repeated one, which is
+	not only the zero matrix of one paired atom or of atoms all at one point,
+	but every set of points on one line: it can be turned about the line
+	freely, there is a plane of eigenvectors, and no row picks one out.  qcprot
+	survives that by never forming the rotation; this module measures with the
+	rotation, and took the identity there, which for three carbons along x
+	against the same three along y answered 1.732 A where Biopython 1.85's
+	SVDSuperimposer and QCPSuperimposer both say 0.  So below a length the
+	eigenvector is found directly instead, by sym4_top(), whose Jacobi
+	rotations do not care whether the eigenvalue repeats.
+
+	The length is the row's against the cofactors' scale, a fraction that says
+	how nearly the largest eigenvalue repeats -- a property of the shape and not
+	of the NV, which is why the bound is a fixed fraction and not a multiple of
+	NV_EPSILON.  It was the square root of NV_EPSILON at first, which let a row
+	lose half its figures before it was refused: eight on a double, and nine and
+	a half on a long double, where a line bent by 0.0002 A kept its row and came
+	out 1.6e-11 A from itself instead of 0.  Measured with the row's length
+	printed, over 5,876 superpositions of the models of t/data/ensemble.pdb and
+	of 1h0t, 1jm4, 2l6j and 2ll7 (PDBbind v2020), each with every selection,
+	the first percentile is 0.35 and nothing that is not three atoms on a line
+	falls under 0.01; the bent line is 9e-9 and three carbons on a line 1e-13.
+	1e-4 is two decades under every real structure and four over the line, and
+	a row that long has lost at most four of its figures.  Every ordinary
+	structure takes the path argued for above, bit for bit as it did.*/
 	scale = nv_fabs(a11);
 	{
 		//the ten distinct entries of a symmetric 4x4
@@ -8269,29 +8779,18 @@ static void qcp_rotation(NV s[3][3], NV e0, NV rot[3][3])
 		for (k = 0; k < 9; k++) if (cand[k] > scale) scale = cand[k];
 	}
 	scale = scale * scale * scale;
-	if (!(best > (16.0 * NV_EPSILON * scale) * (16.0 * NV_EPSILON * scale))) {
-		Zero(rot, 1, NV[3][3]);
-		rot[0][0] = rot[1][1] = rot[2][2] = 1.0;
+	if (!(best > (1e-4 * scale) * (1e-4 * scale))) {
+		NV m[4][4], qj[4];
+		m[0][0] = a11; m[0][1] = a12; m[0][2] = a13; m[0][3] = a14;
+		m[1][0] = a21; m[1][1] = a22; m[1][2] = a23; m[1][3] = a24;
+		m[2][0] = a31; m[2][1] = a32; m[2][2] = a33; m[2][3] = a34;
+		m[3][0] = a41; m[3][1] = a42; m[3][2] = a43; m[3][3] = a44;
+		sym4_top(m, qj);
+		quat_rot(qj, rot);
 		return;
 	}
-	qn = nv_sqrt(best);
-	{
-		const NV q1 = q[kbest][0] / qn, q2 = q[kbest][1] / qn;
-		const NV q3 = q[kbest][2] / qn, q4 = q[kbest][3] / qn;
-		a2 = q1 * q1; x2 = q2 * q2; y2 = q3 * q3; z2 = q4 * q4;
-		xy = q2 * q3; az = q1 * q4; zx = q4 * q2;
-		ay = q1 * q3; yz = q3 * q4; ax = q1 * q2;
-	}
 	//transposed against Biopython's, which multiplies a row vector on the right
-	rot[0][0] = a2 + x2 - y2 - z2;
-	rot[1][0] = 2.0 * (xy + az);
-	rot[2][0] = 2.0 * (zx - ay);
-	rot[0][1] = 2.0 * (xy - az);
-	rot[1][1] = a2 - x2 + y2 - z2;
-	rot[2][1] = 2.0 * (yz + ax);
-	rot[0][2] = 2.0 * (zx + ay);
-	rot[1][2] = 2.0 * (yz - ax);
-	rot[2][2] = a2 - x2 - y2 + z2;
+	quat_rot(q[kbest], rot);
 }
 
 /*rmsd_measure() -- the deviation of one paired set of atoms from the other.
@@ -8627,7 +9126,7 @@ SV * _parse_string(text, opts = &PL_sv_undef)
 				croak("Chem::Structure::Parser: options must be a hash reference");
 			o = (HV *)SvRV(opts);
 		}
-		buf = SvPV_const(text, len);
+		buf = text_bytes(aTHX_ text, &len);
 		res = parse_buf(aTHX_ buf, len, o);
 		RETVAL = newRV_noinc((SV *)res);
 	OUTPUT:
@@ -8677,7 +9176,7 @@ _parse_cif_string(text, opts = &PL_sv_undef)
 				croak("Chem::Structure::Parser: options must be a hash reference");
 			o = (HV *)SvRV(opts);
 		}
-		buf = SvPV_const(text, len);
+		buf = text_bytes(aTHX_ text, &len);
 		res = parse_cif_buf(aTHX_ buf, len, o);
 		RETVAL = newRV_noinc((SV *)res);
 	OUTPUT:
